@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"time"
@@ -170,7 +171,10 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 	outputTokenDuration := responseEndTime - firstTokenTime
 	timeToFirstTokenDuration := ctx.GetContext(TimeToFirstTokenDuration).(int64)
 	proxywasm.LogDebugf("onStreamingResponseBody: responseEndTime=%d, outputTokenDuration=%d, timeToFirstTokenDuration=%d", responseEndTime, outputTokenDuration, timeToFirstTokenDuration)
-	timePerOutputToken := outputTokenDuration / usage.OutputToken
+	var timePerOutputToken float64 = 0
+	if usage.OutputToken > 0 {
+		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken)
+	}
 	var tokensPerSecond float64 = 0
 	if outputTokenDuration > 0 {
 		tokensPerSecond = float64(usage.OutputToken) / (float64(outputTokenDuration) / 1000)
@@ -195,10 +199,13 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 	return bytes.Join(rtn, []byte("\n\n"))
 }
 
-func process_data_with_token(data []byte, ttft int64, tpot int64, tps float64) []byte {
+func process_data_with_token(data []byte, ttft int64, tpot, tps float64) []byte {
 	var err error
 	// trim data: prefix
 	var rtn = string(bytes.TrimPrefix(data, []byte("data: ")))
+	// 保留两位小数
+	tpot = math.Round(tpot*100) / 100
+	tps = math.Round(tps*100) / 100
 	for path, value := range map[string]interface{}{
 		"time_to_first_token_ms":   ttft,
 		"time_per_output_token_ms": tpot,
