@@ -127,10 +127,11 @@ func realIpHandler(_ wrapper.HttpContext, headerName string) {
 
 // onHttpRequestHeaders processes the request headers and logs them if enabled
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
+	realIpHandler(ctx, config.RealIPToHeader)
+
 	if !config.shouldProcess(ctx.Path()) {
 		return types.ActionContinue
 	}
-	realIpHandler(ctx, config.RealIPToHeader)
 
 	ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
 
