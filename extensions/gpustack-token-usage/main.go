@@ -74,14 +74,8 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	config.RealIPToHeader = json.Get("realIPToHeader").String()
 	suffixes := json.Get("enableOnPathSuffix").Array()
 	defaultSuffixes := map[string]bool{
-		"/chat/completions":     true,
-		"/completions":          true,
-		"/embeddings":           true,
-		"/audio/transcriptions": true,
-		"/audio/speech":         true,
-		"/images/generations":   true,
-		"/images/edits":         true,
-		"/rerank":               true,
+		"/chat/completions": true,
+		"/completions":      true,
 	}
 	for _, suffix := range suffixes {
 		path := suffix.String()
@@ -144,7 +138,6 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 	// Get requestStartTime from http context
 	requestStartTime, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
-		proxywasm.LogError("failed to get requestStartTime from http context")
 		return data
 	}
 	// If this is the first chunk, record first token duration metric and span attribute
