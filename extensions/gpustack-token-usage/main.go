@@ -237,12 +237,12 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 	timeToFirstTokenDuration := ctx.GetContext(TimeToFirstTokenDuration).(int64)
 	proxywasm.LogDebugf("onStreamingResponseBody: responseEndTime=%d, outputTokenDuration=%d, timeToFirstTokenDuration=%d", responseEndTime, outputTokenDuration, timeToFirstTokenDuration)
 	var timePerOutputToken float64 = 0
-	if usage.OutputToken > 0 {
-		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken)
+	if usage.OutputToken > 1 {
+		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken - 1)
 	}
 	var tokensPerSecond float64 = 0
 	if outputTokenDuration > 0 {
-		tokensPerSecond = float64(usage.OutputToken) / (float64(outputTokenDuration) / 1000)
+		tokensPerSecond = float64(usage.OutputToken - 1) / (float64(outputTokenDuration) / 1000)
 	}
 
 	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
