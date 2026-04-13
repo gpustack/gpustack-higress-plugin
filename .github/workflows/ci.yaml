@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ========== Go Tests ==========
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: extensions/*/go.sum
+
+      - name: Run Go tests
+        run: make test
+
+      # ========== Python Lint ==========
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Run lint (with auto-fix)
+        run: make lint
+
+      # ========== Check for uncommitted changes ==========
+      - name: Check for uncommitted changes
+        run: make check-dirty
+
+      # ========== Build whl via Docker ==========
+      # Uses the same Dockerfile as push/release: compiles Go plugins, fetches remote
+      # OCI plugins via oras, and runs verify_whl.py (full check) as part of the build.
+      # uv.lock is required by the Dockerfile COPY step; generate it here since it is
+      # not committed to git.
+      - name: Generate uv.lock
+        run: uv lock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build wheel via Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: whl-output
+          outputs: type=local,dest=./dist
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Show build artifacts
+        run: ls -lh dist/

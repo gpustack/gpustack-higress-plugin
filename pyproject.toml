@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpustack-higress-plugins"
+# Placeholder; overridden by git tag in CI (see release.yaml "Set version from tag")
+version = "0.0.0"
+description = "Higress Wasm plugins for GPUStack"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "GPUStack Contributors"},
+]
+keywords = ["higress", "wasm", "plugins", "gpustack"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+# Build and runtime dependencies
+dependencies = [
+    "fastapi>=0.115.14",
+    "uvicorn>=0.32.1",
+    "pyyaml>=6.0",  # Required for build scripts
+]
+
+[project.urls]
+Homepage = "https://github.com/gpustack/gpustack-higress-plugins"
+Repository = "https://github.com/gpustack/gpustack-higress-plugins"
+Issues = "https://github.com/gpustack/gpustack-higress-plugins/issues"
+
+# Development dependencies
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+gpustack-plugins = "gpustack_higress_plugins.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gpustack_higress_plugins"]
+exclude = [
+    "gpustack_higress_plugins/plugins",
+    "gpustack_higress_plugins/manifest.json",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"gpustack_higress_plugins/plugins" = "gpustack_higress_plugins/plugins"
+"gpustack_higress_plugins/manifest.json" = "gpustack_higress_plugins/manifest.json"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/gpustack_higress_plugins",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

@@ -1,0 +1,5 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include gpustack_higress_plugins/plugins *.wasm
+include gpustack_higress_plugins/manifest.json

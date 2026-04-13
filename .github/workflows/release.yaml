@@ -1,0 +1,156 @@
+# This workflow runs for releasing the package to PyPI and Docker Hub.
+# It triggers on workflow dispatch or when a tag matching 'v*.*.*' is pushed.
+#
+# Build strategy:
+#   - whl/sdist: Built via Dockerfile (includes remote OCI plugins via oras mount)
+#   - Docker image: Built via Dockerfile with versioned tags
+#   Both builds share GHA cache; the second build reuses layers from the first.
+
+name: release
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+  pull-requests: read
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*.*.*"
+      - "*.*.*"
+
+env:
+  INPUT_PYTHON_VERSION: '3.11'
+  INPUT_PROJECT: gpustack-higress-plugins
+  DOCKER_IMAGE: gpustack/higress-plugins
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # Sync pyproject.toml version with the git tag before any build step.
+      # Strips leading 'v' if present: v0.2.0rc1 → 0.2.0rc1
+      - name: Set version from tag
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Setting package version to: $VERSION"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.CI_DOCKERHUB_USERNAME }}
+          password: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
+
+      # uv.lock is required by the Dockerfile COPY step.
+      # Generate it here since it is not committed to git.
+      - name: Generate uv.lock
+        run: pip install uv && uv lock
+
+      # Build whl via Dockerfile whl-output stage.
+      # This includes remote OCI plugins fetched via oras mount.
+      # GHA cache is primed here for the image build below.
+      - name: Build wheel via Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: whl-output
+          outputs: type=local,dest=./dist
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Compute Docker image tags:
+      #   v1.2.3        → gpustack/higress-plugins:1.2.3, :1.2, :latest
+      #   v1.2.3-rc1    → gpustack/higress-plugins:1.2.3-rc1  (no :latest)
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'rc') }}
+
+      # Build and push multi-platform Docker image with version tags.
+      # Reuses layers cached by the whl build above.
+      - name: Build and push Docker image
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Release Assets
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          files: |
+            dist/*.whl
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.INPUT_PYTHON_VERSION }}
+
+      # RC tags (e.g. 0.2.0rc1) → TestPyPI; stable tags → PyPI
+      - name: Publish to TestPyPI (RC)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, 'rc') }}
+        run: |
+          uv publish \
+            --publish-url https://test.pypi.org/legacy/ \
+            --token ${{ secrets.CI_TEST_PYPI_API_TOKEN }}
+
+      - name: Publish to PyPI (stable)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, 'rc') }}
+        run: |
+          uv publish --token ${{ secrets.CI_PYPI_API_TOKEN }}
+
+      - name: Verify installation from TestPyPI (RC)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && contains(github.ref_name, 'rc') }}
+        run: |
+          sleep 30
+          uv run \
+            --index https://test.pypi.org/simple/ \
+            --index-strategy unsafe-best-match \
+            --with ${{ env.INPUT_PROJECT }} \
+            --isolated \
+            --no-project \
+            --verbose \
+            -- gpustack-plugins --version
+
+      - name: Verify installation from PyPI (stable)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, 'rc') }}
+        run: |
+          sleep 30
+          uv run \
+            --with ${{ env.INPUT_PROJECT }} \
+            --isolated \
+            --no-project \
+            --verbose \
+            -- gpustack-plugins --version

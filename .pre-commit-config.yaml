@@ -1,0 +1,9 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(gpustack_higress_plugins|scripts)/
+      - id: ruff-format
+        files: ^(gpustack_higress_plugins|scripts)/

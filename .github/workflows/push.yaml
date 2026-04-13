@@ -1,18 +1,29 @@
-name: Build and Release Plugins
+name: Build and Push to Main
 
 on:
   push:
-    tags:
-      - '*'
-permissions:
-  contents: write
+    branches:
+      - main
+
+env:
+  # Override via Settings → Variables → DOCKER_REPO (e.g. "myuser" for testing)
+  DOCKER_REPO: ${{ vars.DOCKER_REPO || 'gpustack' }}
 
 jobs:
-  build-and-release:
+  build-and-push:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # uv.lock is required by the Dockerfile COPY step.
+      # Generate it here since it is not committed to git.
+      - name: Generate uv.lock
+        run: pip install uv && uv lock
+
+      # ========== Build and Push Docker Image ==========
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -20,28 +31,36 @@ jobs:
           username: ${{ secrets.CI_DOCKERHUB_USERNAME }}
           password: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
 
-      - name: Build all plugins
-        run: |
-          set -e
-          for dir in extensions/*; do
-            if [ -d "$dir" ]; then
-              plugin=$(basename "$dir")
-              make build PLUGIN_NAME=$plugin
-              tar -czf "${plugin}.tar.gz" -C "$dir" plugin.wasm
-            fi
-          done
-      - name: Build and Push Docker Images
-        run: |
-          set -e
-          for dir in extensions/*; do
-            if [ -d "$dir" ]; then
-              plugin=$(basename "$dir")
-              make build-image PLUGIN_NAME=$plugin
-              make build-push PLUGIN_NAME=$plugin
-            fi
-          done
-
-      - name: Upload instarelease assets
-        uses: softprops/action-gh-release@v2
+      # Build whl via Dockerfile whl-output stage (amd64 only, WASM is arch-independent).
+      # This includes remote OCI plugins fetched via oras mount.
+      # GHA cache is primed here for the image build below.
+      - name: Build wheel via Docker
+        uses: docker/build-push-action@v6
         with:
-          files: "*.tar.gz"
+          context: .
+          target: whl-output
+          outputs: type=local,dest=./dist
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpustack-higress-plugins-dist
+          path: dist/
+          retention-days: 7
+
+      # Build and push multi-platform Docker image.
+      # Reuses layers cached by the whl build above.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.DOCKER_REPO }}/higress-plugins:latest
+            ${{ env.DOCKER_REPO }}/higress-plugins:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

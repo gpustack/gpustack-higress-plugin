@@ -1,0 +1,6 @@
+go 1.24.4
+
+use (
+	./extensions/gpustack-set-header-pre-route
+	./extensions/gpustack-token-usage
+)

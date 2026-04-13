@@ -1,0 +1,66 @@
+# Remote OCI Plugins Configuration
+#
+# Define external OCI plugin sources for fetching third-party plugins from OCI registries
+#
+# Configuration说明:
+#   default_registry: Default OCI image registry (optional, for simplifying source config)
+#   remote_plugins: Plugin list
+#
+# Plugin fields:
+#   source: OCI image address, supports the following formats:
+#           - Full URL: oci://registry/org/plugin:tag
+#           - Simplified format: plugin:tag (uses default_registry)
+#           - With @digest: plugin@sha256:... (uses default_registry)
+#   name: Local plugin name
+#   version: Plugin version (for directory structure)
+#   digest: (optional) SHA256 digest for version pinning
+#   registry: (optional) Override default registry
+
+# Default registry (recommended to use Chinese mirror for faster access)
+default_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins
+
+# Or use official registry (uncomment to use)
+# default_registry: ghcr.io/higress-extensions
+
+remote_plugins:
+  # Higress official plugins (using default registry + digest for version pinning)
+  - source: ai-proxy:2.0.0
+    name: ai-proxy
+    version: 2.0.0
+    digest: sha256:a3005bed7d70e8281d4bd26bf5520485a4d7b7994b5e67b9b7ab27b9b4b52212
+
+  - source: ai-statistics:2.0.0
+    name: ai-statistics
+    version: 2.0.0
+    digest: sha256:237a93b4fcaddedc80fc714af4f234ea95ab19ddc13101f6b5f34e7edec5527f
+
+  - source: ext-auth:2.0.0
+    name: ext-auth
+    version: 2.0.0
+    digest: sha256:b02da08e0dd519ee0180696f062bb15a04b37de0a88a2c1b46836c07d1e9adab
+
+  - source: model-router:2.0.0
+    name: model-router
+    version: 2.0.0
+    digest: sha256:f4a30a40f069c1ef68ec87e71a739b3246801cfac7388c98590dd98c89be02cb
+
+  - source: transformer:2.0.0
+    name: transformer
+    version: 2.0.0
+    digest: sha256:40ff2e000dcfd94da76c36593bdfd50f4d0f094309c013732da8e1c35171f321
+
+  - source: model-mapper:2.0.0
+    name: model-mapper
+    version: 2.0.0
+    digest: sha256:d6e99e739f83eacf5efef5d00876efcc4ac849a80f19eb19a914d0aa2cce267b
+
+  # Use full OCI URL to override default registry
+  # - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0
+  #   name: jwt-auth
+  #   version: 1.1.0
+
+  # Use registry field to override default registry
+  # - source: jwt-auth:1.1.0
+  #   name: jwt-auth
+  #   version: 1.1.0
+  #   registry: ghcr.io/higress-extensions
