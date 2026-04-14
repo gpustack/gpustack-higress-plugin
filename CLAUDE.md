@@ -26,6 +26,8 @@ make dev          # Install dev deps + pre-commit install (hooks run on git comm
 make build        # Build local Go plugins + fetch remote plugins (requires oras) + generate manifest + build wheel
 make build-docker # Build wheel via Docker (for environments without Go toolchain or oras)
 make clean        # Remove build artifacts in dist/ (uv.lock is preserved)
+make clean-venv   # Remove .venv
+make verify-whl   # Verify wheel contents against expected plugins (runs verify_whl.py)
 ```
 
 `make build` gracefully skips remote plugins if `oras` is not installed (prints a warning).
@@ -40,6 +42,7 @@ make -C extensions watch PLUGIN_NAME=<name>    # Watch + rebuild (requires: brew
 make -C extensions list                        # List local plugins with versions
 make -C extensions list-remote                 # List remote plugins from remote_plugins.yaml
 make -C extensions fetch-remote PLUGIN='oci://registry/name:tag|local-name|version'  # Fetch single remote plugin
+make -C extensions fetch-all-remote               # Fetch all remote plugins from remote_plugins.yaml
 ```
 
 ### Testing
