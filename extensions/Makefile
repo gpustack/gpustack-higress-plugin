@@ -21,6 +21,9 @@ REMOTE_PLUGINS_CONFIG := remote_plugins.yaml
 # ORAS binary for fetching OCI artifacts
 ORAS ?= oras
 
+# Docker registry for OCI plugin images
+DOCKER_REGISTRY ?= docker.io
+
 # Python binary for scripts (use parent venv if available, otherwise system python)
 PYTHON ?= $(if $(wildcard $(EXTENSIONS_DIR)/../.venv/bin/python),$(EXTENSIONS_DIR)/../.venv/bin/python,python3)
 
@@ -43,6 +46,8 @@ COLOR_BLUE := \033[34m
 	@echo "  make list-remote                  - List configured remote plugins"
 	@echo "  make test PLUGIN_NAME=name        - Test a single plugin"
 	@echo "  make test-all                     - Test all local plugins"
+	@echo "  make build-oci-image              - Build OCI plugin image (PLUGIN_NAME=name)"
+	@echo "  make push-oci-image               - Push OCI plugin image (PLUGIN_NAME=name)"
 	@echo ""
 	@echo "Remote Plugin Configuration (remote_plugins.yaml):"
 	@echo "  default_registry: registry.example.com/plugins"
@@ -216,6 +221,33 @@ generate-manifest:
 	@echo "$(COLOR_GREEN)Generating manifest.json...$(COLOR_RESET)"
 	@cd .. && $(PYTHON) scripts/generate_manifest.py
 
+# Build OCI plugin image
+# Depends on build to ensure the .wasm is up to date before packaging.
+# Build context is the repo root so Dockerfile.oci-plugin can reach gpustack_higress_plugins/plugins/.
+build-oci-image: build
+	@version=$$(cat $(PLUGIN_NAME)/VERSION); \
+	image=$(DOCKER_REGISTRY)/$(PLUGIN_NAME):$$version; \
+	echo "$(COLOR_GREEN)Building OCI image $$image...$(COLOR_RESET)"; \
+	docker build \
+		--build-arg PLUGIN_NAME=$(PLUGIN_NAME) \
+		--build-arg PLUGIN_VERSION=$$version \
+		-f $(EXTENSIONS_DIR)/../Dockerfile.oci-plugin \
+		-t $$image \
+		$(EXTENSIONS_DIR)/..; \
+	echo "$(COLOR_GREEN)✓ Built: $$image$(COLOR_RESET)"
+
+# Push OCI plugin image (image must be built first)
+push-oci-image:
+	@if [ -z "$(PLUGIN_NAME)" ]; then \
+		echo "$(COLOR_YELLOW)Error: PLUGIN_NAME is required$(COLOR_RESET)"; \
+		exit 1; \
+	fi
+	@version=$$(cat $(PLUGIN_NAME)/VERSION); \
+	image=$(DOCKER_REGISTRY)/$(PLUGIN_NAME):$$version; \
+	echo "$(COLOR_BLUE)Pushing OCI image $$image...$(COLOR_RESET)"; \
+	docker push $$image; \
+	echo "$(COLOR_GREEN)✓ Pushed: $$image$(COLOR_RESET)"
+
 # Watch for changes and rebuild (development)
 watch:
 	@if [ -z "$(PLUGIN_NAME)" ]; then \
@@ -261,4 +293,4 @@ help:
 	@echo "  make fetch-remote PLUGIN='oci://ghcr.io/higress-extensions/ai-proxy:1.2.3|ai-proxy|1.2.3'"
 	@echo "  make build-all-with-remote"
 
-.PHONY: list list-remote build build-all fetch-remote fetch-all-remote build-all-with-remote test test-all clean generate-manifest watch help
+.PHONY: list list-remote build build-all fetch-remote fetch-all-remote build-all-with-remote test test-all clean generate-manifest watch build-oci-image push-oci-image help

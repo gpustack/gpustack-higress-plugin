@@ -1,0 +1,6 @@
+FROM scratch AS output
+
+ARG PLUGIN_NAME
+ARG PLUGIN_VERSION
+
+COPY gpustack_higress_plugins/plugins/${PLUGIN_NAME}/${PLUGIN_VERSION}/plugin.wasm plugin.wasm

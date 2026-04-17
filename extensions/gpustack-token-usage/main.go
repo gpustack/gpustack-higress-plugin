@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -19,12 +20,10 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// Constants for log keys in Filter State
 const (
 	pluginName = "gpustack-token-usage"
 )
 
-// Constants for context keys
 const (
 	IsStreamingResponse        = "is_streaming_response"
 	StatisticsRequestStartTime = "gpustack_request_start_time"
@@ -37,41 +36,62 @@ const (
 	ModifiedKey         = "gpustack_usage_modified"
 	SeenUsageChunk      = "gpustack_seen_usage_chunk"
 	ProcessedUsageChunk = "gpustack_processed_usage_chunk"
+
+	RequestModelKey  = "gpustack_request_model"
+	RequestAccessKey = "gpustack_request_access_key"
+	RequestUserIDKey = "gpustack_request_user_id"
+	FinalUsageKey    = "gpustack_final_usage"
 )
 
 func main() {}
 
 func init() {
 	wrapper.SetCtx(
-		// Plugin name
 		pluginName,
-		// Set custom function for parsing plugin configuration
 		wrapper.ParseConfig(parseConfig),
-		// Set custom function for processing request headers
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
-		// Set custom function for processing request body
 		wrapper.ProcessRequestBody(onHttpRequestBody),
-		// Set custom function for processing response headers
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
-		// Set custom function for processing streaming response body
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 	)
 }
 
-// PluginConfig Custom plugin configuration
+// EndpointConfig holds the metrics reporting endpoint configuration.
+type EndpointConfig struct {
+	ServiceName    string
+	ServicePort    int64
+	Path           string
+	TimeoutMs      uint32
+}
+
+// PluginConfig holds plugin configuration.
 type PluginConfig struct {
 	RealIPToHeader     string
 	EnableOnPathSuffix []string
+	Endpoint           *EndpointConfig
+	HeaderAdd          map[string]string
+	ReportClient       wrapper.HttpClient
+}
+
+// ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
+type ModelUsageMetrics struct {
+	Model        string  `json:"model"`
+	InputToken   int64   `json:"input_token"`
+	OutputToken  int64   `json:"output_token"`
+	TotalToken   int64   `json:"total_token"`
+	RequestCount int     `json:"request_count"`
+	UserID       *int64  `json:"user_id,omitempty"`
+	ModelID      *int64  `json:"model_id,omitempty"`
+	ProviderID   *int64  `json:"provider_id,omitempty"`
+	AccessKey    *string `json:"access_key,omitempty"`
 }
 
 func (c *PluginConfig) shouldProcess(targetURI string) bool {
-	// check target uri is vaild or not
 	u, err := url.ParseRequestURI(targetURI)
 	if err != nil {
 		proxywasm.LogDebugf("shouldProcess: invalid targetURI: %s", targetURI)
 		return false
 	}
-	// filterred by path suffix
 	path := u.Path
 	for _, suffix := range c.EnableOnPathSuffix {
 		if len(suffix) > 0 && len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix {
@@ -82,8 +102,6 @@ func (c *PluginConfig) shouldProcess(targetURI string) bool {
 	return false
 }
 
-// The YAML configuration filled in the console will be automatically converted to JSON,
-// so we can directly parse the configuration from this JSON parameter
 func parseConfig(json gjson.Result, config *PluginConfig) error {
 	config.RealIPToHeader = json.Get("realIPToHeader").String()
 	suffixes := json.Get("enableOnPathSuffix").Array()
@@ -108,6 +126,30 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	for path := range defaultSuffixes {
 		config.EnableOnPathSuffix = append(config.EnableOnPathSuffix, path)
 	}
+
+	endpoint := json.Get("endpoint")
+	if endpoint.Exists() && endpoint.Get("service_name").String() != "" {
+		timeoutMs := uint32(endpoint.Get("timeout_ms").Uint())
+		if timeoutMs == 0 {
+			timeoutMs = 5000
+		}
+		config.Endpoint = &EndpointConfig{
+			ServiceName: endpoint.Get("service_name").String(),
+			ServicePort: endpoint.Get("service_port").Int(),
+			Path:        endpoint.Get("path").String(),
+			TimeoutMs:   timeoutMs,
+		}
+		config.ReportClient = wrapper.NewClusterClient(wrapper.FQDNCluster{
+			FQDN: config.Endpoint.ServiceName,
+			Port: config.Endpoint.ServicePort,
+		})
+	}
+
+	config.HeaderAdd = make(map[string]string)
+	for k, v := range json.Get("header_add").Map() {
+		config.HeaderAdd[k] = v.String()
+	}
+
 	return nil
 }
 
@@ -115,7 +157,6 @@ func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
 	var (
 		realIpStr string
 	)
-	// Get all request headers
 	if headerName == "" {
 		return nil
 	}
@@ -125,7 +166,6 @@ func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
 		proxywasm.LogDebugf("failed to get remote address, %s", err)
 		return nil
 	}
-	// Only keeps the host without port
 	host, _, err := net.SplitHostPort(string(data))
 	if err != nil {
 		realIpStr = string(data)
@@ -136,8 +176,17 @@ func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
 	return map[string]string{headerName: realIpStr}
 }
 
-// onHttpRequestHeaders processes the request headers and logs them if enabled
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
+	if consumer, _ := proxywasm.GetHttpRequestHeader("x-mse-consumer"); consumer != "" {
+		userID, accessKey := parseConsumerHeader(consumer)
+		if accessKey != nil {
+			ctx.SetContext(RequestAccessKey, *accessKey)
+		}
+		if userID != nil {
+			ctx.SetContext(RequestUserIDKey, *userID)
+		}
+	}
+
 	action := types.ActionContinue
 	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
 	if config.shouldProcess(ctx.Path()) && contentType == "application/json" {
@@ -146,9 +195,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 			proxywasm.LogWarnf("failed to get request headers, skip handling body, %v", err)
 			return action
 		}
-		// request start time is used by Time to First Token
 		ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
-		// only read the body if content-type is application/json
 		ctx.SetContext("headers", hs)
 		action = types.HeaderStopIteration
 	}
@@ -174,7 +221,6 @@ func removeHeader(name string, headers [][2]string) [][2]string {
 	return rtn
 }
 
-// onHttpRequestBody is called if the request is openai completions API like /v1/chat/completions
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
 	proxywasm.LogDebug("processing request body")
 	headers, ok := ctx.GetContext("headers").([][2]string)
@@ -186,6 +232,11 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	for key, value := range ipHeaders {
 		headers = append(headers, [2]string{key, value})
 	}
+
+	if model := gjson.GetBytes(body, "model").String(); model != "" {
+		ctx.SetContext(RequestModelKey, model)
+	}
+
 	stream := gjson.GetBytes(body, "stream")
 	ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
 	includeUsage := gjson.GetBytes(body, "stream_options.include_usage")
@@ -195,16 +246,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		if err != nil {
 			proxywasm.LogErrorf("failed to set json body, %v", err)
 		} else if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-			// replace body failed
 			proxywasm.LogWarnf("failed to replace new body %s, %v", string(newBody), err)
 		} else {
-			// set succeed and replace succeed
 			headers = removeHeader("content-length", headers)
 		}
 	} else {
 		proxywasm.LogDebug("no need to modify request body")
 		if includeUsage.Exists() && !includeUsage.Bool() {
-			// specify not to include usage
 			ctx.SetContext(StatisticsRequestStartTime, nil)
 		}
 	}
@@ -219,8 +267,6 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 	}
 	isStreaming := ctx.GetBoolContext(IsStreamingResponse, false)
 	if isStreaming {
-		// Edge case: request said stream=true, but server responded with non-streaming JSON (e.g., error)
-		// Trust the response content-type over the request parameter
 		contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
 		if strings.Contains(contentType, "application/json") {
 			ctx.SetContext(IsStreamingResponse, false)
@@ -231,30 +277,36 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 	return types.HeaderStopIteration
 }
 
-// Requires to calculate time_to_first_token_ms, time_per_output_token_ms and tokens_per_second.
 func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool) []byte {
-	// Get requestStartTime from http context
+	result := processTokenUsage(ctx, data)
+	if endOfStream {
+		if ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
+			proxywasm.LogWarnf("no usage is found in any chunk with usage bytes")
+		}
+		reportMetrics(ctx, config)
+	}
+	return result
+}
+
+func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 	requestStartTime, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
 		return data
 	}
-	// If this is the first chunk, record first token duration metric and span attribute
 	if ctx.GetContext(StatisticsFirstTokenTime) == nil {
 		firstTokenTime := time.Now().UnixMilli()
 		ctx.SetContext(StatisticsFirstTokenTime, firstTokenTime)
 		ctx.SetContext(TimeToFirstTokenDuration, firstTokenTime-requestStartTime)
-		proxywasm.LogDebugf("onStreamingResponseBody: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
+		proxywasm.LogDebugf("processTokenUsage: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
 	}
 	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
 	if !isStreamingResponse {
-		// TTFT and TPOT are streaming-specific; only inject TPS for non-streaming.
-		// TPS = output_tokens / total_response_time_seconds
-		dur, ok := ctx.GetContext(TimeToFirstTokenDuration).(int64)
-		if !ok || dur <= 0 {
-			return data
-		}
+		dur, _ := ctx.GetContext(TimeToFirstTokenDuration).(int64)
 		usage := tokenusage.GetTokenUsage(ctx, data)
-		if usage.OutputToken == 0 {
+		if usage.TotalToken > 0 {
+			ctx.SetContext(FinalUsageKey, usage)
+		}
+		if dur <= 0 || usage.OutputToken == 0 {
 			return data
 		}
 		tps := math.Round(float64(usage.OutputToken)/(float64(dur)/1000)*100) / 100
@@ -275,24 +327,21 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		}
 		chunk = mergeLargeUsageChunks(ctx, chunk)
 		if chunk == nil {
-			// to avoid the two chunk didn't join with \n\n
 			rtn = append(rtn, []byte(""))
 			continue
 		}
 		trimed_data := bytes.TrimPrefix(chunk, []byte("data: "))
 		if !json.Valid(trimed_data) {
-			// if is part of the json
 			rtn = append(rtn, chunk)
 			continue
 		}
 		result := gjson.GetBytes(trimed_data, "usage")
-		// no usage found
 		if !result.Exists() {
 			rtn = append(rtn, chunk)
 			continue
 		}
 		ctx.SetContext(SeenUsageChunk, true)
-		proxywasm.LogDebugf("valid chunk: %s", string(trimed_data))
+		proxywasm.LogDebugf("processTokenUsage: valid chunk: %s", string(trimed_data))
 		usageExtra := getUsageExtra(ctx, trimed_data)
 		if usageExtra == nil {
 			rtn = append(rtn, chunk)
@@ -300,21 +349,147 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		}
 		ctx.SetContext(ProcessedUsageChunk, true)
 		modified := process_data_with_token(trimed_data, usageExtra)
-		proxywasm.LogDebugf("modified: %s", string(modified))
+		proxywasm.LogDebugf("processTokenUsage: modified: %s", string(modified))
 		rtn = append(rtn, append([]byte("data: "), modified...))
 		ctx.SetContext(ModifiedKey, true)
 	}
-	result := bytes.Join(rtn, []byte("\n\n"))
-	// At the end of stream, log if we saw usage chunks but failed to process any
-	if endOfStream && ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
-		proxywasm.LogWarnf("no usage is found in any chunk with usage bytes")
+	return bytes.Join(rtn, []byte("\n\n"))
+}
+
+// parseConsumerHeader parses x-mse-consumer value of the form [access_key.]gpustack-<user_id>.
+func parseConsumerHeader(consumer string) (userID *int64, accessKey *string) {
+	if consumer == "" || strings.EqualFold(consumer, "none") {
+		return
 	}
-	return result
+	const prefix = "gpustack-"
+	const sep = "." + prefix
+	if idx := strings.LastIndex(consumer, sep); idx >= 0 {
+		ak := consumer[:idx]
+		if ak != "" {
+			accessKey = &ak
+		}
+		if id, err := strconv.ParseInt(consumer[idx+len(sep):], 10, 64); err == nil {
+			userID = &id
+		}
+	} else if strings.HasPrefix(consumer, prefix) {
+		if id, err := strconv.ParseInt(consumer[len(prefix):], 10, 64); err == nil {
+			userID = &id
+		}
+	} else {
+		accessKey = &consumer
+	}
+	return
+}
+
+// parseClusterName extracts modelID or providerID from an Envoy cluster name.
+// Envoy format: "outbound|<port>|<subset>|<fqdn>" where fqdn is "model-<id>-<instance-id>[.suffix]"
+// or "provider-<id>[.suffix]". The optional suffix is .static or .dns.
+func parseClusterName(clusterName string) (modelID *int64, providerID *int64) {
+	// Extract the FQDN (4th field) from Envoy's "outbound|port|subset|fqdn" format.
+	name := clusterName
+	if parts := strings.SplitN(clusterName, "|", 4); len(parts) == 4 {
+		name = parts[3]
+	}
+
+	if strings.HasPrefix(name, "model-") {
+		rest := name[len("model-"):]
+		idx := strings.Index(rest, "-")
+		if idx > 0 {
+			if id, err := strconv.ParseInt(rest[:idx], 10, 64); err == nil {
+				return &id, nil
+			}
+		}
+	} else if strings.HasPrefix(name, "provider-") {
+		rest := name[len("provider-"):]
+		// Strip optional suffix (.static, .dns, etc.) before parsing the ID.
+		if dotIdx := strings.Index(rest, "."); dotIdx > 0 {
+			rest = rest[:dotIdx]
+		}
+		if !strings.Contains(rest, "-") {
+			if id, err := strconv.ParseInt(rest, 10, 64); err == nil {
+				return nil, &id
+			}
+		}
+	}
+	return nil, nil
+}
+
+func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
+	if config.ReportClient == nil {
+		return
+	}
+
+	clusterNameBytes, err := proxywasm.GetProperty([]string{"cluster_name"})
+	if err != nil || len(clusterNameBytes) == 0 {
+		proxywasm.LogDebugf("reportMetrics: no cluster_name, skipping")
+		return
+	}
+	clusterName := string(clusterNameBytes)
+
+	modelID, providerID := parseClusterName(clusterName)
+	if modelID == nil && providerID == nil {
+		proxywasm.LogDebugf("reportMetrics: cluster_name %s does not match expected pattern, skipping", clusterName)
+		return
+	}
+
+	usage, _ := ctx.GetContext(FinalUsageKey).(tokenusage.TokenUsage)
+
+	model := ctx.GetStringContext(RequestModelKey, "")
+	if model == "" {
+		model = usage.Model
+	}
+
+	metrics := ModelUsageMetrics{
+		Model:        model,
+		InputToken:   usage.InputToken,
+		OutputToken:  usage.OutputToken,
+		TotalToken:   usage.TotalToken,
+		RequestCount: 1,
+		ModelID:      modelID,
+		ProviderID:   providerID,
+	}
+	if userID, ok := ctx.GetContext(RequestUserIDKey).(int64); ok {
+		metrics.UserID = &userID
+	}
+	if accessKey := ctx.GetStringContext(RequestAccessKey, ""); accessKey != "" {
+		metrics.AccessKey = &accessKey
+	}
+
+	body, err := json.Marshal(metrics)
+	if err != nil {
+		proxywasm.LogErrorf("reportMetrics: failed to marshal metrics: %v", err)
+		return
+	}
+
+	reportHeaders := [][2]string{{"content-type", "application/json"}}
+	for k, v := range config.HeaderAdd {
+		reportHeaders = append(reportHeaders, [2]string{k, v})
+	}
+
+	path := config.Endpoint.Path
+	if path == "" {
+		path = "/"
+	}
+
+	if err = config.ReportClient.Post(
+		path,
+		reportHeaders,
+		body,
+		func(statusCode int, _ http.Header, _ []byte) {
+			if statusCode/100 != 2 {
+				proxywasm.LogWarnf("reportMetrics: unexpected status %d for route %s", statusCode, clusterName)
+			} else {
+				proxywasm.LogDebugf("reportMetrics: reported for route %s, status=%d", clusterName, statusCode)
+			}
+		},
+		config.Endpoint.TimeoutMs,
+	); err != nil {
+		proxywasm.LogErrorf("reportMetrics: dispatch failed for route %s: %v", clusterName, err)
+	}
 }
 
 func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
 	var err error
-	// trim data: prefix
 	var rtn = string(bytes.TrimPrefix(data, []byte("data: ")))
 	for path, value := range usageExtra {
 		var new_data string
@@ -328,7 +503,6 @@ func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
 }
 
 func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
-	// alread has extra info stored
 	var usageExtraInfo map[string]any
 	extra := ctx.GetContext(UsageExtraKey)
 	if extra != nil {
@@ -343,6 +517,8 @@ func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
 	if firstTokenTime == 0 {
 		return nil
 	}
+
+	ctx.SetContext(FinalUsageKey, usage)
 
 	responseEndTime := time.Now().UnixMilli()
 	outputTokenDuration := responseEndTime - firstTokenTime
@@ -372,7 +548,6 @@ func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte) []byte {
 		ctx.SetContext(IncompleteChunk, false)
 		return chunk
 	}
-	// end of streaming
 	if len(bytes.TrimSpace(trimed_data)) == 0 {
 		return chunk
 	}
