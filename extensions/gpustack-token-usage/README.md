@@ -7,7 +7,7 @@
 1. Injects token usage timing statistics (`time_to_first_token_ms`, `time_per_output_token_ms`, `tokens_per_second`) into AI API responses
 2. Reports usage metrics to a configurable HTTP endpoint for routes matching the GPUStack naming convention (`model-<id>-<instance-id>` or `provider-<id>`)
 
-It supports both streaming (SSE) and non-streaming responses, and works with OpenAI-compatible APIs.
+It supports both streaming (SSE) and non-streaming responses, OpenAI-compatible and Anthropic-compatible APIs, and multipart/form-data requests (e.g. TTS/STT).
 
 ## Configuration
 
@@ -15,9 +15,16 @@ It supports both streaming (SSE) and non-streaming responses, and works with Ope
 # Optional: inject real client IP into a request header
 realIPToHeader: "X-GPUStack-Real-IP"
 
-# Optional: additional URI path suffixes to process for token usage injection
+# Optional: path suffixes that trigger metrics tracking and response body reading
 # Defaults: /chat/completions, /completions, /responses, /messages
 enableOnPathSuffix:
+  - "/chat/completions"
+  - "/messages"
+
+# Optional: path suffixes that also inject stream_options.include_usage (OpenAI-compatible APIs only)
+# Defaults: /chat/completions, /completions
+# Note: /messages (Anthropic) and /responses (OpenAI Responses API) are excluded by default as they include usage natively
+enableUsageOnPathSuffix:
   - "/chat/completions"
   - "/completions"
 
@@ -101,7 +108,6 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
   "total_token": 150,
   "request_count": 1,
   "model_id": 3,
-  "provider_id": null,
   "user_id": 42,
   "access_key": "mykey"
 }
@@ -113,6 +119,7 @@ The HTTP call is fire-and-forget (async via `DispatchHttpCall`); it does not blo
 
 ## Notes
 
-- `enableOnPathSuffix` only controls **token usage injection**; metrics reporting fires for all routes regardless of path, based solely on the route name pattern
-- `stream_options.include_usage: true` is automatically injected into streaming request bodies when absent, so upstream always returns a usage chunk
-- If the response carries `Content-Type: application/json` despite `stream: true` in the request (e.g. an error response), the plugin treats it as non-streaming
+- **`enableOnPathSuffix`** controls which paths trigger metrics tracking (response body is read to extract token counts). Metrics reporting also requires the cluster name to match the GPUStack pattern.
+- **`enableUsageOnPathSuffix`** controls which paths get `stream_options.include_usage: true` automatically injected into streaming request bodies. This is only needed for OpenAI-compatible APIs; Anthropic's `/messages` endpoint includes usage natively and is excluded from the default list.
+- Multipart/form-data requests (e.g. TTS audio generation) are supported: the `model` field is extracted from the form, and the binary response body is not processed.
+- If the response carries `Content-Type: application/json` despite `stream: true` in the request (e.g. an error response), the plugin treats it as non-streaming.

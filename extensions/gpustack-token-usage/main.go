@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -37,10 +40,14 @@ const (
 	SeenUsageChunk      = "gpustack_seen_usage_chunk"
 	ProcessedUsageChunk = "gpustack_processed_usage_chunk"
 
-	RequestModelKey  = "gpustack_request_model"
-	RequestAccessKey = "gpustack_request_access_key"
-	RequestUserIDKey = "gpustack_request_user_id"
-	FinalUsageKey    = "gpustack_final_usage"
+	RequestModelKey        = "gpustack_request_model"
+	FinalUsageKey          = "gpustack_final_usage"
+	ProcessBodyKey         = "gpustack_process_body"
+	InjectStreamOptionsKey = "gpustack_inject_stream_options"
+	BaseMetricsKey         = "gpustack_base_metrics"
+	MetricsTrackingKey     = "gpustack_metrics_tracking"
+	RequestHeadersKey      = "gpustack_headers"
+	MultipartContentType   = "gpustack_multipart_content_type"
 )
 
 func main() {}
@@ -58,19 +65,20 @@ func init() {
 
 // EndpointConfig holds the metrics reporting endpoint configuration.
 type EndpointConfig struct {
-	ServiceName    string
-	ServicePort    int64
-	Path           string
-	TimeoutMs      uint32
+	ServiceName string
+	ServicePort int64
+	Path        string
+	TimeoutMs   uint32
 }
 
 // PluginConfig holds plugin configuration.
 type PluginConfig struct {
-	RealIPToHeader     string
-	EnableOnPathSuffix []string
-	Endpoint           *EndpointConfig
-	HeaderAdd          map[string]string
-	ReportClient       wrapper.HttpClient
+	RealIPToHeader          string
+	EnableOnPathSuffix      []string
+	EnableUsageOnPathSuffix []string
+	Endpoint                *EndpointConfig
+	HeaderAdd               map[string]string
+	ReportClient            wrapper.HttpClient
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
@@ -86,46 +94,67 @@ type ModelUsageMetrics struct {
 	AccessKey    *string `json:"access_key,omitempty"`
 }
 
-func (c *PluginConfig) shouldProcess(targetURI string) bool {
+func matchPathSuffix(targetURI string, suffixes []string) bool {
 	u, err := url.ParseRequestURI(targetURI)
 	if err != nil {
-		proxywasm.LogDebugf("shouldProcess: invalid targetURI: %s", targetURI)
 		return false
 	}
 	path := u.Path
-	for _, suffix := range c.EnableOnPathSuffix {
+	for _, suffix := range suffixes {
 		if len(suffix) > 0 && len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix {
-			proxywasm.LogDebugf("shouldProcess: matched suffix %s for path %s", suffix, path)
 			return true
 		}
 	}
 	return false
 }
 
-func parseConfig(json gjson.Result, config *PluginConfig) error {
-	config.RealIPToHeader = json.Get("realIPToHeader").String()
-	suffixes := json.Get("enableOnPathSuffix").Array()
-	defaultSuffixes := map[string]bool{
-		"/chat/completions": true,
-		"/completions":      true,
-		"/responses":        true,
-		"/messages":         true,
+func (c *PluginConfig) shouldProcess(targetURI string) bool {
+	matched := matchPathSuffix(targetURI, c.EnableOnPathSuffix)
+	if matched {
+		proxywasm.LogDebugf("shouldProcess: matched for path %s", targetURI)
 	}
-	for _, suffix := range suffixes {
+	return matched
+}
+
+func (c *PluginConfig) shouldInjectStreamOptions(targetURI string) bool {
+	return matchPathSuffix(targetURI, c.EnableUsageOnPathSuffix)
+}
+
+func buildPathSuffixes(configField gjson.Result, defaults []string) []string {
+	set := make(map[string]bool, len(defaults))
+	for _, p := range defaults {
+		set[p] = true
+	}
+	for _, suffix := range configField.Array() {
 		path := suffix.String()
 		if path == "" {
 			continue
 		}
 		if !strings.HasPrefix(path, "/") {
-			proxywasm.LogDebugf("onParseConfig: %s is not a valid path suffix (must start with /), skipping", path)
+			proxywasm.LogDebugf("buildPathSuffixes: %s is not a valid path suffix (must start with /), skipping", path)
 			continue
 		}
-		defaultSuffixes[path] = true
+		set[path] = true
 	}
-	config.EnableOnPathSuffix = []string{}
-	for path := range defaultSuffixes {
-		config.EnableOnPathSuffix = append(config.EnableOnPathSuffix, path)
+	result := make([]string, 0, len(set))
+	for path := range set {
+		result = append(result, path)
 	}
+	return result
+}
+
+func parseConfig(json gjson.Result, config *PluginConfig) error {
+	config.RealIPToHeader = json.Get("realIPToHeader").String()
+	config.EnableUsageOnPathSuffix = buildPathSuffixes(json.Get("enableUsageOnPathSuffix"), []string{
+		"/chat/completions",
+		"/completions",
+	})
+	config.EnableOnPathSuffix = buildPathSuffixes(json.Get("enableOnPathSuffix"), []string{
+		"/chat/completions",
+		"/completions",
+		"/responses",
+		"/messages",
+	})
 
 	endpoint := json.Get("endpoint")
 	if endpoint.Exists() && endpoint.Get("service_name").String() != "" {
@@ -153,61 +182,126 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	return nil
 }
 
-func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
-	var (
-		realIpStr string
-	)
-	if headerName == "" {
-		return nil
+// baseMediaType returns the media type without parameters (e.g. "application/json; charset=utf-8" → "application/json").
+func baseMediaType(contentType string) string {
+	mt, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return contentType
 	}
+	return mt
+}
 
+// getRealIPHeader returns the configured header name and the resolved client IP.
+// Returns empty strings when not configured or the source address is unavailable.
+func getRealIPHeader(config PluginConfig) (name, ip string) {
+	if config.RealIPToHeader == "" {
+		return
+	}
 	data, err := proxywasm.GetProperty([]string{"source", "address"})
 	if err != nil {
-		proxywasm.LogDebugf("failed to get remote address, %s", err)
-		return nil
+		proxywasm.LogDebugf("getRealIPHeader: failed to get source address: %v", err)
+		return
 	}
 	host, _, err := net.SplitHostPort(string(data))
 	if err != nil {
-		realIpStr = string(data)
-	} else {
-		realIpStr = host
+		host = string(data)
 	}
+	return config.RealIPToHeader, host
+}
 
-	return map[string]string{headerName: realIpStr}
+// prepareMetrics checks whether this request should be tracked for metrics reporting.
+// Returns true if the request body must be read to extract the model name.
+func prepareMetrics(ctx wrapper.HttpContext) bool {
+	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
+	mt := baseMediaType(contentType)
+	if mt != "application/json" && mt != "multipart/form-data" {
+		return false
+	}
+	clusterNameBytes, _ := proxywasm.GetProperty([]string{"cluster_name"})
+	if len(clusterNameBytes) > 0 {
+		modelID, providerID := parseClusterName(string(clusterNameBytes))
+		if modelID == nil && providerID == nil {
+			proxywasm.LogDebugf("prepareMetrics: cluster %s not tracked", string(clusterNameBytes))
+			return false
+		}
+	}
+	ctx.SetContext(MetricsTrackingKey, true)
+	if mt == "multipart/form-data" {
+		ctx.SetContext(MultipartContentType, contentType)
+	}
+	return true
+}
+
+// prepareStream checks whether response body reading (and optionally stream_options
+// injection) is needed. Returns true if the request body must be read.
+// Anthropic-style /messages endpoints include usage by default and skip injection.
+func prepareStream(ctx wrapper.HttpContext, config PluginConfig) bool {
+	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
+	if baseMediaType(contentType) != "application/json" {
+		return false
+	}
+	needBody := false
+	if config.shouldProcess(ctx.Path()) {
+		ctx.SetContext(ProcessBodyKey, true)
+		ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
+		needBody = true
+	}
+	if config.shouldInjectStreamOptions(ctx.Path()) {
+		ctx.SetContext(InjectStreamOptionsKey, true)
+		needBody = true
+	}
+	return needBody
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
-	if consumer, _ := proxywasm.GetHttpRequestHeader("x-mse-consumer"); consumer != "" {
-		userID, accessKey := parseConsumerHeader(consumer)
-		if accessKey != nil {
-			ctx.SetContext(RequestAccessKey, *accessKey)
-		}
-		if userID != nil {
-			ctx.SetContext(RequestUserIDKey, *userID)
-		}
-	}
+	// 1. Check if metrics tracking requires reading the request body.
+	metricsNeedBody := prepareMetrics(ctx)
 
-	action := types.ActionContinue
-	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
-	if config.shouldProcess(ctx.Path()) && contentType == "application/json" {
-		hs, err := proxywasm.GetHttpRequestHeaders()
-		if err != nil {
-			proxywasm.LogWarnf("failed to get request headers, skip handling body, %v", err)
-			return action
-		}
-		ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
-		ctx.SetContext("headers", hs)
-		action = types.HeaderStopIteration
-	}
+	// 2. Check if stream injection requires reading the request body.
+	streamNeedBody := prepareStream(ctx, config)
 
-	if action == types.ActionContinue {
-		headers := realIpHandler(ctx, config.RealIPToHeader)
-		for key, value := range headers {
-			_ = proxywasm.AddHttpRequestHeader(key, value)
+	// 3. Neither needs the body: inject real IP header now and skip body read.
+	if !metricsNeedBody && !streamNeedBody {
+		if name, ip := getRealIPHeader(config); name != "" {
+			_ = proxywasm.AddHttpRequestHeader(name, ip)
 		}
 		ctx.DontReadRequestBody()
+		return types.ActionContinue
 	}
-	return action
+
+	hs, err := proxywasm.GetHttpRequestHeaders()
+	if err != nil {
+		proxywasm.LogWarnf("onHttpRequestHeaders: failed to get request headers: %v", err)
+		ctx.DontReadRequestBody()
+		return types.ActionContinue
+	}
+	ctx.SetContext(RequestHeadersKey, hs)
+	return types.HeaderStopIteration
+}
+
+func extractModelFromMultipart(body []byte, contentType string) string {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		proxywasm.LogDebugf("extractModelFromMultipart: failed to parse content type: %v", err)
+		return ""
+	}
+	boundary, ok := params["boundary"]
+	if !ok {
+		return ""
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		if part.FormName() == "model" {
+			var buf bytes.Buffer
+			_, _ = buf.ReadFrom(io.LimitReader(part, 1024))
+			return strings.TrimSpace(buf.String())
+		}
+	}
+	return ""
 }
 
 func removeHeader(name string, headers [][2]string) [][2]string {
@@ -221,16 +315,31 @@ func removeHeader(name string, headers [][2]string) [][2]string {
 	return rtn
 }
 
-func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
-	proxywasm.LogDebug("processing request body")
-	headers, ok := ctx.GetContext("headers").([][2]string)
-	if !ok {
-		proxywasm.LogWarn("failed to get headers from context, skip process body")
-		return types.ActionContinue
+func buildBaseMetrics(ctx wrapper.HttpContext) *ModelUsageMetrics {
+	m := &ModelUsageMetrics{
+		Model:        ctx.GetStringContext(RequestModelKey, ""),
+		RequestCount: 1,
 	}
-	ipHeaders := realIpHandler(ctx, config.RealIPToHeader)
-	for key, value := range ipHeaders {
-		headers = append(headers, [2]string{key, value})
+	if headers, ok := ctx.GetContext(RequestHeadersKey).([][2]string); ok {
+		for _, h := range headers {
+			if strings.EqualFold(h[0], "x-mse-consumer") && h[1] != "" {
+				m.UserID, m.AccessKey = parseConsumerHeader(h[1])
+				break
+			}
+		}
+	}
+	return m
+}
+
+// processRequestBody extracts the model name, sets stream state, and optionally injects
+// stream_options.include_usage. Returns the (possibly modified) headers slice.
+func processRequestBody(ctx wrapper.HttpContext, body []byte, headers [][2]string) [][2]string {
+	if multipartCT, ok := ctx.GetContext(MultipartContentType).(string); ok {
+		if model := extractModelFromMultipart(body, multipartCT); model != "" {
+			ctx.SetContext(RequestModelKey, model)
+		}
+		ctx.SetContext(IsStreamingResponse, false)
+		return headers
 	}
 
 	if model := gjson.GetBytes(body, "model").String(); model != "" {
@@ -238,7 +347,14 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	}
 
 	stream := gjson.GetBytes(body, "stream")
-	ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
+	if ctx.GetBoolContext(ProcessBodyKey, false) {
+		ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
+	}
+
+	if !ctx.GetBoolContext(InjectStreamOptionsKey, false) {
+		return headers
+	}
+
 	includeUsage := gjson.GetBytes(body, "stream_options.include_usage")
 	if stream.Exists() && stream.Bool() && !includeUsage.Exists() {
 		proxywasm.LogDebug("setting include_usage to request body")
@@ -256,13 +372,34 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 			ctx.SetContext(StatisticsRequestStartTime, nil)
 		}
 	}
+	return headers
+}
+
+func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
+	proxywasm.LogDebug("processing request body")
+	headers, ok := ctx.GetContext(RequestHeadersKey).([][2]string)
+	if !ok {
+		proxywasm.LogWarn("failed to get headers from context, skip process body")
+		return types.ActionContinue
+	}
+	if name, ip := getRealIPHeader(config); name != "" {
+		headers = append(headers, [2]string{name, ip})
+	}
+	headers = processRequestBody(ctx, body, headers)
+	ctx.SetContext(BaseMetricsKey, buildBaseMetrics(ctx))
 	_ = proxywasm.ReplaceHttpRequestHeaders(headers)
 	return types.ActionContinue
 }
 
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
-	_, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
-	if !ok {
+	metricsTracking := ctx.GetBoolContext(MetricsTrackingKey, false)
+	processBody := ctx.GetBoolContext(ProcessBodyKey, false)
+	if !metricsTracking && !processBody {
+		return types.ActionContinue
+	}
+	if !processBody {
+		reportMetrics(ctx, config)
+		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
 	isStreaming := ctx.GetBoolContext(IsStreamingResponse, false)
@@ -418,6 +555,11 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	if config.ReportClient == nil {
 		return
 	}
+	base, ok := ctx.GetContext(BaseMetricsKey).(*ModelUsageMetrics)
+	if !ok {
+		proxywasm.LogDebugf("reportMetrics: no base metrics, skipping")
+		return
+	}
 
 	clusterNameBytes, err := proxywasm.GetProperty([]string{"cluster_name"})
 	if err != nil || len(clusterNameBytes) == 0 {
@@ -425,7 +567,6 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		return
 	}
 	clusterName := string(clusterNameBytes)
-
 	modelID, providerID := parseClusterName(clusterName)
 	if modelID == nil && providerID == nil {
 		proxywasm.LogDebugf("reportMetrics: cluster_name %s does not match expected pattern, skipping", clusterName)
@@ -433,26 +574,20 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	}
 
 	usage, _ := ctx.GetContext(FinalUsageKey).(tokenusage.TokenUsage)
-
-	model := ctx.GetStringContext(RequestModelKey, "")
+	model := base.Model
 	if model == "" {
 		model = usage.Model
 	}
-
 	metrics := ModelUsageMetrics{
 		Model:        model,
 		InputToken:   usage.InputToken,
 		OutputToken:  usage.OutputToken,
 		TotalToken:   usage.TotalToken,
-		RequestCount: 1,
+		RequestCount: base.RequestCount,
+		UserID:       base.UserID,
+		AccessKey:    base.AccessKey,
 		ModelID:      modelID,
 		ProviderID:   providerID,
-	}
-	if userID, ok := ctx.GetContext(RequestUserIDKey).(int64); ok {
-		metrics.UserID = &userID
-	}
-	if accessKey := ctx.GetStringContext(RequestAccessKey, ""); accessKey != "" {
-		metrics.AccessKey = &accessKey
 	}
 
 	body, err := json.Marshal(metrics)
