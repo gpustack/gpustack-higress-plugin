@@ -145,6 +145,60 @@ Injects route/cluster name into request headers **before** routing (pre-route ph
 
 Config fields: `routeNameHeader`, `clusterNameHeader`, `enableOnPathSuffix`, `enableOnPathPrefix`
 
+### gpustack-rate-limit
+
+Redis-backed multi-dimensional sliding-window rate limiter. User-facing config / YAML examples live in [extensions/gpustack-rate-limit/README.md](extensions/gpustack-rate-limit/README.md); the notes below only capture design decisions and hazards you'd otherwise need to reconstruct from the code.
+
+**Envoy runtime properties**: declared `phase: UNSPECIFIED_PHASE`, `priority: 600` — intentionally aligned with Higress `ai-token-ratelimit`. The plugin must run **after** whoever publishes the `ai_log` filter state in the response-phase filter order; `ai-statistics` (`CUSTOM`/`200`) and `gpustack-token-usage` both qualify. Changing this priority below `200` will silently break TokenLimits.
+
+**Config model** ([config.go](extensions/gpustack-rate-limit/config.go)):
+
+- `PluginConfig.LimitCombinations[]`. Each combo = a list of `MatchRule` + any of: two `RateQuota` blocks (`QueryLimits` rolling-window request-count, `TokenLimits` rolling-window tokens) and one `QuotaSpec` block (`TokenQuota`, calendar-aligned token quota). `RateQuota` windows resolve in the order `PerSecond → PerMinute → PerHour → PerDay → PerCustom`; all unset returns `(0, 0)` and the limit is skipped. **No** `QueryQuota` slot exists by design — rolling `QueryLimits` already covers the "N requests per day" anti-abuse case; AI billing is token-based so calendar alignment is only meaningful for tokens.
+- `PluginConfig.Timezone` is deployment-wide, top-level (default `UTC`). It anchors every `TokenQuota` boundary in this config; per-spec timezone fields are intentionally not exposed because a single deployment almost always has one timezone, and putting it on each spec invites mismatched-boundary bugs. `Validate` loads it once into `c.location` and pushes the `*time.Location` into every `TokenQuota.Compile(loc)`. The deployment timezone is **not** encoded into the Redis key — changing it reinterprets every existing key under the new boundary, which is the user-intended behaviour.
+- `QuotaSpec` (calendar-aligned token quota): exactly one of `EachDay` / `EachMonth` / `EachYear` is set. `Compile(loc)` resolves the period kind, validates `limit > 0`, captures the location supplied by `PluginConfig.Validate`. `GetWindowAndQuota(now)` returns `(now - periodStart, limit)`; window is clamped to ≥ 1s so the lua `ZRANGEBYSCORE` range is never degenerate at the boundary. `KeyPart()` returns a stable label (`each_month` / `each_year`) — **not** a window-second string and **not** the timezone — so the Redis key is timezone-independent and does not rotate within a period.
+- `MatchRule.Value` is a string alias whose match strategy is inferred at `Compile`: literal `"*"` → wildcard; `source: ip` → CIDR/IP; `"regexp_capture:<pattern>"` → RE2 with capture-group key extraction (pattern must contain ≥1 `(...)`); `"regexp:<pattern>"` → RE2 (whole extracted value used as key); otherwise exact. Compile caches regexp/CIDR inside the rule; `Match(headers) *string` returns the extracted raw value on a hit (or `m[1]` on a `regexp_capture:` hit), `nil` on a miss or an uncompiled rule.
+- **`regexp_capture:` is the only way to bucket two different inputs together** when they share a common substring (e.g. `<ak>.gpustack-1` and `gpustack-1` both bucket as `gpustack-1`). The `(?:...)` non-capturing group syntax is essential for the prefix half. Without `regexp_capture`, `Match` returns the full extracted header value and the two shapes go into separate Redis buckets.
+- `SourceConsumer` is hard-wired to read header `x-mse-consumer` (Higress convention, constant `ConsumerHeader`). `SourceIP` is a header-source special case: `Name` holds the header that carries the already-injected real client IP (e.g. `x-real-ip`).
+- `PluginConfig.Validate()` both validates and pre-compiles every `MatchRule` — `parseGlobalConfig` / `parseOverrideRuleConfig` each call it exactly once at startup so there are no runtime compile errors.
+- Global-level config may omit `LimitCombinations` (then Validate is skipped). This supports the pattern "global supplies Redis/defaults, per-route rules override via `ParseOverrideConfig`".
+- **`limit_combinations` aggregation semantics**: `parseOverrideRuleConfig` appends rule-level combos onto global combos rather than replacing them. Every request matched by a rule runs the **union** in a single Redis Eval — global combos first (broader scope, shorter-circuit on common over-quota), then rule-level combos. Unique combo names are enforced across the merged list by `Validate`, so a rule cannot silently shadow a global combo. This is the load-bearing mechanism that lets deployment-wide buckets (e.g. cross-model per-consumer monthly quota) live in `defaultConfig` while each ingress only declares its model-specific sub-cap.
+- **Aliasing safety in `parseOverrideRuleConfig`**: `*config = global` shares all slice headers (`LimitCombinations`, `EnableOnPathSuffix`, `EnableOnPathPrefix`) with global. `json.Unmarshal` of slice fields **resets-and-reuses** the underlying array, which would corrupt global through aliasing across matchRule overrides. The parser **must** detach all three slices to nil before `json.Unmarshal` and rebuild them via `append([]T(nil), global....)` afterwards. This is a real latent footgun — don't simplify the parser back into "just `*config = global` then unmarshal".
+
+**Redis key layout** (one per quota kind):
+
+```text
+<rule_name>|<combo.Name>|<dim1>|<dim2>|...|<kind>:<period>
+```
+
+`<kind>` is `q` (query-count) or `t` (token-count). `<period>` is the window-second string (e.g. `60s`) for rolling `RateQuota`, or the stable calendar label (e.g. `each_month`, `each_year`) for `QuotaSpec`. Each dim fragment is `<source>:<name>=<value>` or `<source>=<value>` when `name` is empty / for consumer. ZSET member is `<request-uuid>|<count>` (count=`1` for query, real `total_tokens` for token). If rule-level overrides leave `rule_name` inherited from global and combo names collide, two routes share the same key — `rule_name` is the only cross-route isolator.
+
+**Calendar quota mechanics**: `TokenQuota` reuses the existing lua script unchanged. The plugin computes `window = now - periodStart` at request phase and again at response phase (so a stream that crosses the boundary records its tokens into the period it ends in). The lua `ZREMRANGEBYSCORE -inf (now-window)` therefore prunes everything before the current period start; a clamped minimum window of 1s avoids deleting boundary-second writes. `EXPIRE key (window*2)` shrinks toward 2s right at the boundary, which conveniently lets stale period data evaporate within seconds without any external reset job.
+
+**Lua script** ([multi_level_limit.lua](extensions/gpustack-rate-limit/multi_level_limit.lua)) — contract is per-combination 6-tuple ARGV `[window, quota, mode, member, count, ttl]` with `mode ∈ { check_and_add, check, add }`. Two-pass:
+
+- Pass 1 — `ZREMRANGEBYSCORE` then, for every `check` or `check_and_add` combo, sum `count` across members via `ZRANGEBYSCORE` + string-match `|(%d+)$`. First over-quota combo short-circuits with `{'LIMITED', <key>}`. **No** combination is written in this case.
+- Pass 2 — `ZADD` + `EXPIRE <ttl>` for every `add` or `check_and_add` combo.
+- Reply is always a two-element Lua array: `{'SUCCESS', ''}` on pass, `{'LIMITED', <key>}` on block. The Go callback reads it with `response.Array()` — **do not** switch to `response.String()` / `response.Error()`; see "Rejection delivery hazards" below.
+
+**TTL is decoupled from `window`** (this was a bug fix): the lua script no longer derives EXPIRE from `window * 2`. Calendar quotas pass a dynamic `window = now - period_start` which is near-zero at period start; multiplying that by 2 gave a 1-2 second TTL and the key would be evicted before the next request, prematurely resetting the quota. Go-side helpers (`rollingTTL` / `calendarTTL` in main.go) compute TTL explicitly: rolling = `window * 2` (preserved); calendar = `period_end - now + ttlGraceSeconds` (300s grace). Don't reintroduce `window * 2` in the lua script.
+
+Request-phase `Eval` uses `check_and_add` (count=1) for `QueryLimits` and `check` (count=0) for both `TokenLimits` and `TokenQuota`. Response-phase (`onHttpStreamDone`) issues a second `Eval` with `mode=add` and `count=total_tokens` for every pending entry. `tokenPendingAdd` carries either a `FixedWindow` (RateQuota) or a `CalendarSpec *QuotaSpec` (QuotaSpec); `windowSeconds(now)` dispatches to recompute the calendar window fresh at response time. `total_tokens` is read from the Envoy filter state `wrapper.AILogKey` — the plugin **does not** parse SSE itself.
+
+**Path filter**: `EnableOnPathSuffix` / `EnableOnPathPrefix` default to AI endpoints + `/model/proxy`. `isPathEnabled()` runs before anything else in the request-header phase; non-matching paths skip the full path — no `GetHttpRequestHeaders()`, no Redis round-trip. `matchPathFilters` is split out as a pure function so it's unit-testable without a proxy-wasm host.
+
+**Unit tests** ([config_test.go](extensions/gpustack-rate-limit/config_test.go), [main_test.go](extensions/gpustack-rate-limit/main_test.go)): standard `go test` (no wasm host), cover every branch of match / compile / extract / KeyPart / Validate / collectChecks / matchPathFilters.
+
+**VM rebuild**: `WithRebuildAfterRequests(1000)` + `WithRebuildMaxMemBytes(200 MiB)` — aligned with Higress AI plugin conventions, guards against long-running memory-leak accumulation.
+
+**Fail-open posture**: Redis dispatch errors, Lua errors and unreadable `:path` all fall through to `ActionContinue`. The plugin never blocks traffic because of its own infrastructure failure.
+
+**Rejection delivery hazards** — under Higress's AI-route filter chain, `SendHttpResponseWithDetail` will return `nil` (accepted by host) yet fail to flush to the downstream client. Symptom in access log: `response_code=429` + `bytes_sent=0` + `response_flags=DC` + `response_code_details=downstream_remote_disconnect`. Two known triggers:
+
+- **Empty response body**. `rejected_msg` falls back to `"Too many requests"` via `defaultRejectedMsg` for this reason — do not remove the fallback. Envoy's local-reply path treats headers+end_stream with a nil body pointer as a degenerate response and queues it without flushing.
+- **Missing `ctx.DisableReroute()`** on request-phase entry. The async Redis dispatch races with other filters' route-cache invalidation otherwise.
+
+Callback body is deliberately minimal (single `response.Array()` read, no `response.Error()` / `response.String()` / `GetProperty` / `LogInfof` between callback entry and `SendHttpResponseWithDetail`) to match the known-good shape of `cluster-key-rate-limit`. Extra hostcalls in between may confuse Envoy's async-local-reply path on some Higress builds — keep this pattern when refactoring.
+
 ## Remote Plugins
 
 Configured in `extensions/remote_plugins.yaml`. Require `oras` (`brew install oras`).
