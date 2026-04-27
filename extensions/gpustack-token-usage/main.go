@@ -87,6 +87,7 @@ type ModelUsageMetrics struct {
 	InputToken   int64   `json:"input_token"`
 	OutputToken  int64   `json:"output_token"`
 	TotalToken   int64   `json:"total_token"`
+	InputCachedToken int64 `json:"input_cached_token"`
 	RequestCount int     `json:"request_count"`
 	UserID       *int64  `json:"user_id,omitempty"`
 	ModelID      *int64  `json:"model_id,omitempty"`
@@ -583,6 +584,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		InputToken:   usage.InputToken,
 		OutputToken:  usage.OutputToken,
 		TotalToken:   usage.TotalToken,
+		InputCachedToken: resolveInputCachedToken(usage),
 		RequestCount: base.RequestCount,
 		UserID:       base.UserID,
 		AccessKey:    base.AccessKey,
@@ -621,6 +623,14 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	); err != nil {
 		proxywasm.LogErrorf("reportMetrics: dispatch failed for route %s: %v", clusterName, err)
 	}
+}
+
+// resolveInputCachedToken returns cached input (prompt) tokens across upstream
+// formats: OpenAI/vLLM expose them in usage.prompt_tokens_details.cached_tokens;
+// Anthropic reports cache hits separately via cache_read_input_tokens
+// (cache_creation is new tokens being written, not a hit, so it is excluded).
+func resolveInputCachedToken(usage tokenusage.TokenUsage) int64 {
+	return usage.InputTokenDetails["cached_tokens"] + usage.AnthropicCacheReadInputToken
 }
 
 func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
