@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +13,6 @@ import (
 	"github.com/higress-group/wasm-go/pkg/tokenusage"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/resp"
 )
 
 const (
@@ -41,6 +39,14 @@ const (
 	// Internal HttpContext keys.
 	ctxKeyRequestID    = "gpustack-rate-limit:request-id"
 	ctxKeyTokenPending = "gpustack-rate-limit:token-pending"
+	ctxKeyAILabels     = "gpustack-rate-limit:ai-labels"
+
+	// Header conventions used to populate aiLabels.Model / aiLabels.Consumer.
+	// x-higress-llm-model is injected by gpustack-set-header-pre-route (or
+	// upstream Higress AI route logic) before our request-headers phase runs;
+	// x-mse-consumer is the standard Higress consumer-identity header.
+	headerLLMModel = "x-higress-llm-model"
+	headerConsumer = "x-mse-consumer"
 )
 
 //go:embed multi_level_limit.lua
@@ -83,6 +89,13 @@ type tokenPendingAdd struct {
 	Quota        int
 	FixedWindow  int64
 	CalendarSpec *QuotaSpec
+
+	// Metric labels (mirror the corresponding LimitEntry produced by
+	// collectChecks, so onHttpStreamDone can emit value_total without
+	// looking the matching entry up again).
+	Combo  string
+	Kind   string
+	Bucket string
 }
 
 // windowSeconds returns the lua window argument for the response-phase add.
@@ -154,8 +167,20 @@ func parseGlobalConfig(raw gjson.Result, config *PluginConfig) error {
 		return fmt.Errorf("unmarshal plugin config: %w", err)
 	}
 	applyPathFilterDefaults(raw, config)
-	if err := InitRedisClusterClient(raw, config); err != nil {
-		return err
+	// gjson treats an explicit `redis: null` as Exists()==true (Raw="null"),
+	// so we must additionally require an object before delegating to
+	// initRedisBackend; otherwise a `redis: null` literal in defaultConfig
+	// fails parseGlobalConfig and leaves m.globalConfig as the zero value,
+	// which then propagates empty path filters into every matchRule override.
+	if redisRaw := raw.Get("redis"); redisRaw.IsObject() {
+		backend, err := initRedisBackend(raw)
+		if err != nil {
+			return err
+		}
+		config.Backend = backend
+	} else {
+		proxywasm.LogInfof("%s: no redis configured, using local (per-instance) rate limiting mode", pluginName)
+		config.Backend = &localBackend{}
 	}
 	if len(config.LimitCombinations) == 0 {
 		return nil
@@ -226,10 +251,12 @@ func parseOverrideRuleConfig(raw gjson.Result, global PluginConfig, config *Plug
 	config.LimitCombinations = append(config.LimitCombinations, global.LimitCombinations...)
 	config.LimitCombinations = append(config.LimitCombinations, ruleCombos...)
 
-	if raw.Get("redis").Exists() {
-		if err := InitRedisClusterClient(raw, config); err != nil {
+	if redisRaw := raw.Get("redis"); redisRaw.IsObject() {
+		backend, err := initRedisBackend(raw)
+		if err != nil {
 			return err
 		}
+		config.Backend = backend
 	}
 	return config.Validate()
 }
@@ -260,11 +287,21 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	reqID := uuid.NewString()
 	ctx.SetContext(ctxKeyRequestID, reqID)
 
-	keys, args, pending := collectChecks(&config, headers, reqID)
+	// Capture the AI-routing labels once at request phase. We deliberately do
+	// NOT call proxywasm.GetProperty / re-read headers inside the (possibly
+	// async) handleEvalResult callback, both for performance and because
+	// CLAUDE.md flags hostcalls between callback entry and
+	// SendHttpResponseWithDetail as risky on some Higress builds. Stash for
+	// onHttpStreamDone too -- token value_total emission uses the same labels.
+	ai := readAILabels(headers)
+	ctx.SetContext(ctxKeyAILabels, ai)
+
+	nowTime := time.Now()
+	entries, pending := collectChecks(&config, headers, reqID, nowTime)
 	if len(pending) > 0 {
 		ctx.SetContext(ctxKeyTokenPending, pending)
 	}
-	if len(keys) == 0 {
+	if len(entries) == 0 {
 		// Either no combo's match rules hit, or all combos had quota=0/empty
 		// windows. Both surface here as a silent no-op which is the most
 		// common "why isn't my limit firing?" misconfiguration symptom.
@@ -272,20 +309,62 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 		return types.ActionContinue
 	}
 
-	if err := config.RedisClient.Eval(
-		multiLevelLimitScript,
-		len(keys),
-		keys,
-		args,
-		func(response resp.Value) { handleLuaResponse(config, reqID, response) },
-	); err != nil {
-		proxywasm.LogWarnf("%s: req=%s redis eval dispatch failed, fail-open: %v", pluginName, reqID, err)
+	action, err := config.Backend.BatchEval(nowTime.Unix(), entries, func(result EvalResult) {
+		handleEvalResult(config, ai, reqID, entries, result)
+	})
+	if err != nil {
+		proxywasm.LogWarnf("%s: req=%s backend eval dispatch failed, fail-open: %v", pluginName, reqID, err)
 		return types.ActionContinue
 	}
-	// StopAllIterationAndWatermark: stop header/body/trailer iteration and
-	// watermark the downstream connection while Redis is in flight. Matches
-	// higress cluster-key-rate-limit / ai-token-ratelimit.
-	return types.HeaderStopAllIterationAndWatermark
+	return action
+}
+
+// readAILabels gathers the four AI-routing label values used as metric
+// prefixes. Misses on any individual slot fall through to "none" so the
+// resulting stat name is always well-formed (sanitizeMetricLabel maps "" to
+// "none" too, this is just explicit).
+func readAILabels(headers [][2]string) aiLabels {
+	return aiLabels{
+		Route:    readRouteName(),
+		Cluster:  readClusterName(),
+		Model:    findHeaderOrNone(headers, headerLLMModel),
+		Consumer: findHeaderOrNone(headers, headerConsumer),
+	}
+}
+
+// readClusterName fetches the Envoy upstream cluster_name property. Resolved
+// after route selection (which has happened by the time onHttpRequestHeaders
+// runs because we DisableReroute earlier in the same phase).
+func readClusterName() string {
+	raw, err := proxywasm.GetProperty([]string{"cluster_name"})
+	if err != nil || len(raw) == 0 {
+		return metricNoneLabel
+	}
+	return string(raw)
+}
+
+// findHeaderOrNone looks up a header value (case-insensitive) and returns
+// metricNoneLabel for misses or empty strings, so the resulting stat name
+// is always well-formed.
+func findHeaderOrNone(headers [][2]string, name string) string {
+	for _, kv := range headers {
+		if strings.EqualFold(kv[0], name) && kv[1] != "" {
+			return kv[1]
+		}
+	}
+	return metricNoneLabel
+}
+
+// readRouteName fetches the Envoy route_name property, returning a stable
+// fallback when unset (e.g. on direct response paths). The fallback flows
+// through to metric labels, so we explicitly use sanitizeMetricLabel's empty
+// sentinel "none" to keep label values uniform.
+func readRouteName() string {
+	raw, err := proxywasm.GetProperty([]string{"route_name"})
+	if err != nil || len(raw) == 0 {
+		return metricNoneLabel
+	}
+	return string(raw)
 }
 
 // isPathEnabled reads ":path" from the current request and delegates to
@@ -346,11 +425,7 @@ func matchPathFilters(config *PluginConfig, path string) bool {
 // "each_month") rather than a window-second number, so the key does not
 // rotate within a period. The dynamic window-seconds value is sent only as
 // a lua ARGV.
-func collectChecks(config *PluginConfig, headers [][2]string, reqID string) (keys, args []interface{}, pending []tokenPendingAdd) {
-	nowTime := time.Now()
-	now := nowTime.Unix()
-	args = []interface{}{strconv.FormatInt(now, 10)}
-
+func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd) {
 	for i := range config.LimitCombinations {
 		combo := &config.LimitCombinations[i]
 
@@ -369,19 +444,30 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string) (key
 			continue
 		}
 
+		// Pre-compute the dimension fragment shared by every limit kind on this
+		// combo. base[2:] is the slice of <source>:<name>=<value> fragments
+		// produced by MatchRule.KeyPart; joining with '|' mirrors the layout
+		// embedded inside the Redis key, but the bucket label here intentionally
+		// excludes the trailing kind:period segment so the same value labels
+		// every metric that pertains to this combo+match-result.
+		bucket := strings.Join(base[2:], "|")
+
 		// QueryLimits (rolling): check-and-add with count=1
 		if combo.QueryLimits != nil {
 			if win, quota := combo.QueryLimits.GetWindowAndQuota(); quota > 0 {
 				key := strings.Join(append(base, "q:"+combo.QueryLimits.KeyPart()), "|")
-				keys = append(keys, key)
-				args = append(args,
-					strconv.FormatInt(win, 10),
-					strconv.Itoa(quota),
-					modeCheckAndAdd,
-					reqID,
-					"1",
-					strconv.FormatInt(rollingTTL(win), 10),
-				)
+				entries = append(entries, LimitEntry{
+					Key:    key,
+					Window: win,
+					Quota:  quota,
+					Mode:   modeCheckAndAdd,
+					Member: reqID,
+					Count:  1,
+					TTL:    rollingTTL(win),
+					Combo:  combo.Name,
+					Kind:   metricKindQuery,
+					Bucket: bucket,
+				})
 			}
 		}
 
@@ -389,16 +475,26 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string) (key
 		if combo.TokenLimits != nil {
 			if win, quota := combo.TokenLimits.GetWindowAndQuota(); quota > 0 {
 				key := strings.Join(append(base, "t:"+combo.TokenLimits.KeyPart()), "|")
-				keys = append(keys, key)
-				args = append(args,
-					strconv.FormatInt(win, 10),
-					strconv.Itoa(quota),
-					modeCheck,
-					reqID,
-					"0",
-					strconv.FormatInt(rollingTTL(win), 10),
-				)
-				pending = append(pending, tokenPendingAdd{Key: key, FixedWindow: win, Quota: quota})
+				entries = append(entries, LimitEntry{
+					Key:    key,
+					Window: win,
+					Quota:  quota,
+					Mode:   modeCheck,
+					Member: reqID,
+					Count:  0,
+					TTL:    rollingTTL(win),
+					Combo:  combo.Name,
+					Kind:   metricKindTokenRolling,
+					Bucket: bucket,
+				})
+				pending = append(pending, tokenPendingAdd{
+					Key:         key,
+					FixedWindow: win,
+					Quota:       quota,
+					Combo:       combo.Name,
+					Kind:        metricKindTokenRolling,
+					Bucket:      bucket,
+				})
 			}
 		}
 
@@ -410,60 +506,95 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string) (key
 		if combo.TokenQuota != nil {
 			if win, quota := combo.TokenQuota.GetWindowAndQuota(nowTime); quota > 0 {
 				key := strings.Join(append(base, "t:"+combo.TokenQuota.KeyPart()), "|")
-				keys = append(keys, key)
-				args = append(args,
-					strconv.FormatInt(win, 10),
-					strconv.Itoa(quota),
-					modeCheck,
-					reqID,
-					"0",
-					strconv.FormatInt(calendarTTL(combo.TokenQuota, nowTime), 10),
-				)
-				pending = append(pending, tokenPendingAdd{Key: key, CalendarSpec: combo.TokenQuota, Quota: quota})
+				entries = append(entries, LimitEntry{
+					Key:    key,
+					Window: win,
+					Quota:  quota,
+					Mode:   modeCheck,
+					Member: reqID,
+					Count:  0,
+					TTL:    calendarTTL(combo.TokenQuota, nowTime),
+					Combo:  combo.Name,
+					Kind:   metricKindTokenCalendar,
+					Bucket: bucket,
+				})
+				pending = append(pending, tokenPendingAdd{
+					Key:          key,
+					CalendarSpec: combo.TokenQuota,
+					Quota:        quota,
+					Combo:        combo.Name,
+					Kind:         metricKindTokenCalendar,
+					Bucket:       bucket,
+				})
 			}
 		}
 	}
-	return keys, args, pending
+	return entries, pending
 }
 
-// handleLuaResponse handles the Lua script result for the request phase.
+// handleEvalResult handles the backend result for the request phase.
+// On success it resumes the paused request (no-op for localBackend which never
+// stops the request). On failure it sends a rate-limit rejection.
 //
-// The script returns an array {status, limited_key}. Reading via
-// response.Array() mirrors higress cluster-key-rate-limit's known-good
-// callback path under this Envoy/wasm-go build.
+// Metric emission rules (see README "Metrics"):
+//   - request_total{result=passed|limited} +1 per request
+//   - On PASSED: value_total{combo,kind,bucket} += entry.Count for every
+//     check_and_add entry (currently only query_limits). Token entries wait
+//     for onHttpStreamDone.
+//   - On LIMITED: rejected_total{combo,kind,bucket} +1 for the entry whose
+//     Key matches result.LimitedKey. Lua/local short-circuit guarantees
+//     exactly one entry attribution per rejected request.
 //
-// reqID is plumbed through so both the malformed-reply Warn and the
-// rejection Info log carry the request identifier, allowing operators to
-// correlate plugin logs with Envoy access logs / upstream traces.
-func handleLuaResponse(config PluginConfig, reqID string, response resp.Value) {
-	result := response.Array()
-	if len(result) < 1 {
-		// Lua should always return a 2-element array (SUCCESS or LIMITED).
-		// A shorter / nil result means lua panicked, redis returned an error
-		// the SDK couldn't unmarshal, or some unexpected protocol response.
-		// Fail-open consistent with the dispatch-error policy.
-		proxywasm.LogWarnf("%s: req=%s malformed lua reply (len=%d), fail-open", pluginName, reqID, len(result))
-		_ = proxywasm.ResumeHttpRequest()
+// Rejection metrics are emitted *after* rejected() so the path between
+// callback entry and SendHttpResponseWithDetail stays minimal -- the same
+// hazard CLAUDE.md flags for the redis async case.
+func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []LimitEntry, result EvalResult) {
+	if result.Status == luaSuccessReply {
+		emitRequestOutcome(ai, config.RuleName, metricResultPassed)
+		for i := range entries {
+			e := &entries[i]
+			if e.Mode == modeCheckAndAdd {
+				emitValue(ai, config.RuleName, e.Combo, e.Kind, e.Bucket, uint64(e.Count))
+			}
+		}
+		// Resuming the paused request is the redis-backend's responsibility
+		// (handled inside its callback wrapper). Local-backend never paused
+		// the request, so calling Resume here would be a host-side no-op at
+		// best and a wasted call on every passed request at worst.
 		return
 	}
-	if result[0].String() == luaSuccessReply {
-		_ = proxywasm.ResumeHttpRequest()
-		return
+	rejected(config, reqID, result.LimitedKey)
+	emitRequestOutcome(ai, config.RuleName, metricResultLimited)
+	for i := range entries {
+		e := &entries[i]
+		if e.Key == result.LimitedKey {
+			emitRejected(ai, config.RuleName, e.Combo, e.Kind, e.Bucket)
+			break
+		}
 	}
-	limitedKey := ""
-	if len(result) >= 2 {
-		limitedKey = result[1].String()
-	}
-	rejected(config, reqID, limitedKey)
 }
 
 // rejected sends a local reply terminating the request.
 //
-// CRITICAL: the body MUST be non-empty. Under Higress's AI-route filter chain
-// an empty-body local reply is queued by Envoy but never flushed to the
-// downstream client (access log shows response_code=429 but bytes_sent=0 and
-// response_flags=DC with response_code_details=downstream_remote_disconnect).
-// defaultRejectedMsg ensures a non-empty body when RejectedMsg is unset.
+// CRITICAL: the body MUST be non-empty AND valid JSON. Two coupled hazards:
+//
+//  1. Empty body: Envoy's local-reply path queues `headers + end_stream` with a
+//     nil body pointer as a degenerate response in some filter chains and never
+//     flushes it (access log: 429 + bytes_sent=0 + response_flags=DC).
+//  2. Non-JSON body in an AI streaming context: when the request had `stream:true`,
+//     gpustack-token-usage's streaming response body handler runs *before* this
+//     local reply reaches the client (priority 910 vs ours 600 — token-usage
+//     decodes first, sets IsStreamingResponse=true, and on encode parses every
+//     chunk through mergeLargeUsageChunks). That helper treats non-JSON chunks
+//     as "incomplete" SSE fragments, buffers them into IncompleteChunkData,
+//     and returns nil; processTokenUsage then replaces the response body with
+//     an empty string. The downstream client sees `Content-Length: 28` headers
+//     followed by zero body bytes.
+//
+// Wrapping the message in a JSON envelope makes `json.Valid` succeed inside
+// mergeLargeUsageChunks, so the chunk passes through unchanged. The OpenAI
+// `{"error":{...}}` shape is also what real OpenAI / Higress AI clients expect
+// for HTTP-level errors, so this doubles as a usability improvement.
 //
 // The x-ratelimit-limited-key header echoes the Redis key that triggered the
 // rejection. It is gated on ShowLimitQuotaHeader (default false) because the
@@ -474,19 +605,60 @@ func rejected(config PluginConfig, reqID, limitedKey string) {
 	if code == 0 {
 		code = defaultRejectedCode
 	}
-	body := config.RejectedMsg
-	if body == "" {
-		body = defaultRejectedMsg
+	msg := config.RejectedMsg
+	if msg == "" {
+		msg = defaultRejectedMsg
 	}
+	body := buildRejectedBody(msg, code)
 	headers := buildRejectedHeaders(config, limitedKey)
+	headers = append(headers, [2]string{"content-type", "application/json"})
 	proxywasm.LogInfof("%s: rate limit exceeded, req=%s key=%s", pluginName, reqID, limitedKey)
-	_ = proxywasm.SendHttpResponseWithDetail(
+	if err := proxywasm.SendHttpResponseWithDetail(
 		uint32(code),
 		pluginName+".rejected",
 		headers,
-		[]byte(body),
+		body,
 		-1,
-	)
+	); err != nil {
+		// Failure here means the rejection response did not get queued by
+		// the host. Symptoms downstream are typically a stalled connection
+		// or a default Envoy 5xx; logging is the only signal an operator
+		// gets that this was the rate-limit branch. Logging AFTER the
+		// hostcall is safe (the CLAUDE.md "callback minimality" hazard
+		// concerns hostcalls BEFORE SendHttpResponseWithDetail, not after).
+		proxywasm.LogWarnf("%s: SendHttpResponseWithDetail failed for req=%s: %v", pluginName, reqID, err)
+	}
+}
+
+// buildRejectedBody returns the JSON envelope used as the rate-limit rejection
+// body. The shape mirrors OpenAI / Anthropic error responses so existing AI
+// clients can deserialize it, and -- crucially -- it is valid JSON, which
+// prevents gpustack-token-usage's streaming SSE parser from buffering it as
+// an "incomplete chunk" and silently zeroing out the response body. If the
+// caller-supplied msg is already a JSON object, it is used verbatim so the
+// operator can override the schema without further escaping.
+func buildRejectedBody(msg string, code int) []byte {
+	if json.Valid([]byte(msg)) && len(msg) > 0 && msg[0] == '{' {
+		return []byte(msg)
+	}
+	envelope := struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    int    `json:"code"`
+		} `json:"error"`
+	}{}
+	envelope.Error.Message = msg
+	envelope.Error.Type = "rate_limit_exceeded"
+	envelope.Error.Code = code
+	out, err := json.Marshal(envelope)
+	if err != nil {
+		// json.Marshal of a fixed shape with a string field cannot realistically
+		// fail; fall back to a hard-coded valid JSON payload so the body still
+		// passes mergeLargeUsageChunks's json.Valid check.
+		return []byte(`{"error":{"message":"Too many requests","type":"rate_limit_exceeded","code":429}}`)
+	}
+	return out
 }
 
 // buildRejectedHeaders returns the response headers attached to a rate-limit
@@ -530,22 +702,45 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
 		pluginName, member, tokens, len(pending))
 
 	nowTime := time.Now()
-	keys := make([]interface{}, 0, len(pending))
-	args := []interface{}{strconv.FormatInt(nowTime.Unix(), 10)}
+	addEntries := make([]LimitEntry, 0, len(pending))
 	for _, p := range pending {
-		keys = append(keys, p.Key)
-		args = append(args,
-			strconv.FormatInt(p.windowSeconds(nowTime), 10),
-			strconv.Itoa(p.Quota),
-			modeAdd,
-			member,
-			strconv.FormatInt(tokens, 10),
-			strconv.FormatInt(p.ttlSeconds(nowTime), 10),
-		)
+		addEntries = append(addEntries, LimitEntry{
+			Key:    p.Key,
+			Window: p.windowSeconds(nowTime),
+			Quota:  p.Quota,
+			Mode:   modeAdd,
+			Member: member,
+			Count:  tokens,
+			TTL:    p.ttlSeconds(nowTime),
+			Combo:  p.Combo,
+			Kind:   p.Kind,
+			Bucket: p.Bucket,
+		})
 	}
 
-	if err := config.RedisClient.Eval(multiLevelLimitScript, len(keys), keys, args, nil); err != nil {
+	if _, err := config.Backend.BatchEval(nowTime.Unix(), addEntries, nil); err != nil {
 		proxywasm.LogWarnf("%s: token-limits add dispatch failed: %v", pluginName, err)
+		return
+	}
+	// Successful add (sync for local, fire-and-forget for redis): record the
+	// per-bucket token consumption. The redis async path may not have actually
+	// committed yet by the time we increment, but BatchEval returning nil error
+	// is the closest "intent to write" signal we have without plumbing a
+	// response callback for add-only flows.
+	ai, ok := ctx.GetContext(ctxKeyAILabels).(aiLabels)
+	if !ok {
+		// Onthe rare path where the request-headers handler did not run (e.g.
+		// the request was short-circuited before our phase), fall back to the
+		// "none" sentinel for every slot so the stat name is still emittable.
+		ai = aiLabels{
+			Route:    metricNoneLabel,
+			Cluster:  metricNoneLabel,
+			Model:    metricNoneLabel,
+			Consumer: metricNoneLabel,
+		}
+	}
+	for _, p := range pending {
+		emitValue(ai, config.RuleName, p.Combo, p.Kind, p.Bucket, uint64(tokens))
 	}
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,69 +49,56 @@ func TestCollectChecksOrderingAndModes(t *testing.T) {
 
 	headers := [][2]string{{"x-api-key", "k1"}}
 	reqID := "req-xyz"
-	keys, args, pending := collectChecks(cfg, headers, reqID)
+	entries, pending := collectChecks(cfg, headers, reqID, time.Now())
 
-	// Expected keys: query-only (1 q) + token-only (1 t) + both (1 q + 1 t) = 4
+	// Expected entries: query-only (1 q) + token-only (1 t) + both (1 q + 1 t) = 4
 	wantKeys := []string{
 		"myrule|query-only|header:x-api-key=k1|q:60s",
 		"myrule|token-only|header:x-api-key=k1|t:60s",
 		"myrule|both|header:x-api-key=k1|q:60s",
 		"myrule|both|header:x-api-key=k1|t:60s",
 	}
-	if len(keys) != len(wantKeys) {
-		t.Fatalf("len(keys)=%d, want %d; keys=%v", len(keys), len(wantKeys), keys)
+	if len(entries) != len(wantKeys) {
+		t.Fatalf("len(entries)=%d, want %d", len(entries), len(wantKeys))
 	}
 	for i, w := range wantKeys {
-		if got, _ := keys[i].(string); got != w {
-			t.Errorf("keys[%d]=%q, want %q", i, got, w)
+		if entries[i].Key != w {
+			t.Errorf("entries[%d].Key=%q, want %q", i, entries[i].Key, w)
 		}
 	}
 
-	// ARGV layout: [timestamp] + 4 * [window, quota, mode, member, count, ttl]
-	if want := 1 + len(wantKeys)*6; len(args) != want {
-		t.Fatalf("len(args)=%d, want %d; args=%v", len(args), want, args)
-	}
-
-	// First arg is the timestamp: non-empty numeric string.
-	if ts, _ := args[0].(string); ts == "" {
-		t.Errorf("args[0] timestamp empty")
-	} else if _, err := strconv.ParseInt(ts, 10, 64); err != nil {
-		t.Errorf("args[0] not numeric: %q", ts)
-	}
-
-	// Walk the 6-tuple per key and verify window/quota/mode/member/count/ttl.
+	// Walk entries and verify window/quota/mode/member/count/ttl.
 	// All combos here use per_minute (60s window), so TTL = window * 2 = 120s.
 	wantTuples := []struct {
-		window string
-		quota  string
+		window int64
+		quota  int
 		mode   string
-		count  string
-		ttl    string
+		count  int64
+		ttl    int64
 	}{
-		{"60", "100", modeCheckAndAdd, "1", "120"}, // query-only
-		{"60", "200000", modeCheck, "0", "120"},    // token-only
-		{"60", "50", modeCheckAndAdd, "1", "120"},  // both-query
-		{"60", "1000", modeCheck, "0", "120"},      // both-token
+		{60, 100, modeCheckAndAdd, 1, 120},    // query-only
+		{60, 200000, modeCheck, 0, 120},        // token-only
+		{60, 50, modeCheckAndAdd, 1, 120},      // both-query
+		{60, 1000, modeCheck, 0, 120},          // both-token
 	}
 	for i, w := range wantTuples {
-		base := 1 + i*6
-		if got, _ := args[base].(string); got != w.window {
-			t.Errorf("combo[%d] window=%q, want %q", i, got, w.window)
+		if entries[i].Window != w.window {
+			t.Errorf("entries[%d].Window=%d, want %d", i, entries[i].Window, w.window)
 		}
-		if got, _ := args[base+1].(string); got != w.quota {
-			t.Errorf("combo[%d] quota=%q, want %q", i, got, w.quota)
+		if entries[i].Quota != w.quota {
+			t.Errorf("entries[%d].Quota=%d, want %d", i, entries[i].Quota, w.quota)
 		}
-		if got, _ := args[base+2].(string); got != w.mode {
-			t.Errorf("combo[%d] mode=%q, want %q", i, got, w.mode)
+		if entries[i].Mode != w.mode {
+			t.Errorf("entries[%d].Mode=%q, want %q", i, entries[i].Mode, w.mode)
 		}
-		if got, _ := args[base+3].(string); got != reqID {
-			t.Errorf("combo[%d] member=%q, want %q", i, got, reqID)
+		if entries[i].Member != reqID {
+			t.Errorf("entries[%d].Member=%q, want %q", i, entries[i].Member, reqID)
 		}
-		if got, _ := args[base+4].(string); got != w.count {
-			t.Errorf("combo[%d] count=%q, want %q", i, got, w.count)
+		if entries[i].Count != w.count {
+			t.Errorf("entries[%d].Count=%d, want %d", i, entries[i].Count, w.count)
 		}
-		if got, _ := args[base+5].(string); got != w.ttl {
-			t.Errorf("combo[%d] ttl=%q, want %q", i, got, w.ttl)
+		if entries[i].TTL != w.ttl {
+			t.Errorf("entries[%d].TTL=%d, want %d", i, entries[i].TTL, w.ttl)
 		}
 	}
 
@@ -145,16 +131,12 @@ func TestCollectChecksAllCombosMiss(t *testing.T) {
 			},
 		},
 	}
-	keys, args, pending := collectChecks(cfg, [][2]string{{"x", "actual"}}, "rid")
-	if len(keys) != 0 {
-		t.Errorf("keys=%v, want empty", keys)
+	entries, pending := collectChecks(cfg, [][2]string{{"x", "actual"}}, "rid", time.Now())
+	if len(entries) != 0 {
+		t.Errorf("entries=%v, want empty", entries)
 	}
 	if len(pending) != 0 {
 		t.Errorf("pending=%v, want empty", pending)
-	}
-	// args still has the timestamp.
-	if len(args) != 1 {
-		t.Errorf("args=%v, want only timestamp", args)
 	}
 }
 
@@ -182,13 +164,13 @@ func TestCollectChecksMultiDimensionKey(t *testing.T) {
 		{"x-api-key", "premium-abc"},
 		{":path", "/chat?model=gpt-4"},
 	}
-	keys, _, _ := collectChecks(cfg, headers, "rid")
-	if len(keys) != 1 {
-		t.Fatalf("len(keys)=%d, want 1", len(keys))
+	entries, _ := collectChecks(cfg, headers, "rid", time.Now())
+	if len(entries) != 1 {
+		t.Fatalf("len(entries)=%d, want 1", len(entries))
 	}
 	want := "rr|c|header:x-api-key=premium-abc|param:model=gpt-4|q:3600s"
-	if got, _ := keys[0].(string); got != want {
-		t.Errorf("key=%q, want %q", got, want)
+	if entries[0].Key != want {
+		t.Errorf("key=%q, want %q", entries[0].Key, want)
 	}
 }
 
@@ -204,9 +186,9 @@ func TestCollectChecksSkipsQuotaWithoutWindow(t *testing.T) {
 			},
 		},
 	}
-	keys, _, _ := collectChecks(cfg, [][2]string{{"x", "v"}}, "rid")
-	if len(keys) != 0 {
-		t.Errorf("expected no keys for an empty quota, got %v", keys)
+	entries, _ := collectChecks(cfg, [][2]string{{"x", "v"}}, "rid", time.Now())
+	if len(entries) != 0 {
+		t.Errorf("expected no entries for an empty quota, got %v", entries)
 	}
 }
 
@@ -233,61 +215,50 @@ func TestCollectChecksTokenQuotaCalendar(t *testing.T) {
 	}
 
 	headers := [][2]string{{"x-mse-consumer", "tenant-a"}}
-	keys, args, pending := collectChecks(cfg, headers, "req-xyz")
+	entries, pending := collectChecks(cfg, headers, "req-xyz", time.Now())
 
-	// Three keys: rolling token + monthly quota + yearly quota.
+	// Three entries: rolling token + monthly quota + yearly quota.
 	// Top-level Timezone is NOT encoded into the key -- it's a deployment-wide constant.
 	wantKeys := []string{
 		"myrule|rolling-and-monthly|header:x-mse-consumer=tenant-a|t:60s",
 		"myrule|rolling-and-monthly|header:x-mse-consumer=tenant-a|t:each_month",
 		"myrule|yearly-only|header:x-mse-consumer=tenant-a|t:each_year",
 	}
-	if len(keys) != len(wantKeys) {
-		t.Fatalf("len(keys)=%d, want %d; keys=%v", len(keys), len(wantKeys), keys)
+	if len(entries) != len(wantKeys) {
+		t.Fatalf("len(entries)=%d, want %d", len(entries), len(wantKeys))
 	}
 	for i, w := range wantKeys {
-		if got, _ := keys[i].(string); got != w {
-			t.Errorf("keys[%d]=%q, want %q", i, got, w)
+		if entries[i].Key != w {
+			t.Errorf("entries[%d].Key=%q, want %q", i, entries[i].Key, w)
 		}
-	}
-
-	// ARGV: timestamp + 3 * 6-tuple
-	if want := 1 + len(wantKeys)*6; len(args) != want {
-		t.Fatalf("len(args)=%d, want %d", len(args), want)
 	}
 
 	// All token-flavoured checks must be mode=check, count=0.
-	for i := 0; i < len(wantKeys); i++ {
-		base := 1 + i*6
-		if got, _ := args[base+2].(string); got != modeCheck {
-			t.Errorf("combo[%d] mode=%q, want %q", i, got, modeCheck)
+	for i := range wantKeys {
+		if entries[i].Mode != modeCheck {
+			t.Errorf("entries[%d].Mode=%q, want %q", i, entries[i].Mode, modeCheck)
 		}
-		if got, _ := args[base+4].(string); got != "0" {
-			t.Errorf("combo[%d] count=%q, want %q", i, got, "0")
+		if entries[i].Count != 0 {
+			t.Errorf("entries[%d].Count=%d, want 0", i, entries[i].Count)
 		}
 	}
 
-	// Window arg for the rolling combo is the fixed 60s; TTL is window * 2 = 120s.
-	if got, _ := args[1].(string); got != "60" {
-		t.Errorf("rolling token window=%q, want %q", got, "60")
+	// Rolling entry (entries[0]): fixed 60s window, TTL = window * 2 = 120s.
+	if entries[0].Window != 60 {
+		t.Errorf("rolling token window=%d, want 60", entries[0].Window)
 	}
-	if got, _ := args[1+5].(string); got != "120" {
-		t.Errorf("rolling token ttl=%q, want %q", got, "120")
+	if entries[0].TTL != 120 {
+		t.Errorf("rolling token ttl=%d, want 120", entries[0].TTL)
 	}
-	// Calendar combos: window in [1, 366d], TTL must be (period_end - now + grace),
-	// at least covering the rest of the period (i.e. > grace seconds, < period+grace).
-	for _, base := range []int{1 + 1*6, 1 + 2*6} {
-		rawWin, _ := args[base].(string)
-		win, err := strconv.ParseInt(rawWin, 10, 64)
-		if err != nil || win < 1 || win > 366*86400 {
-			t.Errorf("calendar window=%q (parsed=%d, err=%v) outside expected range", rawWin, win, err)
+	// Calendar entries (entries[1], entries[2]): window in [1, 366d],
+	// TTL must be (period_end - now + grace).
+	for _, idx := range []int{1, 2} {
+		if entries[idx].Window < 1 || entries[idx].Window > 366*86400 {
+			t.Errorf("entries[%d].Window=%d outside expected range [1, 366d]", idx, entries[idx].Window)
 		}
-		rawTTL, _ := args[base+5].(string)
-		ttl, err := strconv.ParseInt(rawTTL, 10, 64)
-		// TTL >= grace floor (data must outlive a 1-2s window at period start);
-		// TTL <= 366d + grace (year is the largest period).
-		if err != nil || ttl <= 60 || ttl > 366*86400+ttlGraceSeconds+60 {
-			t.Errorf("calendar ttl=%q (parsed=%d, err=%v) outside expected range", rawTTL, ttl, err)
+		// TTL >= grace floor; TTL <= 366d + grace (year is the largest period).
+		if entries[idx].TTL <= 60 || entries[idx].TTL > 366*86400+ttlGraceSeconds+60 {
+			t.Errorf("entries[%d].TTL=%d outside expected range", idx, entries[idx].TTL)
 		}
 	}
 
@@ -619,18 +590,18 @@ func TestCollectChecksRegexpCaptureSharedBucket(t *testing.T) {
 		t.Fatalf("Validate(): %v", err)
 	}
 
-	apiKeys, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "ak-x.gpustack-1"}}, "rid-1")
-	uiKeys, _, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-1"}}, "rid-2")
+	apiEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "ak-x.gpustack-1"}}, "rid-1", time.Now())
+	uiEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-1"}}, "rid-2", time.Now())
 
-	if len(apiKeys) != 1 || len(uiKeys) != 1 {
-		t.Fatalf("len(apiKeys)=%d len(uiKeys)=%d, want 1 each", len(apiKeys), len(uiKeys))
+	if len(apiEntries) != 1 || len(uiEntries) != 1 {
+		t.Fatalf("len(apiEntries)=%d len(uiEntries)=%d, want 1 each", len(apiEntries), len(uiEntries))
 	}
-	if apiKeys[0] != uiKeys[0] {
-		t.Errorf("expected shared bucket: api=%v ui=%v", apiKeys[0], uiKeys[0])
+	if apiEntries[0].Key != uiEntries[0].Key {
+		t.Errorf("expected shared bucket: api=%v ui=%v", apiEntries[0].Key, uiEntries[0].Key)
 	}
 	want := "ai-budget|per-user|consumer=gpustack-1|t:each_month"
-	if got, _ := apiKeys[0].(string); got != want {
-		t.Errorf("key=%q, want %q", got, want)
+	if apiEntries[0].Key != want {
+		t.Errorf("key=%q, want %q", apiEntries[0].Key, want)
 	}
 }
 
@@ -692,3 +663,143 @@ func TestMatchPathFilters(t *testing.T) {
 		})
 	}
 }
+
+func TestSanitizeMetricLabel(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", "none"},
+		{"alice", "alice"},
+		{"consumer=alice", "consumer_alice"},
+		// '.' is preserved on purpose: Higress's bootstrap stats_tags regex
+		// for ai_route / ai_cluster / ai_model / ai_consumer backtrack
+		// correctly across dots and surface them in the Prometheus label
+		// value (e.g. ai_model="qwen3-0.6b"). See metrics.go.
+		{"header:x-higress-llm-model=qwen3-0.6b", "header_x-higress-llm-model_qwen3-0.6b"},
+		{"a|b|c", "a_b_c"},
+		{"192.168.1.1", "192.168.1.1"},
+		{"ai-route-route-1.internal", "ai-route-route-1.internal"},
+		{"outbound|80||model-1.static", "outbound_80__model-1.static"},
+		{"foo-bar_baz", "foo-bar_baz"}, // hyphens and underscores preserved
+	}
+	for _, c := range cases {
+		if got := sanitizeMetricLabel(c.in); got != c.want {
+			t.Errorf("sanitizeMetricLabel(%q)=%q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestFormatStatName(t *testing.T) {
+	// Bare label-only assembly: each (key, value) pair becomes a `key.value`
+	// segment joined with '.'.
+	got := formatStatName(
+		[2]string{"route", "ai-route-1.internal"},
+		[2]string{"upstream", "outbound|80||model-1.static"},
+		[2]string{"metric", metricNameRequestTotal},
+		[2]string{"result", "passed"},
+	)
+	want := "route.ai-route-1.internal.upstream.outbound_80__model-1.static.metric." + metricNameRequestTotal + ".result.passed"
+	if got != want {
+		t.Errorf("formatStatName=%q, want %q", got, want)
+	}
+
+	// No labels: empty string (caller must include at least the metric. slot).
+	if got := formatStatName(); got != "" {
+		t.Errorf("formatStatName empty=%q, want empty", got)
+	}
+
+	// Bucket label sanitisation flows through. '.' is preserved (see metrics.go).
+	bucketStat := formatStatName(
+		[2]string{"bucket", "consumer=alice|header:x-higress-llm-model=qwen3-0.6b"},
+	)
+	if !strings.Contains(bucketStat, "bucket.consumer_alice_header_x-higress-llm-model_qwen3-0.6b") {
+		t.Errorf("bucket sanitisation not applied: %q", bucketStat)
+	}
+}
+
+func TestAILabelsStatName(t *testing.T) {
+	// statName must produce the exact prefix layout that Higress's existing
+	// stats_tags regex extractors expect (route.X.upstream.Y.model.Z...).
+	ai := aiLabels{
+		Route:    "ai-route-1",
+		Cluster:  "outbound|80||model-1.static",
+		Model:    "qwen3-0.6b",
+		Consumer: "alice",
+	}
+	got := ai.statName(metricNameRejectedTotal,
+		[2]string{"rule", "r1"},
+		[2]string{"combo", "c1"},
+		[2]string{"kind", metricKindQuery},
+		[2]string{"bucket", "header:x-higress-llm-model=qwen3-0.6b"},
+	)
+	wantPrefix := "route.ai-route-1.upstream.outbound_80__model-1.static.model.qwen3-0.6b.consumer.alice.metric." + metricNameRejectedTotal
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Errorf("statName missing AI-aligned prefix:\n got=%q\nwant prefix=%q", got, wantPrefix)
+	}
+	if !strings.HasSuffix(got, ".bucket.header_x-higress-llm-model_qwen3-0.6b") {
+		t.Errorf("statName missing sanitised bucket suffix:\n got=%q", got)
+	}
+
+	// Empty slots default to "none" so the stat name is always well-formed.
+	empty := aiLabels{}.statName(metricNameRequestTotal, [2]string{"result", "passed"})
+	if !strings.HasPrefix(empty, "route.none.upstream.none.model.none.consumer.none.metric.") {
+		t.Errorf("empty AI labels did not collapse to 'none': %q", empty)
+	}
+}
+
+func TestCollectChecksMetricLabels(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "myrule",
+		Timezone: "UTC",
+		LimitCombinations: []LimitCombination{
+			{
+				Name: "all-three",
+				Match: []MatchRule{
+					mustHeaderRule(t, "x-mse-consumer", "alice"),
+					mustHeaderRule(t, "x-higress-llm-model", "qwen3-0.6b"),
+				},
+				QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+				TokenLimits: &RateQuota{PerMinute: intPtr(1000)},
+				TokenQuota:  &QuotaSpec{EachMonth: intPtr(60000)},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	headers := [][2]string{
+		{"x-mse-consumer", "alice"},
+		{"x-higress-llm-model", "qwen3-0.6b"},
+	}
+	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	if len(entries) != 3 {
+		t.Fatalf("len(entries)=%d, want 3", len(entries))
+	}
+
+	wantBucket := "header:x-mse-consumer=alice|header:x-higress-llm-model=qwen3-0.6b"
+	wantKinds := []string{metricKindQuery, metricKindTokenRolling, metricKindTokenCalendar}
+	for i, e := range entries {
+		if e.Combo != "all-three" {
+			t.Errorf("entries[%d].Combo=%q, want %q", i, e.Combo, "all-three")
+		}
+		if e.Kind != wantKinds[i] {
+			t.Errorf("entries[%d].Kind=%q, want %q", i, e.Kind, wantKinds[i])
+		}
+		if e.Bucket != wantBucket {
+			t.Errorf("entries[%d].Bucket=%q, want %q", i, e.Bucket, wantBucket)
+		}
+	}
+
+	// pending entries (token_rolling + token_calendar) must mirror the labels.
+	if len(pending) != 2 {
+		t.Fatalf("len(pending)=%d, want 2", len(pending))
+	}
+	if pending[0].Kind != metricKindTokenRolling || pending[0].Combo != "all-three" || pending[0].Bucket != wantBucket {
+		t.Errorf("pending[0] labels = %+v", pending[0])
+	}
+	if pending[1].Kind != metricKindTokenCalendar || pending[1].Combo != "all-three" || pending[1].Bucket != wantBucket {
+		t.Errorf("pending[1] labels = %+v", pending[1])
+	}
+}
+

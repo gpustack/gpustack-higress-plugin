@@ -55,8 +55,9 @@ type PluginConfig struct {
 	// boundaries across combinations.
 	Timezone string `json:"timezone,omitempty"`
 
-	// RedisClient is the initialized Redis cluster client (not part of JSON).
-	RedisClient wrapper.RedisClient `json:"-"`
+	// Backend is the rate-limit storage backend (not part of JSON).
+	// Set to a redisBackend when "redis" is present in config, otherwise localBackend.
+	Backend LimitBackend `json:"-"`
 
 	// location is the resolved Timezone (or UTC), populated by Validate.
 	location *time.Location
@@ -686,20 +687,20 @@ func (c *PluginConfig) Validate() error {
 //	redis:
 //	  service_name: my-redis.static
 //	  password: "********"
-func InitRedisClusterClient(raw gjson.Result, config *PluginConfig) error {
+// initRedisBackend reads the "redis" sub-object from raw and returns a
+// redisBackend. The caller must verify that raw.Get("redis") exists before
+// calling; this function treats a missing service_name as an error.
+func initRedisBackend(raw gjson.Result) (LimitBackend, error) {
 	redisConfig := raw.Get("redis")
-	if !redisConfig.Exists() {
-		return errors.New("missing redis in config")
-	}
 
 	serviceName := redisConfig.Get("service_name").String()
 	if serviceName == "" {
-		return errors.New("redis service_name must not be empty")
+		return nil, errors.New("redis service_name must not be empty")
 	}
 
 	servicePort := int(redisConfig.Get("service_port").Int())
 	if servicePort < 0 {
-		return fmt.Errorf("redis service_port %d must be >= 0", servicePort)
+		return nil, fmt.Errorf("redis service_port %d must be >= 0", servicePort)
 	}
 	if servicePort == 0 {
 		if strings.HasSuffix(serviceName, ".static") {
@@ -714,7 +715,7 @@ func InitRedisClusterClient(raw gjson.Result, config *PluginConfig) error {
 	password := redisConfig.Get("password").String()
 	timeout := int(redisConfig.Get("timeout").Int())
 	if timeout < 0 {
-		return fmt.Errorf("redis timeout %d must be >= 0", timeout)
+		return nil, fmt.Errorf("redis timeout %d must be >= 0", timeout)
 	}
 	if timeout == 0 {
 		timeout = 1000
@@ -722,12 +723,15 @@ func InitRedisClusterClient(raw gjson.Result, config *PluginConfig) error {
 
 	database := int(redisConfig.Get("database").Int())
 	if database < 0 {
-		return fmt.Errorf("redis database %d must be >= 0", database)
+		return nil, fmt.Errorf("redis database %d must be >= 0", database)
 	}
 
-	config.RedisClient = wrapper.NewRedisClusterClient(wrapper.FQDNCluster{
+	client := wrapper.NewRedisClusterClient(wrapper.FQDNCluster{
 		FQDN: serviceName,
 		Port: int64(servicePort),
 	})
-	return config.RedisClient.Init(username, password, int64(timeout), wrapper.WithDataBase(database))
+	if err := client.Init(username, password, int64(timeout), wrapper.WithDataBase(database)); err != nil {
+		return nil, err
+	}
+	return &redisBackend{client: client}, nil
 }
