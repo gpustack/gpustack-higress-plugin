@@ -133,22 +133,47 @@ type aiLabels struct {
 	Consumer string
 }
 
-// withMetric prepends the four AI slots and the metric.<name> marker to the
-// given extra label list, producing the full stat name expected by
-// formatStatName. Pulling this together centrally keeps the slot ordering
-// in one place -- reordering it would silently break the Higress regex
-// extractors documented in formatStatName's comment.
+// statName builds the full Envoy stat name for a single metric emission.
+// The result is `route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.<metricName>.<extra>...`,
+// the slot ordering required by the Higress bootstrap stats_tags regex
+// extractors documented on formatStatName -- reordering these five
+// leading slots would silently break ai_route / ai_cluster / ai_model /
+// ai_consumer auto-extraction.
+//
+// We append directly into a strings.Builder rather than going through
+// formatStatName(labels...). This is the metric-emission hot path
+// (called 1-N times per passed request, once on every rejection) and
+// the previous implementation allocated an intermediate
+// `[][2]string` of 5+len(extras) on every call. The builder still
+// allocates its byte buffer, but that allocation is unavoidable and
+// can be sized once with Grow.
 func (a aiLabels) statName(metricName string, extras ...[2]string) string {
-	labels := make([][2]string, 0, 5+len(extras))
-	labels = append(labels,
-		[2]string{"route", a.Route},
-		[2]string{"upstream", a.Cluster},
-		[2]string{"model", a.Model},
-		[2]string{"consumer", a.Consumer},
-		[2]string{"metric", metricName},
-	)
-	labels = append(labels, extras...)
-	return formatStatName(labels...)
+	var sb strings.Builder
+	// Rough capacity estimate: each AI label segment averages ~16 bytes
+	// (key + dot + sanitised value + dot), the metric name ~40 bytes,
+	// each extra ~16 bytes. Overshooting is cheap; reallocating mid-
+	// build is what we want to avoid.
+	sb.Grow(120 + len(extras)*20)
+
+	sb.WriteString("route.")
+	sb.WriteString(sanitizeMetricLabel(a.Route))
+	sb.WriteString(".upstream.")
+	sb.WriteString(sanitizeMetricLabel(a.Cluster))
+	sb.WriteString(".model.")
+	sb.WriteString(sanitizeMetricLabel(a.Model))
+	sb.WriteString(".consumer.")
+	sb.WriteString(sanitizeMetricLabel(a.Consumer))
+	sb.WriteString(".metric.")
+	sb.WriteString(sanitizeMetricLabel(metricName))
+
+	for _, kv := range extras {
+		sb.WriteByte('.')
+		sb.WriteString(kv[0])
+		sb.WriteByte('.')
+		sb.WriteString(sanitizeMetricLabel(kv[1]))
+	}
+
+	return sb.String()
 }
 
 // emitRequestOutcome increments request_total once per request, regardless

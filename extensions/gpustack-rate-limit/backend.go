@@ -213,6 +213,16 @@ type windowEntry struct {
 
 // localWindowTotal reads shared data for key and sums the counts of all entries
 // with timestamp in (now-window, now]. Returns 0 when the key does not exist yet.
+//
+// We deliberately iterate the raw byte buffer instead of going through
+// decodeEntries: this is the request-phase hot path (called on every request
+// matching the local backend) and decodeEntries would allocate a []windowEntry
+// on each call. The wasm VM has a 200 MiB rebuild ceiling, so reducing
+// per-request allocation extends VM lifetime. localAddEntry still uses
+// decodeEntries because it needs to mutate / filter the slice anyway.
+//
+// Trailing bytes not aligned to 16 are silently discarded, mirroring
+// decodeEntries semantics.
 func localWindowTotal(key string, now, window int64) (int64, error) {
 	data, _, err := proxywasm.GetSharedData(key)
 	if errors.Is(err, types.ErrorStatusNotFound) {
@@ -223,9 +233,10 @@ func localWindowTotal(key string, now, window int64) (int64, error) {
 	}
 	cutoff := now - window
 	var total int64
-	for _, e := range decodeEntries(data) {
-		if e.timestamp > cutoff {
-			total += e.count
+	for i := 0; i+16 <= len(data); i += 16 {
+		timestamp := int64(binary.BigEndian.Uint64(data[i:]))
+		if timestamp > cutoff {
+			total += int64(binary.BigEndian.Uint64(data[i+8:]))
 		}
 	}
 	return total, nil
