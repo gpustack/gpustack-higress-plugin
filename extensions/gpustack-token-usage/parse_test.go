@@ -179,3 +179,174 @@ func TestExtractModelFromMultipart(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractRequestContentBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int64
+	}{
+		{
+			name: "openai chat string content",
+			body: `{"model":"gpt-4o","messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"hello"}]}`,
+			want: int64(len("you are helpful") + len("hello")),
+		},
+		{
+			name: "openai chat multimodal content array",
+			body: `{"messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`,
+			want: int64(len("describe")),
+		},
+		{
+			name: "anthropic with system field string + messages",
+			body: `{"model":"claude","system":"act as expert","messages":[{"role":"user","content":"hi"}]}`,
+			want: int64(len("act as expert") + len("hi")),
+		},
+		{
+			name: "anthropic system as array of text blocks",
+			body: `{"system":[{"type":"text","text":"part1"},{"type":"text","text":"part2"}],"messages":[]}`,
+			want: int64(len("part1") + len("part2")),
+		},
+		{
+			name: "openai responses api input array",
+			body: `{"input":[{"role":"user","content":"q"}]}`,
+			want: int64(len("q")),
+		},
+		{
+			name: "image-only content yields zero",
+			body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`,
+			want: 0,
+		},
+		{
+			name: "empty body",
+			body: `{}`,
+			want: 0,
+		},
+		{
+			name: "non-string content type without text block ignored",
+			body: `{"messages":[{"role":"user","content":[{"type":"file","file":{"id":"f"}}]}]}`,
+			want: 0,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := extractRequestContentBytes([]byte(c.body))
+			if got != c.want {
+				t.Errorf("extractRequestContentBytes(%s) = %d, want %d", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsOutputDeltaChunk(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		// OpenAI shapes
+		{
+			name: "openai delta with content text",
+			body: `{"choices":[{"delta":{"content":"hi"}}]}`,
+			want: true,
+		},
+		{
+			name: "openai delta empty content",
+			body: `{"choices":[{"delta":{"content":""}}]}`,
+			want: false,
+		},
+		{
+			name: "openai delta with tool_calls",
+			body: `{"choices":[{"delta":{"tool_calls":[{"id":"t1","function":{"name":"x"}}]}}]}`,
+			want: true,
+		},
+		{
+			name: "openai delta with function_call",
+			body: `{"choices":[{"delta":{"function_call":{"name":"x"}}}]}`,
+			want: true,
+		},
+		{
+			name: "openai usage-only chunk has empty choices",
+			body: `{"choices":[],"usage":{"total_tokens":150}}`,
+			want: false,
+		},
+		// Anthropic shapes
+		{
+			name: "anthropic content_block_delta with text",
+			body: `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`,
+			want: true,
+		},
+		{
+			name: "anthropic content_block_delta with empty text",
+			body: `{"type":"content_block_delta","delta":{"type":"text_delta","text":""}}`,
+			want: false,
+		},
+		{
+			name: "anthropic content_block_delta partial_json",
+			body: `{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"a\":"}}`,
+			want: true,
+		},
+		{
+			name: "anthropic message_start (not a delta)",
+			body: `{"type":"message_start","message":{"usage":{"input_tokens":50}}}`,
+			want: false,
+		},
+		{
+			name: "anthropic message_delta (not a content delta)",
+			body: `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}`,
+			want: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := isOutputDeltaChunk([]byte(c.body))
+			if got != c.want {
+				t.Errorf("isOutputDeltaChunk(%s) = %v, want %v", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+func TestIsOpenAIUsageOnlyChunk(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "canonical usage-only chunk",
+			body: `{"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":100,"total_tokens":150}}`,
+			want: true,
+		},
+		{
+			name: "delta chunk with content",
+			body: `{"choices":[{"delta":{"content":"hi"}}]}`,
+			want: false,
+		},
+		{
+			name: "non-empty choices with usage piggybacked",
+			body: `{"choices":[{"delta":{}}],"usage":{"total_tokens":150}}`,
+			want: false,
+		},
+		{
+			name: "anthropic message_delta does not match",
+			body: `{"type":"message_delta","usage":{"output_tokens":42}}`,
+			want: false,
+		},
+		{
+			name: "no choices field",
+			body: `{"usage":{"total_tokens":150}}`,
+			want: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := isOpenAIUsageOnlyChunk([]byte(c.body))
+			if got != c.want {
+				t.Errorf("isOpenAIUsageOnlyChunk(%s) = %v, want %v", c.body, got, c.want)
+			}
+		})
+	}
+}

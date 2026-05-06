@@ -36,7 +36,6 @@ const (
 	IncompleteChunk     = "gpustack_incomplete_chunk"
 	IncompleteChunkData = "gpustack_incomplete_chunk_data"
 	UsageExtraKey       = "gpustack_usage_extra"
-	ModifiedKey         = "gpustack_usage_modified"
 	SeenUsageChunk      = "gpustack_seen_usage_chunk"
 	ProcessedUsageChunk = "gpustack_processed_usage_chunk"
 
@@ -46,8 +45,43 @@ const (
 	InjectStreamOptionsKey = "gpustack_inject_stream_options"
 	BaseMetricsKey         = "gpustack_base_metrics"
 	MetricsTrackingKey     = "gpustack_metrics_tracking"
+	MetricsStartedAtKey    = "gpustack_metrics_started_at"
+	MetricsReportedKey     = "gpustack_metrics_reported"
 	RequestHeadersKey      = "gpustack_headers"
 	MultipartContentType   = "gpustack_multipart_content_type"
+
+	// StripUsageChunkKey is set when the user's request body had explicit
+	// stream_options.include_usage:false; we override to true to guarantee
+	// usage telemetry, then drop the OpenAI usage-only chunk before the
+	// client sees it (sniff-but-don't-leak).
+	StripUsageChunkKey = "gpustack_strip_usage_chunk"
+
+	// OutputChunkCountKey accumulates the number of streaming delta chunks
+	// containing output content (OpenAI choices[0].delta.content non-empty,
+	// Anthropic content_block_delta with non-empty text/json/thinking).
+	// Reported as a fallback signal for token estimation when the canonical
+	// usage chunk never arrives (e.g. client-disconnect mid-stream).
+	OutputChunkCountKey = "gpustack_output_chunk_count"
+
+	// RequestContentBytesKey holds the byte-length of extracted text content
+	// from the request body (messages[].content / input[].content / system).
+	// This is a downstream signal for input-token estimation in the
+	// completed=false path; the byte→token ratio is content/locale-specific
+	// and must be applied by the billing service, not by the proxy.
+	RequestContentBytesKey = "gpustack_request_content_bytes"
+
+	// ResponseCompletedKey records whether the response reached its normal
+	// terminus. Set true when:
+	//   - onStreamingResponseBody observed endOfStream=true (covers both
+	//     SSE streams and non-streaming JSON, which reaches the same
+	//     callback as a single chunk with endOfStream=true);
+	//   - onHttpResponseHeaders skipped body reading (TTS/image path) and
+	//     the upstream responded 2xx.
+	// A mid-stream client disconnect / upstream reset never produces
+	// endOfStream=true, so this stays false. Decouples the completed flag
+	// from token counts so non-LLM endpoints (token fields legitimately 0)
+	// are not confused with interrupted LLM streams.
+	ResponseCompletedKey = "gpustack_response_completed"
 )
 
 func main() {}
@@ -60,6 +94,7 @@ func init() {
 		wrapper.ProcessRequestBody(onHttpRequestBody),
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
+		wrapper.ProcessStreamDone(onHttpStreamDone),
 	)
 }
 
@@ -82,18 +117,36 @@ type PluginConfig struct {
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
+// StartedAt / CompletedAt are UnixMilli wall-clock stamps captured at request
+// entry (after path/cluster filtering) and at report dispatch respectively.
+// Both are needed because rate-limit accounting splits across the two:
+// QueryLimits attribute requests at start, TokenLimits / TokenQuota attribute
+// tokens at completion (a stream that crosses a calendar boundary lands in the
+// period it ends in).
+//
+// Completed is true iff the canonical usage chunk was observed before the
+// stream ended. When false (e.g. client-disconnect mid-stream), token fields
+// may be 0 (OpenAI/vLLM) or partial (Anthropic message_start carries
+// input_tokens early, so InputToken is usually populated even on cancel).
+// OutputChunkCount and RequestContentBytes are downstream-side estimation
+// inputs; the proxy never applies estimation ratios itself.
 type ModelUsageMetrics struct {
-	Model        string  `json:"model"`
-	InputToken   int64   `json:"input_token"`
-	OutputToken  int64   `json:"output_token"`
-	TotalToken   int64   `json:"total_token"`
-	InputCachedToken int64 `json:"input_cached_token"`
-	RequestCount int     `json:"request_count"`
-	UserID       *int64  `json:"user_id,omitempty"`
-	ModelID      *int64  `json:"model_id,omitempty"`
-	ModelRouteID *int64  `json:"model_route_id,omitempty"`
-	ProviderID   *int64  `json:"provider_id,omitempty"`
-	AccessKey    *string `json:"access_key,omitempty"`
+	Model               string  `json:"model"`
+	InputToken          int64   `json:"input_token"`
+	OutputToken         int64   `json:"output_token"`
+	TotalToken          int64   `json:"total_token"`
+	InputCachedToken    int64   `json:"input_cached_token"`
+	RequestCount        int     `json:"request_count"`
+	Completed           bool    `json:"completed"`
+	OutputChunkCount    int64   `json:"output_chunk_count"`
+	RequestContentBytes int64   `json:"request_content_bytes"`
+	StartedAt           int64   `json:"started_at"`
+	CompletedAt         int64   `json:"completed_at"`
+	UserID              *int64  `json:"user_id,omitempty"`
+	ModelID             *int64  `json:"model_id,omitempty"`
+	ModelRouteID        *int64  `json:"model_route_id,omitempty"`
+	ProviderID          *int64  `json:"provider_id,omitempty"`
+	AccessKey           *string `json:"access_key,omitempty"`
 }
 
 func matchPathSuffix(targetURI string, suffixes []string) bool {
@@ -228,6 +281,7 @@ func prepareMetrics(ctx wrapper.HttpContext) bool {
 		}
 	}
 	ctx.SetContext(MetricsTrackingKey, true)
+	ctx.SetContext(MetricsStartedAtKey, time.Now().UnixMilli())
 	if mt == "multipart/form-data" {
 		ctx.SetContext(MultipartContentType, contentType)
 	}
@@ -333,8 +387,17 @@ func buildBaseMetrics(ctx wrapper.HttpContext) *ModelUsageMetrics {
 	return m
 }
 
-// processRequestBody extracts the model name, sets stream state, and optionally injects
-// stream_options.include_usage. Returns the (possibly modified) headers slice.
+// processRequestBody extracts the model name, sets stream state, optionally
+// forces stream_options.include_usage:true, and computes request content
+// bytes for downstream input-token estimation. Returns the (possibly modified)
+// headers slice.
+//
+// Force-include-usage policy: when the path is in EnableUsageOnPathSuffix and
+// the request is streaming, we always inject include_usage:true regardless of
+// what the client sent. If the client had an explicit include_usage:false, we
+// also set StripUsageChunkKey so the response-side will drop the OpenAI
+// usage-only chunk before it leaves the proxy — the client's contract is
+// preserved while the proxy still gets reliable usage telemetry.
 func processRequestBody(ctx wrapper.HttpContext, body []byte, headers [][2]string) [][2]string {
 	if multipartCT, ok := ctx.GetContext(MultipartContentType).(string); ok {
 		if model := extractModelFromMultipart(body, multipartCT); model != "" {
@@ -348,6 +411,10 @@ func processRequestBody(ctx wrapper.HttpContext, body []byte, headers [][2]strin
 		ctx.SetContext(RequestModelKey, model)
 	}
 
+	if cb := extractRequestContentBytes(body); cb > 0 {
+		ctx.SetContext(RequestContentBytesKey, cb)
+	}
+
 	stream := gjson.GetBytes(body, "stream")
 	if ctx.GetBoolContext(ProcessBodyKey, false) {
 		ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
@@ -356,25 +423,90 @@ func processRequestBody(ctx wrapper.HttpContext, body []byte, headers [][2]strin
 	if !ctx.GetBoolContext(InjectStreamOptionsKey, false) {
 		return headers
 	}
+	if !stream.Exists() || !stream.Bool() {
+		return headers
+	}
 
 	includeUsage := gjson.GetBytes(body, "stream_options.include_usage")
-	if stream.Exists() && stream.Bool() && !includeUsage.Exists() {
-		proxywasm.LogDebug("setting include_usage to request body")
-		newBody, err := sjson.SetBytes(body, "stream_options.include_usage", true)
-		if err != nil {
-			proxywasm.LogErrorf("failed to set json body, %v", err)
-		} else if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
-			proxywasm.LogWarnf("failed to replace new body %s, %v", string(newBody), err)
-		} else {
-			headers = removeHeader("content-length", headers)
-		}
-	} else {
-		proxywasm.LogDebug("no need to modify request body")
-		if includeUsage.Exists() && !includeUsage.Bool() {
-			ctx.SetContext(StatisticsRequestStartTime, nil)
+	if includeUsage.Exists() && !includeUsage.Bool() {
+		ctx.SetContext(StripUsageChunkKey, true)
+	}
+	if includeUsage.Exists() && includeUsage.Bool() {
+		return headers
+	}
+
+	proxywasm.LogDebug("forcing stream_options.include_usage=true on request body")
+	newBody, err := sjson.SetBytes(body, "stream_options.include_usage", true)
+	if err != nil {
+		proxywasm.LogErrorf("failed to set json body, %v", err)
+		return headers
+	}
+	if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+		proxywasm.LogWarnf("failed to replace new body %s, %v", string(newBody), err)
+		return headers
+	}
+	return removeHeader("content-length", headers)
+}
+
+// extractRequestContentBytes sums the byte length of text-bearing fields in
+// common AI request shapes:
+//   - OpenAI Chat Completions / Anthropic Messages: messages[].content
+//     (string, or array of blocks with type=text)
+//   - OpenAI Responses API: input[].content (same shape)
+//   - Anthropic top-level system (string or array of text blocks)
+//
+// Image / audio / file blocks are deliberately excluded — their byte size
+// (often huge base64) bears no useful relation to token cost. Returns 0 if
+// no recognized shape matches; callers should treat 0 as "unknown".
+//
+// This is a downstream estimation input, not an authoritative count. The
+// byte→token ratio depends on tokenizer + content language and must be
+// applied by the billing service.
+func extractRequestContentBytes(body []byte) int64 {
+	var total int64
+	visit := func(arr gjson.Result) {
+		arr.ForEach(func(_, m gjson.Result) bool {
+			content := m.Get("content")
+			if !content.Exists() {
+				return true
+			}
+			if content.Type == gjson.String {
+				total += int64(len(content.String()))
+				return true
+			}
+			if content.IsArray() {
+				content.ForEach(func(_, block gjson.Result) bool {
+					if t := block.Get("type").String(); t == "text" || t == "" {
+						if text := block.Get("text"); text.Type == gjson.String {
+							total += int64(len(text.String()))
+						}
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
+	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
+		visit(msgs)
+	}
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		visit(input)
+	}
+	if sys := gjson.GetBytes(body, "system"); sys.Exists() {
+		switch {
+		case sys.Type == gjson.String:
+			total += int64(len(sys.String()))
+		case sys.IsArray():
+			sys.ForEach(func(_, block gjson.Result) bool {
+				if text := block.Get("text"); text.Type == gjson.String {
+					total += int64(len(text.String()))
+				}
+				return true
+			})
 		}
 	}
-	return headers
+	return total
 }
 
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
@@ -400,7 +532,18 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 		return types.ActionContinue
 	}
 	if !processBody {
-		reportMetrics(ctx, config)
+		// Reporting is deferred to onHttpStreamDone — a single emission
+		// point that fires for clean completions, upstream errors, and
+		// downstream-cancel resets alike. Don't read the response body
+		// for this path (TTS/STT/image or other non-text upstream).
+		// The body callback is skipped, so the completed signal has to
+		// be set here based on the upstream status: 2xx is taken as
+		// "normally completed" since these endpoints typically have no
+		// token usage and request-count is the billable unit.
+		if status, err := proxywasm.GetHttpResponseHeader(":status"); err == nil &&
+			len(status) > 0 && status[0] == '2' {
+			ctx.SetContext(ResponseCompletedKey, true)
+		}
 		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
@@ -419,12 +562,26 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool) []byte {
 	result := processTokenUsage(ctx, data)
 	if endOfStream {
+		ctx.SetContext(ResponseCompletedKey, true)
 		if ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
 			proxywasm.LogWarnf("no usage is found in any chunk with usage bytes")
 		}
-		reportMetrics(ctx, config)
 	}
 	return result
+}
+
+// onHttpStreamDone is the single emission point for the metrics report.
+// proxy-wasm fires this hook regardless of how the stream ended — clean
+// completion, upstream 5xx, downstream client disconnect, or filter-chain
+// reset — so even mid-stream cancels produce a report (with completed=false
+// and best-effort token data captured up to the disconnect). reportMetrics
+// is idempotent via MetricsReportedKey so this is safe to call alongside
+// any earlier emission paths if they get reintroduced later.
+func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
+	if !ctx.GetBoolContext(MetricsTrackingKey, false) {
+		return
+	}
+	reportMetrics(ctx, config)
 }
 
 func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
@@ -460,10 +617,6 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
 	var rtn = [][]byte{}
 	for chunk := range chunks {
-		if ctx.GetBoolContext(ModifiedKey, false) {
-			rtn = append(rtn, chunk)
-			continue
-		}
 		chunk = mergeLargeUsageChunks(ctx, chunk)
 		if chunk == nil {
 			rtn = append(rtn, []byte(""))
@@ -474,6 +627,14 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 			rtn = append(rtn, chunk)
 			continue
 		}
+
+		// Always-on per-chunk observation: count delta chunks (downstream
+		// uses this as fallback output-token estimator) and greedily capture
+		// Anthropic message_start usage so a mid-stream cancel still keeps
+		// input_tokens / cache token data on the report.
+		countOutputDeltaChunk(ctx, trimed_data)
+		captureAnthropicMessageStart(ctx, trimed_data)
+
 		result := gjson.GetBytes(trimed_data, "usage")
 		if !result.Exists() {
 			rtn = append(rtn, chunk)
@@ -487,12 +648,110 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 			continue
 		}
 		ctx.SetContext(ProcessedUsageChunk, true)
+
+		// Strip OpenAI usage-only chunk when the user originally set
+		// include_usage:false. FinalUsageKey was already populated by
+		// getUsageExtra above, so the report still has the data; the
+		// client just doesn't see the chunk it didn't ask for.
+		if ctx.GetBoolContext(StripUsageChunkKey, false) && isOpenAIUsageOnlyChunk(trimed_data) {
+			proxywasm.LogDebugf("processTokenUsage: stripping OpenAI usage chunk (client requested include_usage=false)")
+			continue
+		}
+
 		modified := process_data_with_token(trimed_data, usageExtra)
 		proxywasm.LogDebugf("processTokenUsage: modified: %s", string(modified))
 		rtn = append(rtn, append([]byte("data: "), modified...))
-		ctx.SetContext(ModifiedKey, true)
 	}
 	return bytes.Join(rtn, []byte("\n\n"))
+}
+
+// countOutputDeltaChunk increments OutputChunkCountKey when this chunk
+// carries non-empty generated content. Detects:
+//   - OpenAI streaming: choices[*].delta with non-empty content / tool_calls
+//     / function_call. The final usage-only chunk has choices=[] and is
+//     therefore correctly excluded.
+//   - Anthropic streaming: type="content_block_delta" with non-empty
+//     delta.text / delta.partial_json / delta.thinking.
+func countOutputDeltaChunk(ctx wrapper.HttpContext, data []byte) {
+	if !isOutputDeltaChunk(data) {
+		return
+	}
+	prev, _ := ctx.GetContext(OutputChunkCountKey).(int64)
+	ctx.SetContext(OutputChunkCountKey, prev+1)
+}
+
+func isOutputDeltaChunk(data []byte) bool {
+	if choices := gjson.GetBytes(data, "choices"); choices.IsArray() {
+		hit := false
+		choices.ForEach(func(_, c gjson.Result) bool {
+			delta := c.Get("delta")
+			if !delta.Exists() {
+				return true
+			}
+			if content := delta.Get("content"); content.Exists() && content.String() != "" {
+				hit = true
+				return false
+			}
+			if tc := delta.Get("tool_calls"); tc.IsArray() && len(tc.Array()) > 0 {
+				hit = true
+				return false
+			}
+			if fc := delta.Get("function_call"); fc.Exists() {
+				hit = true
+				return false
+			}
+			return true
+		})
+		if hit {
+			return true
+		}
+	}
+	if gjson.GetBytes(data, "type").String() == "content_block_delta" {
+		delta := gjson.GetBytes(data, "delta")
+		if text := delta.Get("text"); text.Exists() && text.String() != "" {
+			return true
+		}
+		if pj := delta.Get("partial_json"); pj.Exists() && pj.String() != "" {
+			return true
+		}
+		if th := delta.Get("thinking"); th.Exists() && th.String() != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// captureAnthropicMessageStart eagerly stores the message_start usage block
+// in FinalUsageKey. Anthropic's message_start is the first SSE event and
+// already carries input_tokens / cache_*_input_tokens; capturing it early
+// means a mid-stream client disconnect still leaves the report with
+// trustworthy input-side accounting. Subsequent message_delta usage events
+// (which carry the final output_tokens) overwrite this naturally.
+func captureAnthropicMessageStart(ctx wrapper.HttpContext, data []byte) {
+	if gjson.GetBytes(data, "type").String() != "message_start" {
+		return
+	}
+	if !gjson.GetBytes(data, "message.usage").Exists() {
+		return
+	}
+	usage := tokenusage.GetTokenUsage(ctx, data)
+	if usage.InputToken > 0 || usage.AnthropicCacheReadInputToken > 0 || usage.AnthropicCacheCreationInputToken > 0 {
+		ctx.SetContext(FinalUsageKey, usage)
+	}
+}
+
+// isOpenAIUsageOnlyChunk identifies the OpenAI/vLLM final usage chunk —
+// choices is an empty array and usage is populated. Used to gate stripping
+// when the client originally set stream_options.include_usage:false.
+func isOpenAIUsageOnlyChunk(data []byte) bool {
+	choices := gjson.GetBytes(data, "choices")
+	if !choices.IsArray() {
+		return false
+	}
+	if len(choices.Array()) != 0 {
+		return false
+	}
+	return gjson.GetBytes(data, "usage").Exists()
 }
 
 // parseConsumerHeader parses x-mse-consumer value of the form [access_key.]gpustack-<user_id>.
@@ -580,6 +839,9 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	if config.ReportClient == nil {
 		return
 	}
+	if ctx.GetBoolContext(MetricsReportedKey, false) {
+		return
+	}
 	base, ok := ctx.GetContext(BaseMetricsKey).(*ModelUsageMetrics)
 	if !ok {
 		proxywasm.LogDebugf("reportMetrics: no base metrics, skipping")
@@ -597,6 +859,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		proxywasm.LogDebugf("reportMetrics: cluster_name %s does not match expected pattern, skipping", clusterName)
 		return
 	}
+	ctx.SetContext(MetricsReportedKey, true)
 
 	var modelRouteID *int64
 	if routeNameBytes, err := proxywasm.GetProperty([]string{"route_name"}); err == nil && len(routeNameBytes) > 0 {
@@ -608,18 +871,33 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	if model == "" {
 		model = usage.Model
 	}
+	startedAt, _ := ctx.GetContext(MetricsStartedAtKey).(int64)
+	chunkCount, _ := ctx.GetContext(OutputChunkCountKey).(int64)
+	contentBytes, _ := ctx.GetContext(RequestContentBytesKey).(int64)
+	// Completed reflects whether the response reached its normal terminus,
+	// independently of whether any tokens were emitted. This decouples
+	// non-LLM endpoints (TTS/image — token fields legitimately 0) from
+	// interrupted LLM streams (token fields also 0 but request did not
+	// finish). Set by onStreamingResponseBody when endOfStream=true and by
+	// the response-headers fast path on 2xx upstream status.
+	completed := ctx.GetBoolContext(ResponseCompletedKey, false)
 	metrics := ModelUsageMetrics{
-		Model:        model,
-		InputToken:   usage.InputToken,
-		OutputToken:  usage.OutputToken,
-		TotalToken:   usage.TotalToken,
-		InputCachedToken: resolveInputCachedToken(usage),
-		RequestCount: base.RequestCount,
-		UserID:       base.UserID,
-		AccessKey:    base.AccessKey,
-		ModelID:      modelID,
-		ModelRouteID: modelRouteID,
-		ProviderID:   providerID,
+		Model:               model,
+		InputToken:          usage.InputToken,
+		OutputToken:         usage.OutputToken,
+		TotalToken:          usage.TotalToken,
+		InputCachedToken:    resolveInputCachedToken(usage),
+		RequestCount:        base.RequestCount,
+		Completed:           completed,
+		OutputChunkCount:    chunkCount,
+		RequestContentBytes: contentBytes,
+		StartedAt:           startedAt,
+		CompletedAt:         time.Now().UnixMilli(),
+		UserID:              base.UserID,
+		AccessKey:           base.AccessKey,
+		ModelID:             modelID,
+		ModelRouteID:        modelRouteID,
+		ProviderID:          providerID,
 	}
 
 	body, err := json.Marshal(metrics)

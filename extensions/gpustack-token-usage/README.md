@@ -108,6 +108,11 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
   "total_token": 150,
   "input_cached_token": 10,
   "request_count": 1,
+  "completed": true,
+  "output_chunk_count": 87,
+  "request_content_bytes": 2048,
+  "started_at": 1746518400123,
+  "completed_at": 1746518402456,
   "model_id": 3,
   "model_route_id": 1,
   "user_id": 42,
@@ -115,9 +120,52 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
 }
 ```
 
-`model_id` and `provider_id` are mutually exclusive and derived from the cluster name. `model_route_id` is derived from the Envoy `route_name` property (formats `ai-route-route-<id>.internal` or `ai-route-route-<id>.fallback.internal`) and is omitted when the route name does not match. `input_cached_token` aggregates cached prompt tokens from OpenAI/vLLM (`usage.prompt_tokens_details.cached_tokens`) and Anthropic (`cache_read_input_tokens`); cache-creation tokens are excluded because they are new tokens being written, not a hit. For TTS/STT or other non-LLM routes where no token usage is recorded, all token counts default to `0`.
+#### Field reference
+
+| Field | Always present | Meaning |
+| --- | --- | --- |
+| `model` | yes | Model name from the request (or upstream usage payload as fallback). |
+| `input_token` / `output_token` / `total_token` / `input_cached_token` | yes (may be `0`) | Token counts from the upstream usage chunk. `0` does not necessarily mean the request was free — see `completed` below. |
+| `request_count` | yes (always `1`) | Reserved for future per-batch reporting. |
+| `completed` | yes | `true` iff the response reached its normal terminus — independent of whether any tokens were emitted. Set when the body callback observes `endOfStream=true` (covers SSE streams and non-streaming JSON), or when the body-skip fast path (TTS/STT/image) observed a 2xx upstream status. `false` indicates a mid-stream client disconnect or upstream reset. Crucially: a TTS request that completes normally has all token fields `0` but `completed: true`; an LLM stream cut mid-flight also has token fields `0` but `completed: false`. |
+| `output_chunk_count` | yes (may be `0`) | Number of streaming delta chunks observed with non-empty content. Always populated; useful for output-token estimation when `completed=false` and for calibrating the `chunks → tokens` ratio when `completed=true`. |
+| `request_content_bytes` | yes (may be `0`) | Sum of `messages[].content`, `input[].content`, and top-level `system` text-block byte lengths from the request. Excludes images / audio / file blocks. `0` for unrecognized request shapes (e.g. multipart/form-data). |
+| `started_at` / `completed_at` | yes | UnixMilli wall-clock stamps at request entry (after path/cluster filtering) and at report dispatch. Both are emitted because request-rate accounting attributes events at start (e.g. QPS / `QueryLimits`) while token-rate accounting attributes events at completion (e.g. `TokenLimits` / calendar `TokenQuota`); a stream that crosses a calendar boundary lands in the period it ends in. |
+| `model_id` / `provider_id` | mutually exclusive | Derived from the Envoy cluster name (`outbound\|<port>\|\|model-<id>-<instance>` or `provider-<id>`). |
+| `model_route_id` | when matched | Derived from the Envoy `route_name` property; formats `ai-route-route-<id>.internal` and `ai-route-route-<id>.fallback.internal` (suffix optional). |
+| `user_id` / `access_key` | when present | Parsed from the `x-mse-consumer` header. |
+
+`input_cached_token` aggregates cached prompt tokens from OpenAI/vLLM (`usage.prompt_tokens_details.cached_tokens`) and Anthropic (`cache_read_input_tokens`); cache-creation tokens are excluded because they are new tokens being written, not a hit.
 
 The HTTP call is fire-and-forget (async via `DispatchHttpCall`); it does not block the response to the client.
+
+### Reliability of usage data
+
+The plugin guarantees that streaming requests under `enableUsageOnPathSuffix` have `stream_options.include_usage: true` injected into the request body, **regardless of what the client sent**. If the client originally sent `include_usage: false`, the plugin sniffs the upstream usage chunk for telemetry and then **strips that chunk from the response** before it reaches the client — the client's contract is preserved while the proxy keeps reliable usage data. This is documented as the "sniff-but-don't-leak" pattern and applies only to OpenAI-shape upstreams (Anthropic `/messages` emits usage as an inherent part of the SSE protocol and is not modified).
+
+Even with the force-injection in place, a small fraction of requests will still report `completed: false`:
+
+| Trigger | Effect |
+| --- | --- |
+| Client disconnects mid-stream | Envoy resets the upstream stream; `endOfStream=true` is never delivered to the body callback. |
+| Upstream 5xx / connection reset before completion | Body never reaches its end; usage chunk also never emitted. |
+| Request travels through a non-OpenAI-shape upstream (e.g. Anthropic) and is cut early | The plugin captures `input_tokens` from `message_start` greedily, so `input_token` is usually populated even on cancel; `output_token` may still be missing. |
+
+For non-LLM endpoints (TTS / STT / image generation) the plugin reports `completed: true` whenever the upstream returns 2xx, even though `DontReadResponseBody()` was called. This trades off a corner case: if the upstream begins a 2xx response and then resets mid-body, `completed: true` is reported anyway — but for these endpoints the billable unit is the request itself, not body content, so this is the right default.
+
+**Downstream contract for `completed: false`**
+
+The proxy never applies estimation ratios — those are content-type and tokenizer specific and belong in the billing service. Recommended fallback strategy on the consumer side:
+
+| Field | Strategy when `completed: false` |
+| --- | --- |
+| `input_token` | If non-zero (Anthropic case), trust it. Otherwise apply a per-tenant, per-model byte→token ratio to `request_content_bytes` (calibrate from your own `completed: true` history; English text is roughly `bytes / 4`, Chinese is closer to `bytes / 2`, code is closer to `bytes / 3`). |
+| `output_token` | Apply a per-model `chunks → tokens` ratio to `output_chunk_count` (OpenAI-style streams emit roughly one token per chunk; speculative decoding can emit several at once but the deviation is bounded). |
+| `total_token` | Sum of the two estimates. |
+| `input_cached_token` | Trust if non-zero; otherwise leave at `0`. |
+| Billing policy | Some operators charge interrupted streams at 100% of the estimate (defends against cancel-to-evade abuse), some charge at 50%, some not at all. The proxy emits enough signal to support any of these — it does not pick one. |
+
+For both axes (input and output), recording the calibration table from your own `completed: true` traffic is significantly more accurate than any universal ratio. The proxy also emits `output_chunk_count` on `completed: true` requests precisely so this calibration is possible without a separate telemetry pipeline.
 
 ## Notes
 
