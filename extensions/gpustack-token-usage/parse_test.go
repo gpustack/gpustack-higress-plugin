@@ -77,6 +77,32 @@ func TestParseClusterName(t *testing.T) {
 	}
 }
 
+func TestParseRouteName(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantID   *int64
+	}{
+		{"ai-route-route-1.internal", int64Ptr(1)},
+		{"ai-route-route-42.internal", int64Ptr(42)},
+		{"ai-route-route-7.fallback.internal", int64Ptr(7)},
+		{"ai-route-route-100.fallback.internal", int64Ptr(100)},
+		{"ai-route-route-1", int64Ptr(1)},        // suffix is optional
+		// Invalid / unrelated
+		{"", nil},
+		{"ai-route-route-.internal", nil},        // empty id
+		{"ai-route-route-abc.internal", nil},     // non-numeric id
+		{"ai-route-route-", nil},                 // empty id, no suffix
+		{"other-route-1.internal", nil},          // wrong prefix
+	}
+
+	for _, c := range cases {
+		got := parseRouteName(c.input)
+		if (got == nil) != (c.wantID == nil) || (got != nil && *got != *c.wantID) {
+			t.Errorf("parseRouteName(%q) = %v, want %v", c.input, got, c.wantID)
+		}
+	}
+}
+
 func buildMultipartBody(t *testing.T, fields map[string]string) ([]byte, string) {
 	t.Helper()
 	var buf bytes.Buffer

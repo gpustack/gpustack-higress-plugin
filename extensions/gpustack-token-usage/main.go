@@ -91,6 +91,7 @@ type ModelUsageMetrics struct {
 	RequestCount int     `json:"request_count"`
 	UserID       *int64  `json:"user_id,omitempty"`
 	ModelID      *int64  `json:"model_id,omitempty"`
+	ModelRouteID *int64  `json:"model_route_id,omitempty"`
 	ProviderID   *int64  `json:"provider_id,omitempty"`
 	AccessKey    *string `json:"access_key,omitempty"`
 }
@@ -519,6 +520,29 @@ func parseConsumerHeader(consumer string) (userID *int64, accessKey *string) {
 	return
 }
 
+// parseRouteName extracts the numeric AI route id from a Higress route_name.
+// Formats: "ai-route-route-<id>.internal" or "ai-route-route-<id>.fallback.internal".
+// The dot-suffix is optional (mirrors parseClusterName's provider branch) so a
+// bare "ai-route-route-<id>" is also accepted.
+func parseRouteName(routeName string) *int64 {
+	const prefix = "ai-route-route-"
+	if !strings.HasPrefix(routeName, prefix) {
+		return nil
+	}
+	idStr := routeName[len(prefix):]
+	if dotIdx := strings.Index(idStr, "."); dotIdx != -1 {
+		idStr = idStr[:dotIdx]
+	}
+	if idStr == "" {
+		return nil
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
 // parseClusterName extracts modelID or providerID from an Envoy cluster name.
 // Envoy format: "outbound|<port>|<subset>|<fqdn>" where fqdn is "model-<id>-<instance-id>[.suffix]"
 // or "provider-<id>[.suffix]". The optional suffix is .static or .dns.
@@ -574,6 +598,11 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		return
 	}
 
+	var modelRouteID *int64
+	if routeNameBytes, err := proxywasm.GetProperty([]string{"route_name"}); err == nil && len(routeNameBytes) > 0 {
+		modelRouteID = parseRouteName(string(routeNameBytes))
+	}
+
 	usage, _ := ctx.GetContext(FinalUsageKey).(tokenusage.TokenUsage)
 	model := base.Model
 	if model == "" {
@@ -589,6 +618,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		UserID:       base.UserID,
 		AccessKey:    base.AccessKey,
 		ModelID:      modelID,
+		ModelRouteID: modelRouteID,
 		ProviderID:   providerID,
 	}
 
