@@ -153,6 +153,10 @@ Even with the force-injection in place, a small fraction of requests will still 
 
 For non-LLM endpoints (TTS / STT / image generation) the plugin reports `completed: true` whenever the upstream returns 2xx, even though `DontReadResponseBody()` was called. This trades off a corner case: if the upstream begins a 2xx response and then resets mid-body, `completed: true` is reported anyway — but for these endpoints the billable unit is the request itself, not body content, so this is the right default.
 
+#### Local-reply responses are not reported
+
+Requests that never reached an upstream — e.g. rejected by `gpustack-rate-limit` (429), `route_not_found`, or any other filter that calls `SendHttpResponseWithDetail` — are deliberately excluded from the metrics report. The proxy detects them via the Envoy `upstream.address` property: when no upstream connection was ever made, the property is empty and the report is skipped. (We don't use `response_code_details` because Higress's filter ordering puts token-usage before rate-limit in the response phase, and Envoy only finalizes `response_code_details` at stream destruction — i.e. after our `onHttpStreamDone` has already run. `upstream.address` is set the moment Envoy opens the upstream connection and is reliably populated by the time we read it.) The originating filter is responsible for its own observability (e.g. rate-limit emits `rejected_total` directly), so reporting these here would just duplicate the count and pollute "average tokens per request" aggregations with token=0 entries that never hit an LLM. Upstream-origin 4xx/5xx responses keep `upstream.address` populated and **are** reported (they represent real LLM-bound traffic, even if it failed).
+
 **Downstream contract for `completed: false`**
 
 The proxy never applies estimation ratios — those are content-type and tokenizer specific and belong in the billing service. Recommended fallback strategy on the consumer side:
