@@ -112,10 +112,10 @@ func TestCollectChecksOrderingAndModes(t *testing.T) {
 	if pending[1].Key != "myrule|both|header:x-api-key=k1|t:60s" {
 		t.Errorf("pending[1].Key=%q, unexpected", pending[1].Key)
 	}
-	if pending[0].FixedWindow != 60 || pending[0].Quota != 200000 || pending[0].CalendarSpec != nil {
+	if pending[0].FixedWindow != 60 || pending[0].Quota != 200000 || pending[0].CalendarPeriod.kind != "" {
 		t.Errorf("pending[0] = %+v", pending[0])
 	}
-	if pending[1].FixedWindow != 60 || pending[1].Quota != 1000 || pending[1].CalendarSpec != nil {
+	if pending[1].FixedWindow != 60 || pending[1].Quota != 1000 || pending[1].CalendarPeriod.kind != "" {
 		t.Errorf("pending[1] = %+v", pending[1])
 	}
 }
@@ -262,17 +262,17 @@ func TestCollectChecksTokenQuotaCalendar(t *testing.T) {
 		}
 	}
 
-	// pending entries: one FixedWindow (60s) + two CalendarSpec entries, in emit order.
+	// pending entries: one FixedWindow (60s) + two calendar periods, in emit order.
 	if len(pending) != 3 {
 		t.Fatalf("len(pending)=%d, want 3", len(pending))
 	}
-	if pending[0].FixedWindow != 60 || pending[0].CalendarSpec != nil {
+	if pending[0].FixedWindow != 60 || pending[0].CalendarPeriod.kind != "" {
 		t.Errorf("pending[0] should be fixed-window: %+v", pending[0])
 	}
-	if pending[1].CalendarSpec == nil || pending[1].FixedWindow != 0 {
+	if pending[1].CalendarPeriod.kind == "" || pending[1].FixedWindow != 0 {
 		t.Errorf("pending[1] should be calendar: %+v", pending[1])
 	}
-	if pending[2].CalendarSpec == nil || pending[2].FixedWindow != 0 {
+	if pending[2].CalendarPeriod.kind == "" || pending[2].FixedWindow != 0 {
 		t.Errorf("pending[2] should be calendar: %+v", pending[2])
 	}
 	if !strings.HasSuffix(pending[1].Key, "|t:each_month") {
@@ -282,9 +282,184 @@ func TestCollectChecksTokenQuotaCalendar(t *testing.T) {
 		t.Errorf("pending[2].Key=%q, want suffix |t:each_year", pending[2].Key)
 	}
 
-	// Sanity: the calendar specs in pending should be bound to the deployment-wide SH location.
-	if got := pending[1].CalendarSpec.location.String(); got != "Asia/Shanghai" {
+	// Sanity: the calendar periods in pending should be bound to the deployment-wide SH location.
+	if got := pending[1].CalendarPeriod.location.String(); got != "Asia/Shanghai" {
 		t.Errorf("pending[1] calendar location=%q, want Asia/Shanghai", got)
+	}
+}
+
+// TestCollectChecksMultiPeriodQueryLimits asserts that a single QueryLimits
+// declaring several rolling windows (per_second + per_minute + per_hour)
+// produces one entry per window, each with a distinct Redis key suffix and
+// its own (window, quota, ttl) tuple.
+func TestCollectChecksMultiPeriodQueryLimits(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "myrule",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:  "burst-and-sustained",
+				Match: []MatchRule{mustHeaderRule(t, "x-api-key", "k1")},
+				QueryLimits: &RateQuota{
+					PerSecond: intPtr(10),
+					PerMinute: intPtr(300),
+					PerHour:   intPtr(5000),
+				},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	headers := [][2]string{{"x-api-key", "k1"}}
+	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	if len(entries) != 3 {
+		t.Fatalf("len(entries)=%d, want 3", len(entries))
+	}
+	if len(pending) != 0 {
+		t.Errorf("len(pending)=%d, want 0 (query-only)", len(pending))
+	}
+
+	wantKeys := []string{
+		"myrule|burst-and-sustained|header:x-api-key=k1|q:1s",
+		"myrule|burst-and-sustained|header:x-api-key=k1|q:60s",
+		"myrule|burst-and-sustained|header:x-api-key=k1|q:3600s",
+	}
+	wantTuples := []struct {
+		win   int64
+		quota int
+		ttl   int64
+	}{
+		{1, 10, 2},
+		{60, 300, 120},
+		{3600, 5000, 7200},
+	}
+	for i, w := range wantKeys {
+		if entries[i].Key != w {
+			t.Errorf("entries[%d].Key=%q, want %q", i, entries[i].Key, w)
+		}
+		if entries[i].Window != wantTuples[i].win {
+			t.Errorf("entries[%d].Window=%d, want %d", i, entries[i].Window, wantTuples[i].win)
+		}
+		if entries[i].Quota != wantTuples[i].quota {
+			t.Errorf("entries[%d].Quota=%d, want %d", i, entries[i].Quota, wantTuples[i].quota)
+		}
+		if entries[i].TTL != wantTuples[i].ttl {
+			t.Errorf("entries[%d].TTL=%d, want %d", i, entries[i].TTL, wantTuples[i].ttl)
+		}
+		if entries[i].Mode != modeCheckAndAdd {
+			t.Errorf("entries[%d].Mode=%q, want %q", i, entries[i].Mode, modeCheckAndAdd)
+		}
+		if entries[i].Count != 1 {
+			t.Errorf("entries[%d].Count=%d, want 1", i, entries[i].Count)
+		}
+	}
+}
+
+// TestCollectChecksMultiPeriodTokenLimits asserts that a single TokenLimits
+// declaring two windows produces two check-mode request entries plus two
+// pending-add entries with the matching FixedWindow values.
+func TestCollectChecksMultiPeriodTokenLimits(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "myrule",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:  "tokens-burst-and-sustained",
+				Match: []MatchRule{mustHeaderRule(t, "x-api-key", "k1")},
+				TokenLimits: &RateQuota{
+					PerMinute: intPtr(200000),
+					PerHour:   intPtr(5000000),
+				},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	entries, pending := collectChecks(cfg, [][2]string{{"x-api-key", "k1"}}, "rid", time.Now())
+	if len(entries) != 2 || len(pending) != 2 {
+		t.Fatalf("len(entries)=%d len(pending)=%d, want 2 each", len(entries), len(pending))
+	}
+
+	wantKeys := []string{
+		"myrule|tokens-burst-and-sustained|header:x-api-key=k1|t:60s",
+		"myrule|tokens-burst-and-sustained|header:x-api-key=k1|t:3600s",
+	}
+	wantWindows := []int64{60, 3600}
+	for i, w := range wantKeys {
+		if entries[i].Key != w {
+			t.Errorf("entries[%d].Key=%q, want %q", i, entries[i].Key, w)
+		}
+		if entries[i].Mode != modeCheck || entries[i].Count != 0 {
+			t.Errorf("entries[%d] mode/count=%q/%d, want check/0", i, entries[i].Mode, entries[i].Count)
+		}
+		if pending[i].Key != w {
+			t.Errorf("pending[%d].Key=%q, want %q", i, pending[i].Key, w)
+		}
+		if pending[i].FixedWindow != wantWindows[i] {
+			t.Errorf("pending[%d].FixedWindow=%d, want %d", i, pending[i].FixedWindow, wantWindows[i])
+		}
+		if pending[i].CalendarPeriod.kind != "" {
+			t.Errorf("pending[%d] should not be calendar", i)
+		}
+	}
+}
+
+// TestCollectChecksMultiPeriodTokenQuota asserts that a single TokenQuota
+// declaring multiple calendar periods (each_day + each_month) produces one
+// entry per period, each with its own pending-add CalendarPeriod pointing
+// at the corresponding kind.
+func TestCollectChecksMultiPeriodTokenQuota(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "myrule",
+		Timezone: "UTC",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:  "daily-and-monthly",
+				Match: []MatchRule{{Source: SourceConsumer, Value: "*"}},
+				TokenQuota: &QuotaSpec{
+					EachDay:   intPtr(100000),
+					EachMonth: intPtr(2000000),
+				},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	headers := [][2]string{{"x-mse-consumer", "alice"}}
+	entries, pending := collectChecks(cfg, headers, "rid", time.Now())
+	if len(entries) != 2 || len(pending) != 2 {
+		t.Fatalf("len(entries)=%d len(pending)=%d, want 2 each", len(entries), len(pending))
+	}
+
+	wantKeys := []string{
+		"myrule|daily-and-monthly|consumer=alice|t:each_day",
+		"myrule|daily-and-monthly|consumer=alice|t:each_month",
+	}
+	wantKinds := []PeriodKind{PeriodEachDay, PeriodEachMonth}
+	wantQuotas := []int{100000, 2000000}
+	for i := range wantKeys {
+		if entries[i].Key != wantKeys[i] {
+			t.Errorf("entries[%d].Key=%q, want %q", i, entries[i].Key, wantKeys[i])
+		}
+		if entries[i].Quota != wantQuotas[i] {
+			t.Errorf("entries[%d].Quota=%d, want %d", i, entries[i].Quota, wantQuotas[i])
+		}
+		if entries[i].Kind != metricKindTokenCalendar {
+			t.Errorf("entries[%d].Kind=%q, want %q", i, entries[i].Kind, metricKindTokenCalendar)
+		}
+		if pending[i].CalendarPeriod.kind == "" {
+			t.Fatalf("pending[%d].CalendarPeriod is empty", i)
+		}
+		if pending[i].CalendarPeriod.kind != wantKinds[i] {
+			t.Errorf("pending[%d].CalendarPeriod.kind=%q, want %q", i, pending[i].CalendarPeriod.kind, wantKinds[i])
+		}
+		if pending[i].Quota != wantQuotas[i] {
+			t.Errorf("pending[%d].Quota=%d, want %d", i, pending[i].Quota, wantQuotas[i])
+		}
 	}
 }
 
@@ -313,58 +488,58 @@ func TestCalendarTTLCoversFullPeriod(t *testing.T) {
 	// (period_end - now + grace), so even at the very first second of a
 	// period the TTL covers nearly the whole period.
 	utc := time.UTC
-	monthly := mustCompileQuota(t, QuotaSpec{EachMonth: intPtr(1000000)}, utc)
-	yearly := mustCompileQuota(t, QuotaSpec{EachYear: intPtr(1)}, utc)
-	daily := mustCompileQuota(t, QuotaSpec{EachDay: intPtr(1)}, utc)
+	monthly := mustSinglePeriod(t, QuotaSpec{EachMonth: intPtr(1000000)}, utc)
+	yearly := mustSinglePeriod(t, QuotaSpec{EachYear: intPtr(1)}, utc)
+	daily := mustSinglePeriod(t, QuotaSpec{EachDay: intPtr(1)}, utc)
 
 	cases := []struct {
 		name    string
-		spec    *QuotaSpec
+		period  calendarPeriod
 		now     time.Time
 		wantMin int64 // ttl must be at least this many seconds
 		wantMax int64 // and no more than this
 	}{
 		{
 			"monthly at first second of month covers ~30 days",
-			&monthly,
+			monthly,
 			time.Date(2026, 4, 1, 0, 0, 1, 0, utc),
 			// Apr has 30 days, so periodEnd-now ≈ 30d. With grace=300, range:
 			29*86400 + ttlGraceSeconds, 31*86400 + ttlGraceSeconds + 1,
 		},
 		{
 			"monthly mid-month covers remaining ~half month",
-			&monthly,
+			monthly,
 			time.Date(2026, 4, 15, 0, 0, 0, 0, utc),
 			14*86400 + ttlGraceSeconds, 17*86400 + ttlGraceSeconds + 1,
 		},
 		{
 			"monthly last second of month is grace-only",
-			&monthly,
+			monthly,
 			time.Date(2026, 4, 30, 23, 59, 59, 0, utc),
 			ttlGraceSeconds, ttlGraceSeconds + 5,
 		},
 		{
 			"yearly at first second of year covers ~365 days",
-			&yearly,
+			yearly,
 			time.Date(2026, 1, 1, 0, 0, 1, 0, utc),
 			364*86400 + ttlGraceSeconds, 366*86400 + ttlGraceSeconds + 1,
 		},
 		{
 			"daily at first second of day covers ~24 hours",
-			&daily,
+			daily,
 			time.Date(2026, 4, 15, 0, 0, 1, 0, utc),
 			86400 - 5 + ttlGraceSeconds, 86400 + ttlGraceSeconds + 1,
 		},
 		{
 			"december → january rollover",
-			&yearly,
+			yearly,
 			time.Date(2026, 12, 31, 23, 59, 0, 0, utc),
 			60 + ttlGraceSeconds - 5, 60 + ttlGraceSeconds + 1,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := calendarTTL(c.spec, c.now)
+			got := calendarTTL(&c.period, c.now)
 			if got < c.wantMin || got > c.wantMax {
 				t.Errorf("calendarTTL = %d, want in [%d, %d]", got, c.wantMin, c.wantMax)
 			}
@@ -384,8 +559,8 @@ func TestTokenPendingAddTTLSeconds(t *testing.T) {
 	})
 
 	t.Run("calendar shrinks toward period end", func(t *testing.T) {
-		spec := mustCompileQuota(t, QuotaSpec{EachMonth: intPtr(1)}, utc)
-		p := tokenPendingAdd{CalendarSpec: &spec}
+		period := mustSinglePeriod(t, QuotaSpec{EachMonth: intPtr(1)}, utc)
+		p := tokenPendingAdd{CalendarPeriod: period}
 
 		earlyTTL := p.ttlSeconds(time.Date(2026, 4, 1, 0, 0, 1, 0, utc))
 		lateTTL := p.ttlSeconds(time.Date(2026, 4, 30, 23, 59, 0, 0, utc))
@@ -406,9 +581,9 @@ func TestTokenPendingAddWindowSeconds(t *testing.T) {
 		}
 	})
 
-	t.Run("calendar spec recomputes from now", func(t *testing.T) {
-		spec := mustCompileQuota(t, QuotaSpec{EachMonth: intPtr(1000)}, utc)
-		p := tokenPendingAdd{CalendarSpec: &spec}
+	t.Run("calendar period recomputes from now", func(t *testing.T) {
+		period := mustSinglePeriod(t, QuotaSpec{EachMonth: intPtr(1000)}, utc)
+		p := tokenPendingAdd{CalendarPeriod: period}
 		// Mid-month: should be roughly two weeks in seconds.
 		got := p.windowSeconds(time.Date(2026, 4, 15, 12, 0, 0, 0, utc))
 		want := int64(14*86400 + 12*3600)
@@ -417,9 +592,9 @@ func TestTokenPendingAddWindowSeconds(t *testing.T) {
 		}
 	})
 
-	t.Run("calendar spec at period boundary clamps", func(t *testing.T) {
-		spec := mustCompileQuota(t, QuotaSpec{EachMonth: intPtr(1000)}, utc)
-		p := tokenPendingAdd{CalendarSpec: &spec}
+	t.Run("calendar period at boundary clamps", func(t *testing.T) {
+		period := mustSinglePeriod(t, QuotaSpec{EachMonth: intPtr(1000)}, utc)
+		p := tokenPendingAdd{CalendarPeriod: period}
 		got := p.windowSeconds(time.Date(2026, 4, 1, 0, 0, 0, 0, utc))
 		if got != 1 {
 			t.Errorf("windowSeconds=%d, want 1 (clamped)", got)
@@ -779,12 +954,16 @@ func TestCollectChecksMetricLabels(t *testing.T) {
 
 	wantBucket := "header:x-mse-consumer=alice|header:x-higress-llm-model=qwen3-0.6b"
 	wantKinds := []string{metricKindQuery, metricKindTokenRolling, metricKindTokenCalendar}
+	wantPeriods := []string{"60s", "60s", "each_month"}
 	for i, e := range entries {
 		if e.Combo != "all-three" {
 			t.Errorf("entries[%d].Combo=%q, want %q", i, e.Combo, "all-three")
 		}
 		if e.Kind != wantKinds[i] {
 			t.Errorf("entries[%d].Kind=%q, want %q", i, e.Kind, wantKinds[i])
+		}
+		if e.Period != wantPeriods[i] {
+			t.Errorf("entries[%d].Period=%q, want %q", i, e.Period, wantPeriods[i])
 		}
 		if e.Bucket != wantBucket {
 			t.Errorf("entries[%d].Bucket=%q, want %q", i, e.Bucket, wantBucket)
@@ -795,11 +974,84 @@ func TestCollectChecksMetricLabels(t *testing.T) {
 	if len(pending) != 2 {
 		t.Fatalf("len(pending)=%d, want 2", len(pending))
 	}
-	if pending[0].Kind != metricKindTokenRolling || pending[0].Combo != "all-three" || pending[0].Bucket != wantBucket {
+	if pending[0].Kind != metricKindTokenRolling || pending[0].Combo != "all-three" || pending[0].Period != "60s" || pending[0].Bucket != wantBucket {
 		t.Errorf("pending[0] labels = %+v", pending[0])
 	}
-	if pending[1].Kind != metricKindTokenCalendar || pending[1].Combo != "all-three" || pending[1].Bucket != wantBucket {
+	if pending[1].Kind != metricKindTokenCalendar || pending[1].Combo != "all-three" || pending[1].Period != "each_month" || pending[1].Bucket != wantBucket {
 		t.Errorf("pending[1] labels = %+v", pending[1])
+	}
+}
+
+// TestMetricPeriodLabelDisambiguation asserts that when a single combo
+// declares multiple windows on the same kind, every emitted entry carries
+// a distinct Period label so rejected_total / value_total can be sliced
+// per-period in Prometheus.
+func TestMetricPeriodLabelDisambiguation(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "myrule",
+		Timezone: "UTC",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:  "stacked",
+				Match: []MatchRule{{Source: SourceConsumer, Value: "*"}},
+				QueryLimits: &RateQuota{
+					PerSecond: intPtr(20),
+					PerMinute: intPtr(600),
+				},
+				TokenLimits: &RateQuota{
+					PerMinute: intPtr(200000),
+					PerHour:   intPtr(5000000),
+				},
+				TokenQuota: &QuotaSpec{
+					EachDay:   intPtr(500000),
+					EachMonth: intPtr(10000000),
+				},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	entries, pending := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+
+	// All entries on this combo share the same (Combo, Bucket); only
+	// (Kind, Period) should distinguish them. Use that pair as a uniqueness
+	// key — duplicates would mean a metric collision.
+	type keyTuple struct{ Kind, Period string }
+	seen := make(map[keyTuple]int)
+	for _, e := range entries {
+		seen[keyTuple{e.Kind, e.Period}]++
+	}
+	for k, n := range seen {
+		if n != 1 {
+			t.Errorf("(kind=%q, period=%q) appears %d times across entries; metrics would collide", k.Kind, k.Period, n)
+		}
+	}
+	wantPeriods := map[string]struct{}{
+		"1s": {}, "60s": {}, "3600s": {}, "each_day": {}, "each_month": {},
+	}
+	gotPeriods := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		gotPeriods[e.Period] = struct{}{}
+	}
+	for p := range wantPeriods {
+		if _, ok := gotPeriods[p]; !ok {
+			t.Errorf("period %q missing from entries; got %v", p, gotPeriods)
+		}
+	}
+	for p := range gotPeriods {
+		if _, ok := wantPeriods[p]; !ok {
+			t.Errorf("unexpected period %q in entries", p)
+		}
+	}
+
+	// Pending entries (token_rolling + token_calendar only) must carry
+	// matching Period values so onHttpStreamDone's emitValue is per-period.
+	for _, p := range pending {
+		if p.Period == "" {
+			t.Errorf("pending entry missing Period: %+v", p)
+		}
 	}
 }
 

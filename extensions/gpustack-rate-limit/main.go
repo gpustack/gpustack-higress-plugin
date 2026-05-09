@@ -77,31 +77,42 @@ var (
 // tokenPendingAdd carries the info needed to perform the response-phase
 // "add" for a TokenLimits or TokenQuota combination.
 //
-// Exactly one of FixedWindow / CalendarSpec is set:
-//   - FixedWindow: rolling RateQuota (TokenLimits). Window is fixed for the
-//     life of the request.
-//   - CalendarSpec: calendar-aligned QuotaSpec (TokenQuota). Window is
-//     recomputed at response phase against the response-time clock so a
-//     stream that crosses the period boundary writes its tokens into the
-//     period it ends in (consistent with onHttpStreamDone semantics).
+// Exactly one of FixedWindow / CalendarPeriod is set:
+//   - FixedWindow > 0: rolling RateQuota (TokenLimits). Window is fixed for
+//     the life of the request.
+//   - CalendarPeriod.kind != "": calendar-aligned QuotaSpec period
+//     (TokenQuota). Window is recomputed at response phase against the
+//     response-time clock so a stream that crosses the period boundary
+//     writes its tokens into the period it ends in (consistent with
+//     onHttpStreamDone semantics).
+//
+// CalendarPeriod is stored by value (not by pointer) so the data captured
+// at request phase remains valid even if a config reload re-Compiles the
+// originating QuotaSpec between request and response phases. The struct is
+// small enough that the copy is cheap.
+//
+// A single TokenLimits or TokenQuota that declares multiple windows / periods
+// produces one tokenPendingAdd per declared window, each pointing at a
+// distinct Redis key.
 type tokenPendingAdd struct {
-	Key          string
-	Quota        int
-	FixedWindow  int64
-	CalendarSpec *QuotaSpec
+	Key            string
+	Quota          int
+	FixedWindow    int64
+	CalendarPeriod calendarPeriod
 
 	// Metric labels (mirror the corresponding LimitEntry produced by
 	// collectChecks, so onHttpStreamDone can emit value_total without
 	// looking the matching entry up again).
 	Combo  string
 	Kind   string
+	Period string
 	Bucket string
 }
 
 // windowSeconds returns the lua window argument for the response-phase add.
 func (p *tokenPendingAdd) windowSeconds(now time.Time) int64 {
-	if p.CalendarSpec != nil {
-		w, _ := p.CalendarSpec.GetWindowAndQuota(now)
+	if p.CalendarPeriod.kind != "" {
+		w, _ := p.CalendarPeriod.GetWindowAndQuota(now)
 		return w
 	}
 	return p.FixedWindow
@@ -111,8 +122,8 @@ func (p *tokenPendingAdd) windowSeconds(now time.Time) int64 {
 // combo, recomputed against `now` so calendar-aligned combos shrink toward
 // the period end as the period progresses.
 func (p *tokenPendingAdd) ttlSeconds(now time.Time) int64 {
-	if p.CalendarSpec != nil {
-		return calendarTTL(p.CalendarSpec, now)
+	if p.CalendarPeriod.kind != "" {
+		return calendarTTL(&p.CalendarPeriod, now)
 	}
 	return rollingTTL(p.FixedWindow)
 }
@@ -130,8 +141,8 @@ func rollingTTL(window int64) int64 {
 // in the period the data was written. Without this, the dynamic window value
 // (small at period start) would produce a near-zero TTL and the key would be
 // evicted before the next request arrived, prematurely resetting the quota.
-func calendarTTL(spec *QuotaSpec, now time.Time) int64 {
-	end := spec.periodEnd(now)
+func calendarTTL(period *calendarPeriod, now time.Time) int64 {
+	end := period.periodEnd(now)
 	ttl := end.Unix() - now.Unix() + ttlGraceSeconds
 	if ttl < 1 {
 		ttl = 1
@@ -425,6 +436,12 @@ func matchPathFilters(config *PluginConfig, path string) bool {
 // "each_month") rather than a window-second number, so the key does not
 // rotate within a period. The dynamic window-seconds value is sent only as
 // a lua ARGV.
+//
+// A single QueryLimits / TokenLimits with multiple windows configured (e.g.
+// per_second + per_minute) emits one entry per window; a TokenQuota with
+// multiple periods (e.g. each_day + each_month) likewise emits one entry per
+// period. Each window/period gets its own distinct kind:period suffix in the
+// Redis key so they never collide.
 func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd) {
 	for i := range config.LimitCombinations {
 		combo := &config.LimitCombinations[i]
@@ -452,81 +469,91 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 		// every metric that pertains to this combo+match-result.
 		bucket := strings.Join(base[2:], "|")
 
-		// QueryLimits (rolling): check-and-add with count=1
-		if combo.QueryLimits != nil {
-			if win, quota := combo.QueryLimits.GetWindowAndQuota(); quota > 0 {
-				key := strings.Join(append(base, "q:"+combo.QueryLimits.KeyPart()), "|")
-				entries = append(entries, LimitEntry{
-					Key:    key,
-					Window: win,
-					Quota:  quota,
-					Mode:   modeCheckAndAdd,
-					Member: reqID,
-					Count:  1,
-					TTL:    rollingTTL(win),
-					Combo:  combo.Name,
-					Kind:   metricKindQuery,
-					Bucket: bucket,
-				})
-			}
+		// QueryLimits (rolling): check-and-add with count=1, one entry per
+		// configured window.
+		for _, lim := range combo.QueryLimits.Limits() {
+			period := lim.KeyPart()
+			key := strings.Join(append(base, "q:"+period), "|")
+			entries = append(entries, LimitEntry{
+				Key:    key,
+				Window: lim.window,
+				Quota:  lim.quota,
+				Mode:   modeCheckAndAdd,
+				Member: reqID,
+				Count:  1,
+				TTL:    rollingTTL(lim.window),
+				Combo:  combo.Name,
+				Kind:   metricKindQuery,
+				Period: period,
+				Bucket: bucket,
+			})
 		}
 
-		// TokenLimits (rolling): check-only in the request phase; pending add in response phase.
-		if combo.TokenLimits != nil {
-			if win, quota := combo.TokenLimits.GetWindowAndQuota(); quota > 0 {
-				key := strings.Join(append(base, "t:"+combo.TokenLimits.KeyPart()), "|")
-				entries = append(entries, LimitEntry{
-					Key:    key,
-					Window: win,
-					Quota:  quota,
-					Mode:   modeCheck,
-					Member: reqID,
-					Count:  0,
-					TTL:    rollingTTL(win),
-					Combo:  combo.Name,
-					Kind:   metricKindTokenRolling,
-					Bucket: bucket,
-				})
-				pending = append(pending, tokenPendingAdd{
-					Key:         key,
-					FixedWindow: win,
-					Quota:       quota,
-					Combo:       combo.Name,
-					Kind:        metricKindTokenRolling,
-					Bucket:      bucket,
-				})
-			}
+		// TokenLimits (rolling): check-only in the request phase; pending add in
+		// response phase. One entry per configured window.
+		for _, lim := range combo.TokenLimits.Limits() {
+			period := lim.KeyPart()
+			key := strings.Join(append(base, "t:"+period), "|")
+			entries = append(entries, LimitEntry{
+				Key:    key,
+				Window: lim.window,
+				Quota:  lim.quota,
+				Mode:   modeCheck,
+				Member: reqID,
+				Count:  0,
+				TTL:    rollingTTL(lim.window),
+				Combo:  combo.Name,
+				Kind:   metricKindTokenRolling,
+				Period: period,
+				Bucket: bucket,
+			})
+			pending = append(pending, tokenPendingAdd{
+				Key:         key,
+				FixedWindow: lim.window,
+				Quota:       lim.quota,
+				Combo:       combo.Name,
+				Kind:        metricKindTokenRolling,
+				Period:      period,
+				Bucket:      bucket,
+			})
 		}
 
-		// TokenQuota (calendar): check-only in the request phase; pending add in response phase.
-		// Window is recomputed at response time to handle period rollover during a long stream.
-		// TTL is set to (period_end - now + grace) so the key survives until the period ends
-		// regardless of how early in the period the first write happens (a dynamic short
-		// window at period start would otherwise produce a 1-2 second TTL).
-		if combo.TokenQuota != nil {
-			if win, quota := combo.TokenQuota.GetWindowAndQuota(nowTime); quota > 0 {
-				key := strings.Join(append(base, "t:"+combo.TokenQuota.KeyPart()), "|")
-				entries = append(entries, LimitEntry{
-					Key:    key,
-					Window: win,
-					Quota:  quota,
-					Mode:   modeCheck,
-					Member: reqID,
-					Count:  0,
-					TTL:    calendarTTL(combo.TokenQuota, nowTime),
-					Combo:  combo.Name,
-					Kind:   metricKindTokenCalendar,
-					Bucket: bucket,
-				})
-				pending = append(pending, tokenPendingAdd{
-					Key:          key,
-					CalendarSpec: combo.TokenQuota,
-					Quota:        quota,
-					Combo:        combo.Name,
-					Kind:         metricKindTokenCalendar,
-					Bucket:       bucket,
-				})
+		// TokenQuota (calendar): check-only in the request phase; pending add in
+		// response phase. One entry per declared period (each_day / each_month /
+		// each_year). Window is recomputed at response time to handle period
+		// rollover during a long stream. TTL is set to (period_end - now + grace)
+		// so the key survives until the period ends regardless of how early in
+		// the period the first write happens (a dynamic short window at period
+		// start would otherwise produce a 1-2 second TTL).
+		for _, cp := range combo.TokenQuota.Periods() {
+			win, quota := cp.GetWindowAndQuota(nowTime)
+			if quota <= 0 {
+				continue
 			}
+			period := cp.KeyPart()
+			key := strings.Join(append(base, "t:"+period), "|")
+			entries = append(entries, LimitEntry{
+				Key:    key,
+				Window: win,
+				Quota:  quota,
+				Mode:   modeCheck,
+				Member: reqID,
+				Count:  0,
+				TTL:    calendarTTL(&cp, nowTime),
+				Combo:  combo.Name,
+				Kind:   metricKindTokenCalendar,
+				Period: period,
+				Bucket: bucket,
+			})
+			pending = append(pending, tokenPendingAdd{
+				Key:            key,
+				CalendarPeriod: cp,
+				Quota:          quota,
+				Combo:          combo.Name,
+				Kind:           metricKindTokenCalendar,
+				Period:         period,
+				Bucket:         bucket,
+			})
 		}
 	}
 	return entries, pending
@@ -554,7 +581,7 @@ func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []
 		for i := range entries {
 			e := &entries[i]
 			if e.Mode == modeCheckAndAdd {
-				emitValue(ai, config.RuleName, e.Combo, e.Kind, e.Bucket, uint64(e.Count))
+				emitValue(ai, config.RuleName, e.Combo, e.Kind, e.Period, e.Bucket, uint64(e.Count))
 			}
 		}
 		// Resuming the paused request is the redis-backend's responsibility
@@ -568,7 +595,7 @@ func handleEvalResult(config PluginConfig, ai aiLabels, reqID string, entries []
 	for i := range entries {
 		e := &entries[i]
 		if e.Key == result.LimitedKey {
-			emitRejected(ai, config.RuleName, e.Combo, e.Kind, e.Bucket)
+			emitRejected(ai, config.RuleName, e.Combo, e.Kind, e.Period, e.Bucket)
 			break
 		}
 	}
@@ -740,7 +767,7 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
 		}
 	}
 	for _, p := range pending {
-		emitValue(ai, config.RuleName, p.Combo, p.Kind, p.Bucket, uint64(tokens))
+		emitValue(ai, config.RuleName, p.Combo, p.Kind, p.Period, p.Bucket, uint64(tokens))
 	}
 }
 

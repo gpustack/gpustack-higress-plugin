@@ -381,15 +381,22 @@ func extractCookie(headers [][2]string, name string) (string, bool) {
 //
 // Each combination supports two flavours of accounting:
 //   - Rolling-window (RateQuota) -- "no more than N in any continuous window".
-//     Use QueryLimits (requests) or TokenLimits (tokens).
+//     Use QueryLimits (requests) or TokenLimits (tokens). A single RateQuota
+//     may declare more than one window simultaneously (e.g. per_second AND
+//     per_minute); each declared window is enforced independently with its
+//     own Redis key, so the request must satisfy ALL configured windows.
 //   - Calendar-aligned token quota (QuotaSpec) -- "no more than N tokens in
 //     this calendar day / month / year, resets on the natural boundary in
-//     the configured timezone". Use TokenQuota. Request-count is intentionally
-//     not offered as a calendar quota: rolling windows already cover the
-//     anti-abuse / fairness use cases that "N requests per day" addresses.
+//     the configured timezone". Use TokenQuota. A single QuotaSpec may
+//     declare more than one calendar period simultaneously (e.g. each_day
+//     AND each_month); each declared period is enforced independently with
+//     its own Redis key. Request-count is intentionally not offered as a
+//     calendar quota: rolling windows already cover the anti-abuse /
+//     fairness use cases that "N requests per day" addresses.
 //
 // Flavours can be combined: e.g. a rolling per-minute rate limit on top of a
-// monthly token quota. Each non-nil field contributes a separate Redis key.
+// monthly token quota. Each declared window / period contributes a separate
+// Redis key.
 type LimitCombination struct {
 	// Name uniquely identifies this combination (used in logs, metrics, and
 	// the Redis key).
@@ -431,10 +438,13 @@ const defaultTimezone = "UTC"
 // from the script's point of view this is just a longer / shorter sliding
 // window. The Redis key fragment uses a stable label (e.g. "each_month") so
 // that the key is stable across the period and naturally rotates only when
-// the EXPIRE TTL (window*2) collapses near the boundary.
+// the EXPIRE TTL collapses near the boundary.
 //
-// Exactly one of EachDay / EachMonth / EachYear must be set; the int value
-// is the limit (count or tokens, depending on which slot uses this spec).
+// At least one of EachDay / EachMonth / EachYear must be set; the int value
+// is the limit for that period. Multiple periods may be set on the same
+// QuotaSpec, in which case each period is enforced independently with its
+// own Redis key (e.g. EachDay=10000 + EachMonth=200000 produces two buckets,
+// and the request must satisfy both).
 type QuotaSpec struct {
 	// EachDay is the limit per calendar day (00:00 - 24:00 in the deployment timezone).
 	EachDay *int `json:"each_day,omitempty"`
@@ -446,59 +456,98 @@ type QuotaSpec struct {
 	EachYear *int `json:"each_year,omitempty"`
 
 	// Compile artefacts (unexported; not part of JSON).
+	periods  []calendarPeriod
+	location *time.Location
+}
+
+// calendarPeriod is one compiled calendar period extracted from a QuotaSpec.
+// A QuotaSpec compiles into one calendarPeriod per declared field (each_day /
+// each_month / each_year), so a spec with several periods set produces
+// several independent buckets sharing the same dimensional match.
+type calendarPeriod struct {
 	kind     PeriodKind
 	quota    int
 	location *time.Location
 }
 
-// Compile validates the spec and binds it to the deployment-wide timezone
-// resolved by PluginConfig.Validate. Must be called once during config
-// loading; a non-nil error means the spec is invalid and the plugin should
-// refuse to start.
+// Compile validates the spec and binds every declared period to the
+// deployment-wide timezone resolved by PluginConfig.Validate. Must be called
+// once during config loading; a non-nil error means the spec is invalid and
+// the plugin should refuse to start.
+//
+// Periods are recorded in the fixed order each_day, each_month, each_year so
+// that the resulting Redis key fragments (and pending-add ordering) are
+// deterministic regardless of JSON field order.
+//
+// Re-Compile allocates a fresh backing array for q.periods rather than
+// reusing the existing one. Higress can call Compile more than once on the
+// same *QuotaSpec instance: parseOverrideRuleConfig copies global combos by
+// value but their TokenQuota pointers still alias global, so every rule
+// override re-Compiles the shared spec. Reusing the backing array would
+// silently overwrite period data that earlier callers may have observed
+// via Periods(); allocating fresh keeps any previously-handed-out values
+// independent of future re-Compile calls.
 func (q *QuotaSpec) Compile(loc *time.Location) error {
 	if loc == nil {
 		return errors.New("quota_spec: nil location")
 	}
-	set := 0
-	if q.EachDay != nil {
-		q.kind = PeriodEachDay
-		q.quota = *q.EachDay
-		set++
-	}
-	if q.EachMonth != nil {
-		q.kind = PeriodEachMonth
-		q.quota = *q.EachMonth
-		set++
-	}
-	if q.EachYear != nil {
-		q.kind = PeriodEachYear
-		q.quota = *q.EachYear
-		set++
-	}
-	if set == 0 {
-		return errors.New("quota_spec: exactly one of each_day/each_month/each_year must be set")
-	}
-	if set > 1 {
-		return errors.New("quota_spec: only one of each_day/each_month/each_year may be set")
-	}
-	if q.quota <= 0 {
-		return fmt.Errorf("quota_spec: limit must be > 0, got %d", q.quota)
-	}
+	q.periods = nil
 	q.location = loc
+
+	add := func(kind PeriodKind, limit *int) error {
+		if limit == nil {
+			return nil
+		}
+		if *limit <= 0 {
+			return fmt.Errorf("quota_spec %s: limit must be > 0, got %d", kind, *limit)
+		}
+		q.periods = append(q.periods, calendarPeriod{
+			kind:     kind,
+			quota:    *limit,
+			location: loc,
+		})
+		return nil
+	}
+	if err := add(PeriodEachDay, q.EachDay); err != nil {
+		return err
+	}
+	if err := add(PeriodEachMonth, q.EachMonth); err != nil {
+		return err
+	}
+	if err := add(PeriodEachYear, q.EachYear); err != nil {
+		return err
+	}
+	if len(q.periods) == 0 {
+		return errors.New("quota_spec: at least one of each_day/each_month/each_year must be set")
+	}
 	return nil
 }
 
+// Periods returns one calendarPeriod per declared period, by value, in the
+// order each_day, each_month, each_year. Returns nil before Compile or on a
+// nil receiver.
+//
+// Returning copies (rather than pointers into q.periods) keeps callers
+// insulated from a subsequent re-Compile on the same *QuotaSpec instance:
+// the values they hold remain valid even if the underlying slice is later
+// reallocated or replaced. This mirrors RateQuota.Limits()'s shape.
+func (q *QuotaSpec) Periods() []calendarPeriod {
+	if q == nil || len(q.periods) == 0 {
+		return nil
+	}
+	return append([]calendarPeriod(nil), q.periods...)
+}
+
 // periodStart returns the start instant of the calendar period containing now.
-// Compile must have been called.
-func (q *QuotaSpec) periodStart(now time.Time) time.Time {
-	t := now.In(q.location)
-	switch q.kind {
+func (p *calendarPeriod) periodStart(now time.Time) time.Time {
+	t := now.In(p.location)
+	switch p.kind {
 	case PeriodEachDay:
-		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, q.location)
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, p.location)
 	case PeriodEachMonth:
-		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, q.location)
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, p.location)
 	case PeriodEachYear:
-		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, q.location)
+		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, p.location)
 	}
 	return time.Time{}
 }
@@ -506,16 +555,15 @@ func (q *QuotaSpec) periodStart(now time.Time) time.Time {
 // periodEnd returns the start of the NEXT period (== exclusive end of the
 // current period). time.Date normalizes overflow, so e.g. month 13 becomes
 // year+1 / month 1, which gives correct boundaries at year rollover.
-// Compile must have been called.
-func (q *QuotaSpec) periodEnd(now time.Time) time.Time {
-	t := now.In(q.location)
-	switch q.kind {
+func (p *calendarPeriod) periodEnd(now time.Time) time.Time {
+	t := now.In(p.location)
+	switch p.kind {
 	case PeriodEachDay:
-		return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, q.location)
+		return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, p.location)
 	case PeriodEachMonth:
-		return time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, q.location)
+		return time.Date(t.Year(), t.Month()+1, 1, 0, 0, 0, 0, p.location)
 	case PeriodEachYear:
-		return time.Date(t.Year()+1, 1, 1, 0, 0, 0, 0, q.location)
+		return time.Date(t.Year()+1, 1, 1, 0, 0, 0, 0, p.location)
 	}
 	return time.Time{}
 }
@@ -523,32 +571,34 @@ func (q *QuotaSpec) periodEnd(now time.Time) time.Time {
 // GetWindowAndQuota returns the dynamic window in seconds (now - periodStart)
 // and the configured quota. The window is clamped to >= 1 second to keep the
 // lua script's ZRANGEBYSCORE range non-degenerate at the period boundary.
-// Returns (0, 0) when Compile has not run successfully.
-func (q *QuotaSpec) GetWindowAndQuota(now time.Time) (int64, int) {
-	if q.location == nil || q.kind == "" {
+// Returns (0, 0) when this period has not been compiled successfully.
+func (p *calendarPeriod) GetWindowAndQuota(now time.Time) (int64, int) {
+	if p.location == nil || p.kind == "" {
 		return 0, 0
 	}
-	diff := now.Unix() - q.periodStart(now).Unix()
+	diff := now.Unix() - p.periodStart(now).Unix()
 	if diff < 1 {
 		diff = 1
 	}
-	return diff, q.quota
+	return diff, p.quota
 }
 
-// KeyPart returns the stable Redis key fragment for this spec, e.g.
+// KeyPart returns the stable Redis key fragment for this period, e.g.
 // "each_month". The deployment timezone is not encoded into the key: it is
-// a deployment-wide constant declared at PluginConfig.Timezone. Returns ""
-// before Compile.
-func (q *QuotaSpec) KeyPart() string {
-	if q.kind == "" {
-		return ""
-	}
-	return string(q.kind)
+// a deployment-wide constant declared at PluginConfig.Timezone.
+func (p *calendarPeriod) KeyPart() string {
+	return string(p.kind)
 }
 
 // RateQuota is a sliding-window quota: the maximum amount allowed within a
 // time window. The structure is neutral and is reused for request-count and
 // token-count limits (and any other "N per window" use case).
+//
+// More than one window field may be set on a single RateQuota. Each declared
+// window is enforced independently with its own Redis key, so e.g. setting
+// both PerSecond=10 and PerMinute=300 produces two buckets and the request
+// must satisfy both. The natural pattern is "burst guard + sustained guard"
+// (per_second + per_minute) or "long-tail abuse cap" (per_minute + per_day).
 type RateQuota struct {
 	// PerSecond quota per second.
 	PerSecond *int `json:"per_second,omitempty"`
@@ -569,40 +619,53 @@ type RateQuota struct {
 	CustomWindowSeconds *int `json:"custom_window_seconds,omitempty"`
 }
 
+// rateLimit is one (window, quota) pair derived from a RateQuota.
+type rateLimit struct {
+	// window is the sliding window size in seconds.
+	window int64
+	// quota is the count allowed within window.
+	quota int
+}
+
+// KeyPart returns this rate window's Redis key suffix, e.g. "60s".
+func (l rateLimit) KeyPart() string {
+	return fmt.Sprintf("%ds", l.window)
+}
+
 // ============================================
 // Helper methods
 // ============================================
 
-// GetWindowAndQuota returns the window size in seconds and the quota from
-// this RateQuota. When no window is configured it returns (0, 0); callers
-// should check quota <= 0 to decide whether the quota is effective.
-func (r *RateQuota) GetWindowAndQuota() (windowSeconds int64, quota int) {
-	if r.PerSecond != nil {
-		return 1, *r.PerSecond
+// Limits returns one rateLimit per declared window in this RateQuota, in the
+// fixed order per_second, per_minute, per_hour, per_day, per_custom. Windows
+// with non-positive quota (or, for per_custom, a missing/non-positive
+// custom_window_seconds) are silently skipped, matching the historical
+// "treat zero as not configured" behaviour. The result may be empty, in
+// which case the caller should treat this RateQuota as not contributing
+// any limit.
+func (r *RateQuota) Limits() []rateLimit {
+	if r == nil {
+		return nil
 	}
-	if r.PerMinute != nil {
-		return 60, *r.PerMinute
+	var out []rateLimit
+	add := func(window int64, quota *int) {
+		if quota == nil || *quota <= 0 {
+			return
+		}
+		out = append(out, rateLimit{window: window, quota: *quota})
 	}
-	if r.PerHour != nil {
-		return 3600, *r.PerHour
+	add(1, r.PerSecond)
+	add(60, r.PerMinute)
+	add(3600, r.PerHour)
+	add(86400, r.PerDay)
+	if r.PerCustom != nil && *r.PerCustom > 0 &&
+		r.CustomWindowSeconds != nil && *r.CustomWindowSeconds > 0 {
+		out = append(out, rateLimit{
+			window: int64(*r.CustomWindowSeconds),
+			quota:  *r.PerCustom,
+		})
 	}
-	if r.PerDay != nil {
-		return 86400, *r.PerDay
-	}
-	if r.PerCustom != nil && r.CustomWindowSeconds != nil {
-		return int64(*r.CustomWindowSeconds), *r.PerCustom
-	}
-	return 0, 0
-}
-
-// KeyPart returns this quota's window fragment of the Redis key, e.g. "60s".
-// Returns an empty string when the quota is not configured.
-func (r *RateQuota) KeyPart() string {
-	win, quota := r.GetWindowAndQuota()
-	if quota <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("%ds", win)
+	return out
 }
 
 // Validate performs full configuration validation and pre-compiles every

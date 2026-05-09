@@ -189,13 +189,17 @@ func emitRequestOutcome(ai aiLabels, rule, result string) {
 }
 
 // emitRejected increments rejected_total for the (single) combination that
-// tripped the lua/local short-circuit. Sum across all (combo, kind, bucket)
-// equals request_total{result=limited}.
-func emitRejected(ai aiLabels, rule, combo, kind, bucket string) {
+// tripped the lua/local short-circuit. The period slot disambiguates the
+// rolling-window (`1s`/`60s`/`3600s`/...) or calendar-period (`each_day`/
+// `each_month`/`each_year`) the rejection came from when a single combo
+// declares multiple windows/periods on the same kind. Sum across all
+// (combo, kind, period, bucket) equals request_total{result=limited}.
+func emitRejected(ai aiLabels, rule, combo, kind, period, bucket string) {
 	incrCounter(ai.statName(metricNameRejectedTotal,
 		[2]string{"rule", rule},
 		[2]string{"combo", combo},
 		[2]string{"kind", kind},
+		[2]string{"period", period},
 		[2]string{"bucket", bucket},
 	), 1)
 }
@@ -203,11 +207,14 @@ func emitRejected(ai aiLabels, rule, combo, kind, bucket string) {
 // emitValue increments value_total by the amount that was just written into
 // the bucket -- 1 for query (per passed request), or total_tokens for
 // token_rolling / token_calendar (at stream done). count == 0 is a no-op.
-func emitValue(ai aiLabels, rule, combo, kind, bucket string, count uint64) {
+// The period label disambiguates per-window/per-period attribution when a
+// single combo declares multiple windows or periods on the same kind.
+func emitValue(ai aiLabels, rule, combo, kind, period, bucket string, count uint64) {
 	incrCounter(ai.statName(metricNameValueTotal,
 		[2]string{"rule", rule},
 		[2]string{"combo", combo},
 		[2]string{"kind", kind},
+		[2]string{"period", period},
 		[2]string{"bucket", bucket},
 	), count)
 }

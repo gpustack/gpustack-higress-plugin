@@ -26,6 +26,7 @@ type LimitEntry struct {
 	// metrics path doesn't need to re-parse the Redis key string.
 	Combo  string // combination name from config (combo.Name)
 	Kind   string // metricKindQuery / metricKindTokenRolling / metricKindTokenCalendar
+	Period string // window/period suffix used in the Redis key, e.g. "1s", "60s", "each_month"
 	Bucket string // dimension fragment (everything past <rule>|<combo>) joined with '|'; sanitized at emit time
 }
 

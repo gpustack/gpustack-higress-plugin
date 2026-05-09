@@ -184,9 +184,12 @@ Both `ak-x.gpustack-1` and `gpustack-1` map to the same key fragment
 
 ### RateQuota fields
 
-Exactly one of the following window fields should be set. The first non-nil one
-in the order `per_second -> per_minute -> per_hour -> per_day -> per_custom`
-takes effect.
+Any subset of the following window fields may be set on a single `RateQuota`.
+**Each declared window is enforced as an independent rolling-window bucket
+with its own Redis key**, so a request must satisfy every configured window.
+The natural pattern is "burst guard + sustained guard" (e.g. `per_second` +
+`per_minute`) or "burst + sustained + abuse cap" (`per_second` + `per_minute`
++ `per_day`).
 
 | Field                   | Type | Required | Default | Description                                                                  |
 | ----------------------- | ---- | -------- | ------- | ---------------------------------------------------------------------------- |
@@ -199,14 +202,20 @@ takes effect.
 
 \* At least one window field must be set; otherwise the quota is treated as
 "not configured" and the combination silently skips that kind of limit.
+Window fields with non-positive values (or `per_custom` without a positive
+`custom_window_seconds`) are silently dropped and do not contribute a
+bucket.
 
 ### QuotaSpec fields
 
-A calendar-aligned token quota. Exactly one of `each_day` / `each_month` /
-`each_year` must be set; the int value is the token limit for that period.
-The period boundary is anchored to the deployment-wide top-level `timezone`
-field -- e.g. `each_month` resets on the 1st of every month at 00:00 in
-that timezone.
+A calendar-aligned token quota. Any subset of `each_day` / `each_month` /
+`each_year` may be set; the int value is the token limit for that period.
+**Each declared period is enforced as an independent calendar bucket with
+its own Redis key**, so a request must satisfy every configured period.
+A common pattern is `each_day` + `each_month` ("daily fairness floor and
+monthly billing cap"). Period boundaries are anchored to the deployment-wide
+top-level `timezone` field -- e.g. `each_month` resets on the 1st of every
+month at 00:00 in that timezone.
 
 | Field        | Type | Required | Default | Description                                                                          |
 | ------------ | ---- | -------- | ------- | ------------------------------------------------------------------------------------ |
@@ -214,7 +223,8 @@ that timezone.
 | `each_month` | int  | No\*     | -       | Tokens allowed per calendar month (resets on the 1st at 00:00 in the deployment timezone). |
 | `each_year`  | int  | No\*     | -       | Tokens allowed per calendar year (resets on Jan 1 at 00:00 in the deployment timezone).    |
 
-\* Exactly one of `each_day` / `each_month` / `each_year` must be set.
+\* At least one of `each_day` / `each_month` / `each_year` must be set, and
+every set value must be a positive integer.
 
 The timezone is intentionally **not** a per-spec field: a deployment almost
 always has one timezone, so declaring it once at the top level avoids
@@ -315,12 +325,12 @@ Prometheus through Higress's existing stats sink, become standard
 | ------------------------------------ | ----------------------- | ----------------------------------------------------------------------------- |
 | `gpustack_rate_limit_request_total`  | 1 per request           | Once per request that ran rate-limit checks; labelled with `result`           |
 | `gpustack_rate_limit_rejected_total` | 1 per rejected request  | When lua / local backend short-circuits with LIMITED; tripping combo labelled |
-| `gpustack_rate_limit_value_total`    | The lua `count` written | Per `check_and_add` (1 per passed query) and per response-phase `add`         |
+| `gpustack_rate_limit_value_total`    | The lua `count` written | Per declared window/period bucket that the request wrote into. A combo with stacked windows (e.g. `per_second` + `per_minute`) writes once per window per request, so `sum by (kind) (value_total)` is **not** request count when stacking is in use — pin the `period` label (or use `request_total` for request rate). |
 
 `sum by (route) (gpustack_rate_limit_rejected_total)` always equals
 `gpustack_rate_limit_request_total{result="limited"}` for the same `route`,
 because lua's pass-1 short-circuit guarantees each rejected request
-attributes to exactly one `(combo, kind, bucket)` tuple.
+attributes to exactly one `(combo, kind, period, bucket)` tuple.
 
 ### Stat name layout
 
@@ -328,7 +338,7 @@ Stat names follow the Higress AI plugin convention so the existing
 bootstrap stats_tags extractors fire automatically:
 
 ```text
-route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.<metric>.rule.<rule>.combo.<combo>.kind.<kind>.bucket.<bucket>
+route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.<metric>.rule.<rule>.combo.<combo>.kind.<kind>.period.<period>.bucket.<bucket>
 route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpustack_rate_limit_request_total.rule.<rule>.result.<result>
 ```
 
@@ -342,6 +352,7 @@ route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpusta
 | `rule`     | Top-level `rule_name`                                                                   |
 | `combo`    | The matched `limit_combinations[].name`                                                 |
 | `kind`     | `query` / `token_rolling` / `token_calendar`                                            |
+| `period`   | Window/period suffix. For rolling kinds: `1s` / `60s` / `3600s` / `86400s` / `<custom>s`. For `token_calendar`: `each_day` / `each_month` / `each_year`. Disambiguates per-window emissions when one combo declares multiple windows on the same kind. |
 | `bucket`   | Sanitised dimension fragment (past `<rule>\|<combo>` in the Redis key)                  |
 | `result`   | `passed` / `limited` (only on `request_total`)                                          |
 
@@ -363,7 +374,7 @@ ships built-in `stats_tags` regex extractors that match the leading
 Prometheus labels. With **zero** deployment changes:
 
 ```text
-route_upstream_model_qwen3_0_6b_consumer_alice_metric_gpustack_rate_limit_rejected_total_rule_model_route_1_combo_1_default_kind_query_bucket_header_x-higress-llm-model_qwen3-0_6b{
+route_upstream_model_qwen3_0_6b_consumer_alice_metric_gpustack_rate_limit_rejected_total_rule_model_route_1_combo_1_default_kind_query_period_60s_bucket_header_x-higress-llm-model_qwen3-0_6b{
   ai_route="ai-route-route-1.internal",
   ai_cluster="outbound|80||model-1.static"
 } 2
@@ -371,8 +382,8 @@ route_upstream_model_qwen3_0_6b_consumer_alice_metric_gpustack_rate_limit_reject
 
 Two of the four AI slots (`ai_route`, `ai_cluster`) are extracted as
 Prometheus labels for free. The remaining slots (`model`, `consumer`,
-`rule`, `combo`, `kind`, `bucket`, `result`) live inside the metric name
-string. To grep just our metrics:
+`rule`, `combo`, `kind`, `period`, `bucket`, `result`) live inside the
+metric name string. To grep just our metrics:
 
 ```bash
 curl -s localhost:15020/stats/prometheus | grep '_metric_gpustack_rate_limit_'
@@ -390,39 +401,46 @@ scrape_configs:
   - job_name: higress-gateway
     # ...your existing scrape settings (kubernetes_sd / static_configs / etc)...
     metric_relabel_configs:
-      # rejected_total / value_total: 5 extra labels (rule/combo/kind/bucket + model/consumer)
+      # rejected_total / value_total: 6 extra labels (rule/combo/kind/period/bucket + model/consumer)
+      # The period anchor uses an enumerated capture (\d+s|each_day|each_month|each_year)
+      # so the bucket-end '_(.+)$' cannot accidentally swallow it.
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: model
         replacement: '$1'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: consumer
         replacement: '$2'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: rule
         replacement: '$4'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: combo
         replacement: '$5'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: kind
         replacement: '$6'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
-        target_label: bucket
+        target_label: period
         replacement: '$7'
       - source_labels: [__name__]
-        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_bucket_(.+)$'
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
+        action: replace
+        target_label: bucket
+        replacement: '$8'
+      - source_labels: [__name__]
+        regex: '^route_upstream_model_(.+?)_consumer_(.+?)_metric_gpustack_rate_limit_(rejected|value)_total_rule_(.+?)_combo_(.+?)_kind_(query|token_rolling|token_calendar)_period_(\d+s|each_day|each_month|each_year)_bucket_(.+)$'
         action: replace
         target_label: __name__
         replacement: 'gpustack_rate_limit_$3_total'
@@ -461,7 +479,7 @@ After scrape Prometheus sees:
 gpustack_rate_limit_rejected_total{
   ai_route="ai-route-route-1.internal", ai_cluster="outbound|80||model-1.static",
   model="qwen3-0_6b", consumer="alice", rule="model-route-1",
-  combo="1-default", kind="query", bucket="header_x-higress-llm-model_qwen3-0_6b"
+  combo="1-default", kind="query", period="60s", bucket="header_x-higress-llm-model_qwen3-0_6b"
 } 2
 ```
 
@@ -469,10 +487,10 @@ gpustack_rate_limit_rejected_total{
 
 The `metric_relabel` regex anchors on the literal substrings `_route_`,
 `_upstream_`, `_model_`, `_consumer_`, `_metric_`, `_rule_`, `_combo_`,
-`_kind_`, `_bucket_`, `_result_`. Because the underlying separator
-(`.` → `_` after Envoy's Prometheus formatter) is identical to the byte
-that can appear *inside* a value, **values containing one of these
-substrings will silently mis-parse**. Concrete examples that break:
+`_kind_`, `_period_`, `_bucket_`, `_result_`. Because the underlying
+separator (`.` → `_` after Envoy's Prometheus formatter) is identical to
+the byte that can appear *inside* a value, **values containing one of
+these substrings will silently mis-parse**. Concrete examples that break:
 
 - A `combo` named `1_kind_premium` — `_kind_` appears inside the combo
   value, so `_kind_(query|token_rolling|token_calendar)` will lock onto
@@ -492,9 +510,13 @@ that has not been promoted into `envoy_bootstrap.json`'s stats_tags list.
 **Practical mitigations**:
 
 - Avoid using the literal substrings `route`, `upstream`, `model`,
-  `consumer`, `metric`, `rule`, `combo`, `kind`, `bucket`, `result` as
-  segments of `rule_name` / `combo.name` / match values. Underscored
-  variants (e.g. `gpu_routing` is fine, `gpu_route_id` is risky).
+  `consumer`, `metric`, `rule`, `combo`, `kind`, `period`, `bucket`,
+  `result` as segments of `rule_name` / `combo.name` / match values.
+  Underscored variants (e.g. `gpu_routing` is fine, `gpu_route_id` is
+  risky). The `period` slot's enumerated regex anchor
+  (`\d+s|each_day|each_month|each_year`) makes it safer than the open
+  `(.+?)` slots — a value matching the enumeration but appearing inside
+  another field can still mis-parse, but typical config values don't.
 - For the long-term clean solution, use an Istio EnvoyFilter to extend
   `bootstrap.stats_config.stats_tags` (the same mechanism Higress uses
   for `ai_route` / `ai_cluster` / `ai_model`); the regex there matches
@@ -528,21 +550,32 @@ the actual sliding-window contents.
 ### Example queries (assumes `metric_relabel_configs` applied)
 
 ```promql
-# Rejection rate by combo/kind (top-level dashboard).
-sum by (rule, combo, kind) (rate(gpustack_rate_limit_rejected_total[5m]))
+# Rejection rate by combo/kind/period (top-level dashboard).
+sum by (rule, combo, kind, period) (rate(gpustack_rate_limit_rejected_total[5m]))
+
+# Per-window breakdown for a stacked rate combo (e.g. q:1s vs q:60s vs q:86400s
+# for a single combo with per_second + per_minute + per_day all set).
+sum by (period) (rate(gpustack_rate_limit_rejected_total{combo="stacked", kind="query"}[5m]))
 
 # Top 10 noisiest buckets right now (drill-down).
 topk(10, rate(gpustack_rate_limit_rejected_total[5m]))
 
-# Token consumption rate by route.
-sum by (ai_route) (rate(gpustack_rate_limit_value_total{kind=~"token_.*"}[5m]))
+# Token consumption rate by route. Pin a single (kind, period) tuple --
+# value_total writes once per declared bucket, so an unpinned
+# kind=~"token_.*" sum double-counts across token_rolling and token_calendar
+# (and across stacked windows within either). The shortest token_rolling
+# window is the most granular signal; pick whichever is configured.
+sum by (ai_route) (rate(gpustack_rate_limit_value_total{kind="token_rolling", period="60s"}[5m]))
 
 # Token consumption per consumer per model (the AI billing view).
-sum by (consumer, model) (rate(gpustack_rate_limit_value_total{kind="token_calendar"}[5m]))
+# When token_quota declares both each_day and each_month, pick the period
+# explicitly to avoid double-counting the same total_tokens twice (the lua
+# script writes the same count to each period's ZSET).
+sum by (consumer, model) (rate(gpustack_rate_limit_value_total{kind="token_calendar", period="each_month"}[5m]))
 
 # Tokens consumed in current calendar month for a single consumer
 # (counter is monotonic across periods; pick a window covering the period).
-increase(gpustack_rate_limit_value_total{kind="token_calendar", consumer="alice"}[31d])
+increase(gpustack_rate_limit_value_total{kind="token_calendar", period="each_month", consumer="alice"}[31d])
 
 # Pass-through rate (per-request basis, not per-combo).
 sum(rate(gpustack_rate_limit_request_total{result="passed"}[5m]))
@@ -766,6 +799,44 @@ redis:
 For a deployment whose billing cycle aligns with a non-UTC timezone, set the
 top-level `timezone` accordingly (e.g. `Asia/Shanghai`). All `token_quota`
 boundaries in this config will use that timezone.
+
+### Example 6a: Stacked windows on a single combo
+
+A single `query_limits` (or `token_limits`) may declare multiple rolling
+windows at once -- every declared window is its own bucket and the request
+must satisfy them all. A single `token_quota` works the same way for
+calendar periods. Use this when you want a layered cap on the same
+dimension match without duplicating the `match` block.
+
+```yaml
+rule_name: stacked-budget
+timezone: UTC
+limit_combinations:
+  - name: per-consumer
+    match:
+      - source: consumer
+        value: "*"
+    # Burst guard + sustained guard + abuse cap, all on the same consumer.
+    query_limits:
+      per_second: 20
+      per_minute: 600
+      per_day:    50000
+    # Tight rolling token cap and a longer-window safety net.
+    token_limits:
+      per_minute: 200000
+      per_hour:   5000000
+    # Daily fairness floor and monthly billing cap, both per consumer.
+    token_quota:
+      each_day:   500000
+      each_month: 5000000
+redis:
+  service_name: redis.static
+```
+
+Each window/period contributes a separate Redis key (so the keys above are
+`q:1s`, `q:60s`, `q:86400s`, `t:60s`, `t:3600s`, `t:each_day`, `t:each_month`
+under the same `<rule>|<combo>|<dim>` prefix). Operators can configure them
+independently and `redis-cli ZRANGE` each one in isolation.
 
 ### Example 7: Global + route-level override (aggregation semantics)
 
