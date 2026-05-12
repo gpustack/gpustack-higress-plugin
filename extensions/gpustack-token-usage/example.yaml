@@ -4,9 +4,34 @@ metadata:
   name: gpustack-token-usage
   namespace: higress-system
 spec:
-  defaultConfig: {}
+  defaultConfig:
+    # Real client IP injected into the upstream request — only when the
+    # upstream cluster is a GPUStack-trusted FQDN (see
+    # `additionalClusterNameRegexps` to extend the built-in matchers).
+    realIPHeader: x-gpustack-real-ip
+    # Static headers shared between two outbound channels:
+    #   1. Injected into the upstream LLM request (same gate as realIPHeader).
+    #   2. Attached to every metrics-report POST sent to `endpoint` below.
+    # Use this to ship a pre-shared token the GPUStack backend validates in
+    # both contexts.
+    header_add:
+      x-gpustack-internal-token: change-me
+    # Optional: extend the built-in cluster_name FQDN matchers.
+    # additionalClusterNameRegexps:
+    #   - "^my-internal-svc(\\.|$)"
+    # Optional: metrics-report endpoint.
+    # endpoint:
+    #   service_name: gpustack-server.gpustack.svc.cluster.local
+    #   service_port: 80
+    #   path: /v2/usage/gateway-metrics
+    #   timeout_ms: 5000
   defaultConfigDisable: false
   failStrategy: FAIL_OPEN
-  priority: 910
+  phase: UNSPECIFIED_PHASE
+  # 400 puts this plugin after model-mapper (so cluster_name reflects the
+  # post-mapping selection) and before ext-auth (so the auth service sees
+  # the trust headers). The plugin does not publish `ai_log`, so lowering
+  # the priority does not affect gpustack-rate-limit's token accounting.
+  priority: 400
   url: http://localhost:8080/wasm-plugins/gpustack-token-usage/1.0.0/plugin.wasm
 status: {}

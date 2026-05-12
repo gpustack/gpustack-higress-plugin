@@ -8,8 +8,10 @@ import (
 	"math"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +23,18 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+// defaultClusterNameRegexps are matched against the FQDN field of Envoy's
+// cluster_name ("outbound|<port>|<subset>|<fqdn>"). The realIPHeader /
+// header_add trust headers are only injected into the upstream request when
+// the FQDN matches one of these (or one of the user-supplied
+// additionalClusterNameRegexps) so trusted headers never flow to third-party
+// upstreams reached via the proxy.
+var defaultClusterNameRegexps = []string{
+	`^gpustack(-|\.|$)`,
+	`^model-\d+-\d+(\.|$)`,
+	`^provider-\d+(\.|$)`,
+}
 
 const (
 	pluginName = "gpustack-token-usage"
@@ -110,8 +124,17 @@ type PluginConfig struct {
 	EnableOnPathSuffix      []string
 	EnableUsageOnPathSuffix []string
 	Endpoint                *EndpointConfig
-	HeaderAdd               map[string]string
-	ReportClient            wrapper.HttpClient
+	// HeaderAdd is shared between two purposes:
+	//   1. Injected into upstream LLM requests (with realIPHeader) when
+	//      cluster_name matches ClusterNameMatchers — so the GPUStack
+	//      backend can validate the gateway-issued trust token.
+	//   2. Attached to every metrics-report POST sent to Endpoint — the
+	//      report endpoint also lives on the GPUStack backend and validates
+	//      the same token. Sharing one config keeps the secret single-sourced.
+	HeaderAdd           map[string]string
+	ReportClient        wrapper.HttpClient
+	RealIPHeader        string
+	ClusterNameMatchers []*regexp.Regexp
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
@@ -231,7 +254,86 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 		config.HeaderAdd[k] = v.String()
 	}
 
+	config.RealIPHeader = json.Get("realIPHeader").String()
+
+	patterns := append([]string(nil), defaultClusterNameRegexps...)
+	for _, item := range json.Get("additionalClusterNameRegexps").Array() {
+		if s := item.String(); s != "" {
+			patterns = append(patterns, s)
+		}
+	}
+	config.ClusterNameMatchers = make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return fmt.Errorf("invalid cluster_name regexp %q: %w", p, err)
+		}
+		config.ClusterNameMatchers = append(config.ClusterNameMatchers, re)
+	}
+
 	return nil
+}
+
+// extractClusterFQDN returns the FQDN field of Envoy's
+// "outbound|<port>|<subset>|<fqdn>". For non-Envoy-shaped values the raw
+// string is returned so user-supplied regexps can still match literally.
+func extractClusterFQDN(clusterName string) string {
+	if parts := strings.SplitN(clusterName, "|", 4); len(parts) == 4 {
+		return parts[3]
+	}
+	return clusterName
+}
+
+func matchesAnyCluster(fqdn string, matchers []*regexp.Regexp) bool {
+	for _, m := range matchers {
+		if m.MatchString(fqdn) {
+			return true
+		}
+	}
+	return false
+}
+
+// injectTrustHeaders writes realIPHeader and the configured header_add map
+// into the request — but only when the upstream cluster's FQDN matches the
+// configured trust-cluster regexps. For non-matching clusters (e.g. third-
+// party LLM providers) this is a no-op so the gateway-issued trust token
+// never leaks. Headers are Replaced (not Added) so a client-supplied value
+// cannot co-exist with the gateway-injected one.
+func injectTrustHeaders(config PluginConfig) {
+	if config.RealIPHeader == "" && len(config.HeaderAdd) == 0 {
+		return
+	}
+	raw, err := proxywasm.GetProperty([]string{"cluster_name"})
+	if err != nil || len(raw) == 0 {
+		proxywasm.LogDebugf("injectTrustHeaders: cluster_name unavailable: %v", err)
+		return
+	}
+	if !matchesAnyCluster(extractClusterFQDN(string(raw)), config.ClusterNameMatchers) {
+		return
+	}
+	if config.RealIPHeader != "" {
+		writeRealIPHeader(config.RealIPHeader)
+	}
+	for k, v := range config.HeaderAdd {
+		if err := proxywasm.ReplaceHttpRequestHeader(k, v); err != nil {
+			proxywasm.LogWarnf("injectTrustHeaders: failed to replace header %s: %v", k, err)
+		}
+	}
+}
+
+func writeRealIPHeader(name string) {
+	data, err := proxywasm.GetProperty([]string{"source", "address"})
+	if err != nil {
+		proxywasm.LogDebugf("writeRealIPHeader: failed to get source address: %v", err)
+		return
+	}
+	host, _, err := net.SplitHostPort(string(data))
+	if err != nil {
+		host = string(data)
+	}
+	if err := proxywasm.ReplaceHttpRequestHeader(name, host); err != nil {
+		proxywasm.LogWarnf("writeRealIPHeader: failed to replace header %s: %v", name, err)
+	}
 }
 
 // baseMediaType returns the media type without parameters (e.g. "application/json; charset=utf-8" → "application/json").
@@ -289,6 +391,11 @@ func prepareStream(ctx wrapper.HttpContext, config PluginConfig) bool {
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
+	// 0. Inject trust headers (real-IP + header_add) into the upstream
+	//    request, gated by cluster_name match. Runs unconditionally — does
+	//    not depend on path-suffix / metrics-tracking decisions below.
+	injectTrustHeaders(config)
+
 	// 1. Check if metrics tracking requires reading the request body.
 	metricsNeedBody := prepareMetrics(ctx)
 

@@ -6,6 +6,7 @@
 
 1. Injects token usage timing statistics (`time_to_first_token_ms`, `time_per_output_token_ms`, `tokens_per_second`) into AI API responses
 2. Reports usage metrics to a configurable HTTP endpoint for routes matching the GPUStack naming convention (`model-<id>-<instance-id>` or `provider-<id>`)
+3. Injects the real client IP and a pre-shared trust token into upstream requests destined for GPUStack-trusted clusters (the same trust token is also attached to outbound metrics-report POSTs, so the GPUStack backend validates it identically in both contexts)
 
 It supports both streaming (SSE) and non-streaming responses, OpenAI-compatible and Anthropic-compatible APIs, and multipart/form-data requests (e.g. TTS/STT).
 
@@ -32,13 +33,60 @@ endpoint:
   path: /v2/usage/gateway-metrics
   timeout_ms: 5000  # Optional, default 5000ms
 
-# Optional: extra headers to attach to every metrics POST request
+# Optional: header that receives the real client IP. Injected into upstream
+# requests only when cluster_name matches a trust regexp (see below).
+realIPHeader: x-gpustack-real-ip
+
+# Optional: static headers used in TWO places:
+#   1. Injected into upstream LLM requests (same trust gate as realIPHeader).
+#   2. Attached to every metrics-report POST sent to `endpoint`.
+# A single shared pre-shared token works for both because the GPUStack
+# backend validates them identically.
 header_add:
-  X-Internal-Token: "secret"
+  x-gpustack-internal-token: "shared-secret"
+
+# Optional: extra regular expressions matched against the cluster_name FQDN.
+# Added to the built-in defaults; does not replace them.
+additionalClusterNameRegexps:
+  - "^my-internal-svc(\\.|$)"
 ```
 
-Recommended priority: `910`  
+Recommended priority: `400`  
 Recommended phase: `UNSPECIFIED_PHASE`
+
+The plugin runs at `priority: 400` so it lands after `model-mapper` (cluster_name is finalised) and before `ext-auth` (the auth service sees the trust headers). It does not publish the `ai_log` filter state, so its priority is independent of `gpustack-rate-limit`'s token accounting.
+
+## Trust header injection
+
+For traffic destined to **GPUStack-trusted upstreams**, the plugin injects `realIPHeader` and every entry of `header_add` into the request. Both are written with **Replace** semantics so a client-supplied value cannot co-exist with the gateway-injected one.
+
+### Trusted cluster matching
+
+The plugin reads the `cluster_name` property (Envoy form `outbound|<port>|<subset>|<fqdn>`), extracts the FQDN, and matches it against:
+
+| Pattern                       | Matches                                                              |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `^gpustack(-\|\.\|$)`         | `gpustack`, `gpustack-server`, `gpustack-*.<ns>.svc.cluster.local`…  |
+| `^model-\d+-\d+(\.\|$)`       | GPUStack model instances (`model-<id>-<instance>[.suffix]`)          |
+| `^provider-\d+(\.\|$)`        | GPUStack providers (`provider-<id>[.suffix]`)                        |
+
+Headers are injected **only** when the FQDN matches one of these patterns or one of the `additionalClusterNameRegexps`. Every other upstream is passed through untouched — the trust token never leaks to third-party LLM providers reached via the proxy.
+
+### Threat model
+
+Within a Kubernetes cluster the gpustack-server HTTP port is typically reachable from any pod in the cluster. A malicious in-cluster workload could therefore bypass Higress and send forged `x-gpustack-real-ip` headers directly to gpustack-server. By pairing the IP header with a pre-shared token (`header_add: x-gpustack-internal-token: <secret>`) and validating the token on the server side, gpustack-server can distinguish requests that actually came through Higress from forged direct hits.
+
+The pre-shared token is a long-lived static secret — anyone with read access to *both* the WasmPlugin config *and* the server-side validator config can forge requests. The token still raises the bar relative to plain network reachability and is sufficient when access to request-level traces / logs is kept narrower than access to configuration.
+
+### Secret rotation
+
+Static-token rotation requires a brief overlap window:
+
+1. Update gpustack-server's validator to accept `<old-secret>` **and** `<new-secret>`.
+2. Update this plugin's `header_add` to emit `<new-secret>`.
+3. After all in-flight requests have drained (usually seconds), remove `<old-secret>` from the validator.
+
+Both ends must be able to be reconfigured without restart for this to be non-disruptive.
 
 ## Token Usage Injection
 
