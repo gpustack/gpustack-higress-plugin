@@ -104,8 +104,8 @@ func onHttpRequestHeaders(_ wrapper.HttpContext, config PluginConfig) types.Acti
 		addRealIPHeader(config.realIPHeader)
 	}
 	for k, v := range config.headerAdd {
-		if err := proxywasm.AddHttpRequestHeader(k, v); err != nil {
-			proxywasm.LogWarnf("gpustack-ip: failed to add header %s: %v", k, err)
+		if err := proxywasm.ReplaceHttpRequestHeader(k, v); err != nil {
+			proxywasm.LogWarnf("gpustack-ip: failed to replace header %s: %v", k, err)
 		}
 	}
 	return types.ActionContinue
@@ -121,7 +121,7 @@ func addRealIPHeader(name string) {
 	if err != nil {
 		host = string(data)
 	}
-	if err := proxywasm.AddHttpRequestHeader(name, host); err != nil {
-		proxywasm.LogWarnf("gpustack-ip: failed to add header %s: %v", name, err)
+	if err := proxywasm.ReplaceHttpRequestHeader(name, host); err != nil {
+		proxywasm.LogWarnf("gpustack-ip: failed to replace header %s: %v", name, err)
 	}
 }
