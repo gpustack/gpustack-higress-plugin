@@ -1,0 +1,45 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-generic-proxy-router
+  namespace: higress-system
+spec:
+  # Must run after model-router:
+  #   - Higress's built-in model-router runs at UNSPECIFIED_PHASE / priority=900
+  #     to parse the `model` field from the request body and write it to the
+  #     x-higress-llm-model header.
+  #   - This plugin needs to override that header, so its priority must be < 900.
+  #   - It's also recommended to be > 600 (gpustack-rate-limit / ai-token-ratelimit)
+  #     so rate-limiting policies see the final model name mapped from the path.
+  phase: UNSPECIFIED_PHASE
+  priority: 800
+  url: oci://<your-registry>/<your-org>/gpustack-generic-proxy-router:1.0.0
+  sha256: "<sha256-digest>"
+  defaultConfigDisable: false
+
+  # ============================================================
+  # For paths like /model/proxy/{id}/v1/chat/completions
+  #   - Extract {id}
+  #   - Look up the real model name in aliasNameMapping
+  #   - Write it to the x-higress-llm-model header (replacing the original value)
+  # On a hit, downstream ai-route / gpustack-rate-limit operate on the real model name.
+  # ============================================================
+  defaultConfig:
+    prefix: "/model/proxy/"
+    targetHeader: "x-higress-llm-model"
+    aliasNameMapping:
+      qwen-alias: "qwen2.5-7b-instruct"
+      llama-alias: "llama-3.1-8b-instruct"
+      gpt4-alias: "gpt-4o"
+
+  # You can also override per ingress / route, e.g. enable only on a specific AI route:
+  # matchRules:
+  #   - ingress:
+  #       - ai-route-internal.internal
+  #     configDisable: false
+  #     config:
+  #       prefix: "/llm/route/"
+  #       targetHeader: "x-higress-llm-model"
+  #       aliasNameMapping:
+  #         internal-fast: "qwen2.5-7b-instruct"
+  #         internal-smart: "qwen2.5-72b-instruct"

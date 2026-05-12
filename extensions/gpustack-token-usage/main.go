@@ -299,6 +299,15 @@ func matchesAnyCluster(fqdn string, matchers []*regexp.Regexp) bool {
 // party LLM providers) this is a no-op so the gateway-issued trust token
 // never leaks. Headers are Replaced (not Added) so a client-supplied value
 // cannot co-exist with the gateway-injected one.
+//
+// Requires that cluster_name has already been resolved by a preceding filter
+// when this runs in the request-headers phase. In Higress, model-router /
+// model-mapper resolve the route (and thus the cluster) before any Wasm
+// plugin priority < 900 runs; the recommended priority of 400 therefore
+// guarantees cluster_name is populated. If the property is empty (no
+// upstream resolved yet, or unrecognised flow) the function fail-closes:
+// no headers are written, so the trust token cannot leak via a misordered
+// filter chain.
 func injectTrustHeaders(config PluginConfig) {
 	if config.RealIPHeader == "" && len(config.HeaderAdd) == 0 {
 		return

@@ -60,6 +60,12 @@ The plugin runs at `priority: 400` so it lands after `model-mapper` (cluster_nam
 
 For traffic destined to **GPUStack-trusted upstreams**, the plugin injects `realIPHeader` and every entry of `header_add` into the request. Both are written with **Replace** semantics so a client-supplied value cannot co-exist with the gateway-injected one.
 
+### Filter ordering requirement
+
+Trust-header injection runs in the request-headers phase and reads the Envoy `cluster_name` property to decide whether the upstream is trusted. `cluster_name` is populated only after the route has been resolved, so this plugin **must** run after the filter that resolves the route — in Higress that is `model-router` / `model-mapper`. The recommended priority of `400` puts this plugin downstream of `model-mapper` (priority `900`) and satisfies the requirement.
+
+If the property is empty when this plugin runs (no upstream resolved yet, or an unrecognised flow), trust headers are not injected — the plugin fail-closes so the gateway-issued token cannot leak through a misordered filter chain.
+
 ### Trusted cluster matching
 
 The plugin reads the `cluster_name` property (Envoy form `outbound|<port>|<subset>|<fqdn>`), extracts the FQDN, and matches it against:
