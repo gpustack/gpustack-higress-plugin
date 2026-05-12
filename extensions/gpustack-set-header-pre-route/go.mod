@@ -1,4 +1,4 @@
-module github.com/orangedeng/gpustack-higress-plugins/extensions/gpustack-set-header-pre-route
+module github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-set-header-pre-route
 
 go 1.24.4
 

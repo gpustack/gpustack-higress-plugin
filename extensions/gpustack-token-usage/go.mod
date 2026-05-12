@@ -1,4 +1,4 @@
-module github.com/orangedeng/gpustack-higress-plugins/extensions/gpustack-token-usage
+module github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-token-usage
 
 go 1.24.4
 

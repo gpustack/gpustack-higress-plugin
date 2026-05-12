@@ -1,4 +1,4 @@
-module github.com/orangedeng/gpustack-higress-plugins/extensions/gpustack-rate-limit
+module github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-rate-limit
 
 go 1.24.4
 
