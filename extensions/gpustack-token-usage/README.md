@@ -12,9 +12,6 @@ It supports both streaming (SSE) and non-streaming responses, OpenAI-compatible 
 ## Configuration
 
 ```yaml
-# Optional: inject real client IP into a request header
-realIPToHeader: "X-GPUStack-Real-IP"
-
 # Optional: path suffixes that trigger metrics tracking and response body reading
 # Defaults: /chat/completions, /completions, /responses, /messages
 enableOnPathSuffix:

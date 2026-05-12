@@ -4,8 +4,7 @@ metadata:
   name: gpustack-token-usage
   namespace: higress-system
 spec:
-  defaultConfig:
-    realIPToHeader: x-gpustack-real-ip
+  defaultConfig: {}
   defaultConfigDisable: false
   failStrategy: FAIL_OPEN
   priority: 910

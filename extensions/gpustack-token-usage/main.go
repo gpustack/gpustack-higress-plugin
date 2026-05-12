@@ -8,7 +8,6 @@ import (
 	"math"
 	"mime"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -108,7 +107,6 @@ type EndpointConfig struct {
 
 // PluginConfig holds plugin configuration.
 type PluginConfig struct {
-	RealIPToHeader          string
 	EnableOnPathSuffix      []string
 	EnableUsageOnPathSuffix []string
 	Endpoint                *EndpointConfig
@@ -199,7 +197,6 @@ func buildPathSuffixes(configField gjson.Result, defaults []string) []string {
 }
 
 func parseConfig(json gjson.Result, config *PluginConfig) error {
-	config.RealIPToHeader = json.Get("realIPToHeader").String()
 	config.EnableUsageOnPathSuffix = buildPathSuffixes(json.Get("enableUsageOnPathSuffix"), []string{
 		"/chat/completions",
 		"/completions",
@@ -244,24 +241,6 @@ func baseMediaType(contentType string) string {
 		return contentType
 	}
 	return mt
-}
-
-// getRealIPHeader returns the configured header name and the resolved client IP.
-// Returns empty strings when not configured or the source address is unavailable.
-func getRealIPHeader(config PluginConfig) (name, ip string) {
-	if config.RealIPToHeader == "" {
-		return
-	}
-	data, err := proxywasm.GetProperty([]string{"source", "address"})
-	if err != nil {
-		proxywasm.LogDebugf("getRealIPHeader: failed to get source address: %v", err)
-		return
-	}
-	host, _, err := net.SplitHostPort(string(data))
-	if err != nil {
-		host = string(data)
-	}
-	return config.RealIPToHeader, host
 }
 
 // prepareMetrics checks whether this request should be tracked for metrics reporting.
@@ -316,11 +295,8 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// 2. Check if stream injection requires reading the request body.
 	streamNeedBody := prepareStream(ctx, config)
 
-	// 3. Neither needs the body: inject real IP header now and skip body read.
+	// 3. Neither needs the body: skip body read.
 	if !metricsNeedBody && !streamNeedBody {
-		if name, ip := getRealIPHeader(config); name != "" {
-			_ = proxywasm.AddHttpRequestHeader(name, ip)
-		}
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
@@ -515,9 +491,6 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	if !ok {
 		proxywasm.LogWarn("failed to get headers from context, skip process body")
 		return types.ActionContinue
-	}
-	if name, ip := getRealIPHeader(config); name != "" {
-		headers = append(headers, [2]string{name, ip})
 	}
 	headers = processRequestBody(ctx, body, headers)
 	ctx.SetContext(BaseMetricsKey, buildBaseMetrics(ctx))

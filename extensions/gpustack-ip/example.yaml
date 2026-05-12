@@ -1,0 +1,21 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-ip
+  namespace: higress-system
+spec:
+  defaultConfig:
+    realIPHeader: x-gpustack-real-ip
+    header_add:
+      x-gpustack-internal-token: change-me
+    # Optional: extend the built-in cluster_name FQDN matchers.
+    # additionalClusterNameRegexps:
+    #   - "^my-internal-svc(\\.|$)"
+  defaultConfigDisable: false
+  failStrategy: FAIL_OPEN
+  phase: UNSPECIFIED_PHASE
+  # Must run after model-mapper (so cluster_name reflects post-mapping
+  # routing) and before ext-auth (so the auth service sees the trust headers).
+  priority: 400
+  url: http://localhost:8080/wasm-plugins/gpustack-ip/1.0.0/plugin.wasm
+status: {}
