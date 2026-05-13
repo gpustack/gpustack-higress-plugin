@@ -404,7 +404,29 @@ type LimitCombination struct {
 
 	// Match is the list of dimension match rules; every rule must hit for the
 	// combination to be enabled.
+	//
+	// May be empty when IsFallback is true: a fallback combo with no match
+	// rules applies to every request the plugin sees (subject to the
+	// fallback-suppression semantics described on IsFallback). Non-fallback
+	// combos must declare at least one match rule -- a non-fallback combo
+	// with empty Match would unconditionally bind every request and
+	// permanently suppress every fallback, which is almost certainly a
+	// misconfiguration.
 	Match []MatchRule `json:"match"`
+
+	// IsFallback flags this combo as a fallback / default. Fallback combos
+	// are only evaluated against a request when no non-fallback combo also
+	// matches that request. Multiple fallback combos within the same plugin
+	// form one logical group: when no non-fallback combo matches, every
+	// matching fallback combo fires (their buckets are still AND-combined
+	// within the group).
+	//
+	// Typical use: a deployment-wide "default plan" combo paired with
+	// per-user "override" combos. Users with a more specific override are
+	// bound only by their override; users without one fall through to the
+	// default. Without this flag, the two would AND together and the
+	// override could never raise the effective allowance above the default.
+	IsFallback bool `json:"is_fallback,omitempty"`
 
 	// QueryLimits is the rolling-window request-count quota (requests per window).
 	QueryLimits *RateQuota `json:"query_limits,omitempty"`
@@ -702,8 +724,9 @@ func (c *PluginConfig) Validate() error {
 			return fmt.Errorf("duplicate limit_combinations.name %q", combo.Name)
 		}
 		seen[combo.Name] = struct{}{}
-		if len(combo.Match) == 0 {
-			return fmt.Errorf("limit_combinations[%q].match must not be empty", combo.Name)
+		if len(combo.Match) == 0 && !combo.IsFallback {
+			return fmt.Errorf("limit_combinations[%q].match must not be empty "+
+				"(only fallback combos may omit match rules)", combo.Name)
 		}
 		if combo.QueryLimits == nil && combo.TokenLimits == nil && combo.TokenQuota == nil {
 			return fmt.Errorf("limit_combinations[%q] must configure at least one of "+

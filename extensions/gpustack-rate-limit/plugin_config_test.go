@@ -140,6 +140,18 @@ func TestPluginConfigValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "empty match is ok on a fallback combo",
+			cfg: PluginConfig{
+				RuleName: "r",
+				LimitCombinations: []LimitCombination{{
+					Name:        "default",
+					IsFallback:  true,
+					QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+				}},
+			},
+			wantErr: false,
+		},
+		{
 			name: "token_quota with no period set",
 			cfg: PluginConfig{
 				RuleName: "r",

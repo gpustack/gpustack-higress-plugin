@@ -121,12 +121,15 @@ keeping the other one; the overall enable decision is the OR of both lists.
 | Field           | Type             | Required | Default | Description                                                                                                 |
 | --------------- | ---------------- | -------- | ------- | ----------------------------------------------------------------------------------------------------------- |
 | `name`          | string           | Yes      | -       | Combination name; must be unique within `limit_combinations`. Used in the Redis key, logs, and metrics.     |
-| `match`         | array of object  | Yes      | -       | List of dimension match rules. **Every rule must hit** for the combination to be activated.                 |
+| `match`         | array of object  | Yes\*\*  | -       | List of dimension match rules. **Every rule must hit** for the combination to be activated.                 |
+| `is_fallback`   | boolean          | No       | `false` | Marks this combo as a fallback. See [Fallback combos](#fallback-combos).                                    |
 | `query_limits`  | object           | No\*     | -       | Rolling-window request-count quota (see [RateQuota](#ratequota-fields)). Triggers check-and-add at the request phase.      |
 | `token_limits`  | object           | No\*     | -       | Rolling-window AI token-count quota. Triggers check at the request phase and add at the response phase.                    |
 | `token_quota`   | object           | No\*     | -       | Calendar-aligned AI token quota (see [QuotaSpec](#quotaspec-fields)). Same check / add lifecycle as `token_limits`.         |
 
 \* At least one of `query_limits` / `token_limits` / `token_quota` must be configured per combination.
+
+\*\* `match` may be omitted (or set to an empty array) **only** when `is_fallback: true`. A fallback combo with no match rules applies to every request the plugin sees; see [Fallback combos](#fallback-combos).
 
 ### `match` rule fields (dimension)
 
@@ -261,6 +264,64 @@ plugin sets TTL to `period_end - now + 300s` (5-minute grace), so the
 key always lives until the period ends regardless of how early in the
 period the first write happens. Rolling-window combos still use
 `window * 2` as before.
+
+### Fallback combos
+
+`is_fallback: true` marks a combo as a deployment-wide default that should
+only bind requests no other combo did. The plugin evaluates combos in two
+passes:
+
+1. Walk every combo and run its `match` rules. Partition the matched set
+   into **non-fallback** and **fallback** groups.
+2. Pick the active group: non-fallback if it has at least one entry,
+   fallback otherwise. Only combos in the active group contribute Redis
+   buckets to this request.
+
+Within a group, every active combo still ANDs -- a request bound by two
+non-fallback combos has to satisfy both. Fallback suppression is the only
+asymmetric rule: a fallback combo whose match rules hit is still skipped
+if any non-fallback combo's match rules also hit on the same request.
+
+A fallback combo may declare an empty `match`, in which case it applies
+to every request the plugin sees (subject to the suppression rule).
+Non-fallback combos must declare at least one match rule -- a
+non-fallback combo with empty `match` would unconditionally bind every
+request and permanently suppress every fallback, which is almost
+certainly a misconfiguration.
+
+#### Why fallbacks exist: per-user overrides above a default plan
+
+Without `is_fallback`, two combos that both match the same request
+AND-combine: the request must satisfy the strictest of the two. That
+makes it impossible to grant an individual user a *higher* allowance
+than the deployment-wide default -- the default keeps clamping them
+back down.
+
+Marking the default combo `is_fallback: true` lets the per-user combo
+replace it for that user:
+
+```yaml
+limit_combinations:
+  - name: default-plan
+    is_fallback: true
+    # No `match` -- applies to every request not covered by an override.
+    token_quota:
+      each_month: 1000000   # 1M tokens/month for every user by default
+
+  - name: vip-alice
+    match:
+      - source: consumer
+        value: "alice"
+    token_quota:
+      each_month: 10000000  # 10M tokens/month for alice specifically
+```
+
+Requests carrying `x-mse-consumer: alice` match `vip-alice` (non-fallback
+group is non-empty), so `default-plan` is suppressed -- alice gets her
+10M cap with no interference from the 1M default. Every other user only
+matches `default-plan` (non-fallback group is empty), so the fallback
+fires and they get 1M. Without `is_fallback`, alice would be capped at
+1M because both combos would AND.
 
 ### Redis fields
 

@@ -422,6 +422,14 @@ func matchPathFilters(config *PluginConfig, path string) bool {
 	return false
 }
 
+// matchedCombo is one combo that survived match-rule evaluation, paired with
+// the key-fragment prefix built from its match results. Used internally by
+// collectChecks to defer entry emission until after fallback partitioning.
+type matchedCombo struct {
+	combo *LimitCombination
+	base  []string
+}
+
 // collectChecks walks every combination and its match rules to build the
 // Lua script arguments for the request phase, and to collect token-flavoured
 // "add" tasks to execute in the response phase.
@@ -442,7 +450,22 @@ func matchPathFilters(config *PluginConfig, path string) bool {
 // multiple periods (e.g. each_day + each_month) likewise emits one entry per
 // period. Each window/period gets its own distinct kind:period suffix in the
 // Redis key so they never collide.
+//
+// Fallback combos (LimitCombination.IsFallback == true) are handled in a
+// two-pass walk:
+//
+//  1. Pass 1 evaluates match rules for every combo and partitions the matched
+//     set into non-fallback vs fallback groups.
+//  2. Pass 2 emits entries only for the chosen group: non-fallback if it is
+//     non-empty, fallback otherwise. Both groups still AND internally — a
+//     request bound by two non-fallback combos still has to satisfy both.
+//
+// The result is "default-or-override" semantics: a fallback combo only fires
+// for requests that no non-fallback combo also matched, so a per-user
+// override can legitimately raise the effective allowance above the
+// deployment-wide default for the targeted user without affecting others.
 func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowTime time.Time) (entries []LimitEntry, pending []tokenPendingAdd) {
+	var nonFallback, fallback []matchedCombo
 	for i := range config.LimitCombinations {
 		combo := &config.LimitCombinations[i]
 
@@ -460,6 +483,24 @@ func collectChecks(config *PluginConfig, headers [][2]string, reqID string, nowT
 		if !matched {
 			continue
 		}
+		m := matchedCombo{combo: combo, base: base}
+		if combo.IsFallback {
+			fallback = append(fallback, m)
+		} else {
+			nonFallback = append(nonFallback, m)
+		}
+	}
+
+	// Pick the active group: non-fallback wins outright; fallback only fires
+	// when no non-fallback combo matched this request.
+	active := nonFallback
+	if len(active) == 0 {
+		active = fallback
+	}
+
+	for _, m := range active {
+		combo := m.combo
+		base := m.base
 
 		// Pre-compute the dimension fragment shared by every limit kind on this
 		// combo. base[2:] is the slice of <source>:<name>=<value> fragments

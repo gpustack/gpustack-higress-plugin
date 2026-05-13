@@ -120,6 +120,167 @@ func TestCollectChecksOrderingAndModes(t *testing.T) {
 	}
 }
 
+// TestCollectChecksFallbackSuppressedWhenOverrideMatches asserts the core
+// "default-or-override" semantics: when a non-fallback combo matches the
+// request, every fallback combo is suppressed even if it would have matched
+// on its own match rules. This is what lets per-user overrides legitimately
+// raise the allowance above a deployment-wide default without the default
+// AND-clamping the user back down.
+func TestCollectChecksFallbackSuppressedWhenOverrideMatches(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "r",
+		LimitCombinations: []LimitCombination{
+			{
+				// Fallback default: empty match -> applies to every request
+				// the plugin sees, but only when no non-fallback combo did.
+				Name:        "default",
+				IsFallback:  true,
+				QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+			},
+			{
+				Name:        "vip-override",
+				Match:       []MatchRule{mustHeaderRule(t, "x-mse-consumer", "vip-1")},
+				QueryLimits: &RateQuota{PerMinute: intPtr(1000)},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "vip-1"}}, "rid", time.Now())
+	if len(entries) != 1 {
+		t.Fatalf("len(entries)=%d, want 1 (override only, default suppressed)", len(entries))
+	}
+	if entries[0].Combo != "vip-override" {
+		t.Errorf("entries[0].Combo=%q, want vip-override", entries[0].Combo)
+	}
+	if entries[0].Quota != 1000 {
+		t.Errorf("entries[0].Quota=%d, want 1000 (override allowance, not default 10)",
+			entries[0].Quota)
+	}
+}
+
+// TestCollectChecksFallbackFiresWhenNoOverrideMatches asserts the other half
+// of the contract: requests with no matching non-fallback combo fall through
+// to the fallback group, which fires as if it were the only configured combo.
+func TestCollectChecksFallbackFiresWhenNoOverrideMatches(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "r",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:        "default",
+				IsFallback:  true,
+				QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+			},
+			{
+				Name:        "vip-override",
+				Match:       []MatchRule{mustHeaderRule(t, "x-mse-consumer", "vip-1")},
+				QueryLimits: &RateQuota{PerMinute: intPtr(1000)},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	// A non-VIP request: vip-override misses, default fires.
+	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+	if len(entries) != 1 {
+		t.Fatalf("len(entries)=%d, want 1 (default fires)", len(entries))
+	}
+	if entries[0].Combo != "default" || entries[0].Quota != 10 {
+		t.Errorf("entries[0] = (combo=%q, quota=%d), want (default, 10)",
+			entries[0].Combo, entries[0].Quota)
+	}
+	// The Redis key has no dimension fragments because the fallback combo
+	// declared no match rules — every non-overridden caller shares the
+	// single deployment-wide bucket.
+	wantKey := "r|default|q:60s"
+	if entries[0].Key != wantKey {
+		t.Errorf("entries[0].Key=%q, want %q", entries[0].Key, wantKey)
+	}
+}
+
+// TestCollectChecksMultipleFallbacksAllFire asserts that the fallback group is
+// still AND-combined internally: when several fallback combos are present and
+// no non-fallback combo matched, every matching fallback contributes its own
+// bucket (same as the non-fallback group behaves when several combos AND).
+func TestCollectChecksMultipleFallbacksAllFire(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "r",
+		LimitCombinations: []LimitCombination{
+			{
+				Name:        "default-requests",
+				IsFallback:  true,
+				QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+			},
+			{
+				Name:        "default-tokens",
+				IsFallback:  true,
+				TokenLimits: &RateQuota{PerMinute: intPtr(1000)},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	entries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "alice"}}, "rid", time.Now())
+	if len(entries) != 2 {
+		t.Fatalf("len(entries)=%d, want 2 (both fallbacks fire)", len(entries))
+	}
+	got := map[string]bool{}
+	for _, e := range entries {
+		got[e.Combo] = true
+	}
+	if !got["default-requests"] || !got["default-tokens"] {
+		t.Errorf("expected both fallback combos to fire, got %v", got)
+	}
+}
+
+// TestCollectChecksFallbackWithMatchRulesStillSuppressed asserts that
+// fallbacks declaring their own match rules are also subject to suppression
+// when any non-fallback combo matched — IsFallback is the only signal that
+// matters; the presence of match rules on a fallback does not promote it
+// above the suppression rule.
+func TestCollectChecksFallbackWithMatchRulesStillSuppressed(t *testing.T) {
+	cfg := &PluginConfig{
+		RuleName: "r",
+		LimitCombinations: []LimitCombination{
+			{
+				// Fallback bound to the consumer dimension via regexp_capture
+				// (typical "per-user default plan" shape from the enterprise
+				// translator).
+				Name:        "default-per-user",
+				IsFallback:  true,
+				Match:       []MatchRule{{Source: SourceConsumer, Value: `regexp_capture:^(gpustack-.+)$`}},
+				QueryLimits: &RateQuota{PerMinute: intPtr(10)},
+			},
+			{
+				Name:        "vip-override",
+				Match:       []MatchRule{mustHeaderRule(t, "x-mse-consumer", "gpustack-vip")},
+				QueryLimits: &RateQuota{PerMinute: intPtr(1000)},
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(): %v", err)
+	}
+
+	// VIP request: both combos' match rules hit, but the fallback is suppressed.
+	vipEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-vip"}}, "rid", time.Now())
+	if len(vipEntries) != 1 || vipEntries[0].Combo != "vip-override" {
+		t.Errorf("VIP entries=%+v, want only vip-override", vipEntries)
+	}
+
+	// Non-VIP gpustack user: only the fallback's match rule hits, so it fires.
+	nonVipEntries, _ := collectChecks(cfg, [][2]string{{"x-mse-consumer", "gpustack-7"}}, "rid", time.Now())
+	if len(nonVipEntries) != 1 || nonVipEntries[0].Combo != "default-per-user" {
+		t.Errorf("non-VIP entries=%+v, want only default-per-user", nonVipEntries)
+	}
+}
+
 func TestCollectChecksAllCombosMiss(t *testing.T) {
 	cfg := &PluginConfig{
 		RuleName: "r",
