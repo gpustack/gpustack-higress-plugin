@@ -1,0 +1,66 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-model-mapper
+  namespace: higress-system
+spec:
+  # This plugin is a drop-in replacement for higress's built-in model-mapper.
+  # **Disable model-mapper** when this plugin is active (`kubectl -n
+  # higress-system edit wasmplugin model-mapper` → `defaultConfigDisable:
+  # true`), otherwise both plugins will try to rewrite the body and the
+  # outcome depends on priority ordering.
+  #
+  # Priority 800 matches higress model-mapper's original slot: it runs after
+  # any header-projection plugin (e.g. gpustack-generic-proxy-router /
+  # model-router at 900) and before limit plugins (gpustack-rate-limit /
+  # ai-token-ratelimit at 600).
+  phase: UNSPECIFIED_PHASE
+  priority: 800
+  url: oci://<your-registry>/<your-org>/gpustack-model-mapper:1.0.0
+  sha256: "<sha256-digest>"
+  defaultConfigDisable: false
+
+  defaultConfig:
+    modelKey: "model"
+    modelToHeader: "x-higress-llm-model-final"
+
+    # Mapping table. Key syntax:
+    #   "exact-name"  → exact match
+    #   "prefix-*"    → prefix match (key ends with *)
+    #   "*"           → default fallback
+    #
+    # Used by GPUStack to map custom-route names to the actual deployed
+    # model. Fixes issue 4617 (STT/image-edits 404 in custom routes) by
+    # also supporting multipart/form-data bodies.
+    modelMapping:
+      my-stt-route: whisper-large-v3
+      my-image-edit-route: dall-e-3
+      # Prefix examples:
+      # legacy-*: qwen2.5-7b-instruct
+      # legacy-coder-*: qwen2.5-coder-7b
+      # Default:
+      # "*": qwen2.5-7b-instruct
+
+    # Path filter. Defaults cover the OpenAI-style AI endpoints; override to
+    # narrow / widen. Use `["*"]` to match every path.
+    # enableOnPathSuffix:
+    #   - /completions
+    #   - /audio/transcriptions
+    #   - /images/edits
+
+  # Per-route override pattern. mapper is typically configured PER ROUTE in
+  # GPUStack (the mapping table differs per route), so matchRules is the
+  # natural shape:
+  # matchRules:
+  #   - ingress:
+  #       - whisper-custom-route.higress-system
+  #     configDisable: false
+  #     config:
+  #       modelMapping:
+  #         my-stt-route: whisper-large-v3
+  #   - ingress:
+  #       - dall-e-custom-route.higress-system
+  #     configDisable: false
+  #     config:
+  #       modelMapping:
+  #         my-image-route: dall-e-3
