@@ -4,33 +4,81 @@ metadata:
   name: gpustack-generic-proxy-router
   namespace: higress-system
 spec:
-  # Must run after model-router:
-  #   - Higress's built-in model-router runs at UNSPECIFIED_PHASE / priority=900
-  #     to parse the `model` field from the request body and write it to the
-  #     x-higress-llm-model header.
-  #   - This plugin needs to override that header, so its priority must be < 900.
-  #   - It's also recommended to be > 600 (gpustack-rate-limit / ai-token-ratelimit)
-  #     so rate-limiting policies see the final model name mapped from the path.
+  # This plugin fully replaces Higress's built-in `model-router` while adding
+  # path-driven routing on top. **Disable model-router** when this plugin is
+  # deployed (`kubectl -n higress-system edit wasmplugin model-router` →
+  # `defaultConfigDisable: true`), otherwise both plugins will write
+  # `x-higress-llm-model` and you'll get whichever-priority-wins behaviour.
+  #
+  # Priority 900 matches model-router's original slot so downstream
+  # consumers (ai-route, gpustack-rate-limit at 600, ai-token-ratelimit at
+  # 600) see the final resolved model name without any other ordering
+  # changes.
   phase: UNSPECIFIED_PHASE
-  priority: 800
+  priority: 900
   url: oci://<your-registry>/<your-org>/gpustack-generic-proxy-router:1.0.0
   sha256: "<sha256-digest>"
   defaultConfigDisable: false
 
-  # ============================================================
-  # For paths like /model/proxy/{id}/v1/chat/completions
-  #   - Extract {id}
-  #   - Look up the real model name in aliasNameMapping
-  #   - Write it to the x-higress-llm-model header (replacing the original value)
-  # On a hit, downstream ai-route / gpustack-rate-limit operate on the real model name.
-  # ============================================================
   defaultConfig:
+    # --------------------------------------------------------------
+    # Path-driven mode: /model/proxy/{id}/v1/chat/completions
+    #   - Extract {id}, look up `aliasNameMapping[id]` → target model.
+    #   - Write the target into `targetHeader` and into the body's `modelKey`.
+    # If the URL doesn't match `prefix` (or {id} isn't mapped), the plugin
+    # falls through to body-driven mode below.
+    # --------------------------------------------------------------
     prefix: "/model/proxy/"
     targetHeader: "x-higress-llm-model"
+    modelKey: "model"
     aliasNameMapping:
       qwen-alias: "qwen2.5-7b-instruct"
       llama-alias: "llama-3.1-8b-instruct"
       gpt4-alias: "gpt-4o"
+      # Values can also be "<provider>/<model>" — split happens iff
+      # `addProviderHeader` is configured.
+      # openai-gpt4: "openai/gpt-4"
+
+    # --------------------------------------------------------------
+    # Body-driven mode (model-router parity):
+    #   - Triggered on paths matching `enableOnPathSuffix` when path-driven
+    #     mode didn't fire.
+    #   - Reads `model` from the body (JSON or multipart/form-data) and
+    #     writes it into `targetHeader`. Splits `provider/model` when
+    #     `addProviderHeader` is set.
+    # `enableOnPathSuffix` defaults to OpenAI's standard AI endpoints;
+    # override to narrow or widen. Use `["*"]` to match every path.
+    # --------------------------------------------------------------
+    # enableOnPathSuffix:
+    #   - /completions
+    #   - /embeddings
+    #   - /audio/transcriptions
+
+    # --------------------------------------------------------------
+    # Provider/model split (optional). When the resolved target — coming
+    # from either aliasNameMapping or the body's `model` field — is of the
+    # form "<provider>/<model>", `addProviderHeader` receives the provider
+    # half, `modelToHeader` receives the model half, and the body is
+    # rewritten to just the model half. `targetHeader` always carries the
+    # unsplit value.
+    # --------------------------------------------------------------
+    # addProviderHeader: "x-higress-llm-provider"
+    # modelToHeader: "x-higress-llm-model-final"
+
+    # --------------------------------------------------------------
+    # Auto-routing (JSON bodies only). When the body's model field equals
+    # `higress/auto`, the last `role:user` message is matched against
+    # `rules` (RE2). First match wins; `defaultModel` is the fallback when
+    # no rule matches.
+    # --------------------------------------------------------------
+    # autoRouting:
+    #   enable: true
+    #   defaultModel: "qwen2.5-7b-instruct"
+    #   rules:
+    #     - pattern: "(?i)\\bcode\\b"
+    #       model: "qwen2.5-coder-7b"
+    #     - pattern: "(?i)\\b(image|photo)\\b"
+    #       model: "qwen-vl"
 
   # You can also override per ingress / route, e.g. enable only on a specific AI route:
   # matchRules:
