@@ -39,20 +39,15 @@ remote_plugins:
     version: 2.0.0
     digest: sha256:b02da08e0dd519ee0180696f062bb15a04b37de0a88a2c1b46836c07d1e9adab
 
-  - source: model-router:2.0.0
-    name: model-router
-    version: 2.0.0
-    digest: sha256:f4a30a40f069c1ef68ec87e71a739b3246801cfac7388c98590dd98c89be02cb
+  # model-router and model-mapper are no longer fetched from upstream —
+  # gpustack-generic-proxy-router and gpustack-model-mapper (built locally)
+  # are drop-in replacements covering both their behaviour and the missing
+  # multipart/form-data support.
 
   - source: transformer:2.0.0
     name: transformer
     version: 2.0.0
     digest: sha256:40ff2e000dcfd94da76c36593bdfd50f4d0f094309c013732da8e1c35171f321
-
-  - source: model-mapper:2.0.0
-    name: model-mapper
-    version: 2.0.0
-    digest: sha256:d6e99e739f83eacf5efef5d00876efcc4ac849a80f19eb19a914d0aa2cce267b
 
   # Use full OCI URL to override default registry
   # - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0
