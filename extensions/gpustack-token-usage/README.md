@@ -49,6 +49,13 @@ header_add:
 # Added to the built-in defaults; does not replace them.
 additionalClusterNameRegexps:
   - "^my-internal-svc(\\.|$)"
+
+# Optional: request header carrying the caller's organization id. When the
+# inbound request has this header, the value is forwarded as
+# `organization_id` on the metrics-report payload. The header is treated as
+# optional — if absent, `organization_id` is omitted from the payload.
+# Default: X-Organization-Id
+organizationIDHeader: X-Organization-Id
 ```
 
 Recommended priority: `400`  
@@ -167,7 +174,8 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
   "model_id": 3,
   "model_route_id": 1,
   "user_id": 42,
-  "access_key": "mykey"
+  "access_key": "mykey",
+  "organization_id": "org-7"
 }
 ```
 
@@ -185,6 +193,7 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
 | `model_id` / `provider_id` | mutually exclusive | Derived from the Envoy cluster name (`outbound\|<port>\|\|model-<id>-<instance>` or `provider-<id>`). |
 | `model_route_id` | when matched | Derived from the Envoy `route_name` property; formats `ai-route-route-<id>.internal` and `ai-route-route-<id>.fallback.internal` (suffix optional). |
 | `user_id` / `access_key` | when present | Parsed from the `x-mse-consumer` header. |
+| `organization_id` | when present | Verbatim string copy of the inbound request header named by `organizationIDHeader` (default `X-Organization-Id`). Omitted entirely when the header is absent or empty — the proxy never invents or defaults a value. |
 
 `input_cached_token` aggregates cached prompt tokens from OpenAI/vLLM (`usage.prompt_tokens_details.cached_tokens`) and Anthropic (`cache_read_input_tokens`); cache-creation tokens are excluded because they are new tokens being written, not a hit.
 

@@ -19,6 +19,10 @@ spec:
     # Optional: extend the built-in cluster_name FQDN matchers.
     # additionalClusterNameRegexps:
     #   - "^my-internal-svc(\\.|$)"
+    # Optional: request header carrying the caller's organization id; if
+    # present on the inbound request it is forwarded as `organization_id`
+    # on the metrics-report payload. Defaults to X-Organization-Id.
+    # organizationIDHeader: X-Organization-Id
     # Optional: metrics-report endpoint.
     # endpoint:
     #   service_name: gpustack-server.gpustack.svc.cluster.local

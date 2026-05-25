@@ -38,6 +38,11 @@ var defaultClusterNameRegexps = []string{
 
 const (
 	pluginName = "gpustack-token-usage"
+
+	// defaultOrganizationIDHeader is the request header from which the
+	// organization_id metric attribute is extracted. Override via the
+	// `organizationIDHeader` config field.
+	defaultOrganizationIDHeader = "X-Organization-Id"
 )
 
 const (
@@ -131,10 +136,11 @@ type PluginConfig struct {
 	//   2. Attached to every metrics-report POST sent to Endpoint — the
 	//      report endpoint also lives on the GPUStack backend and validates
 	//      the same token. Sharing one config keeps the secret single-sourced.
-	HeaderAdd           map[string]string
-	ReportClient        wrapper.HttpClient
-	RealIPHeader        string
-	ClusterNameMatchers []*regexp.Regexp
+	HeaderAdd            map[string]string
+	ReportClient         wrapper.HttpClient
+	RealIPHeader         string
+	ClusterNameMatchers  []*regexp.Regexp
+	OrganizationIDHeader string
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
@@ -168,6 +174,7 @@ type ModelUsageMetrics struct {
 	ModelRouteID        *int64  `json:"model_route_id,omitempty"`
 	ProviderID          *int64  `json:"provider_id,omitempty"`
 	AccessKey           *string `json:"access_key,omitempty"`
+	OrganizationID      *string `json:"organization_id,omitempty"`
 }
 
 func matchPathSuffix(targetURI string, suffixes []string) bool {
@@ -255,6 +262,12 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	}
 
 	config.RealIPHeader = json.Get("realIPHeader").String()
+
+	if orgHeader := json.Get("organizationIDHeader").String(); orgHeader != "" {
+		config.OrganizationIDHeader = orgHeader
+	} else {
+		config.OrganizationIDHeader = defaultOrganizationIDHeader
+	}
 
 	patterns := append([]string(nil), defaultClusterNameRegexps...)
 	for _, item := range json.Get("additionalClusterNameRegexps").Array() {
@@ -463,17 +476,19 @@ func removeHeader(name string, headers [][2]string) [][2]string {
 	return rtn
 }
 
-func buildBaseMetrics(ctx wrapper.HttpContext) *ModelUsageMetrics {
+func buildBaseMetrics(ctx wrapper.HttpContext, config PluginConfig, headers [][2]string) *ModelUsageMetrics {
 	m := &ModelUsageMetrics{
 		Model:        ctx.GetStringContext(RequestModelKey, ""),
 		RequestCount: 1,
 	}
-	if headers, ok := ctx.GetContext(RequestHeadersKey).([][2]string); ok {
-		for _, h := range headers {
-			if strings.EqualFold(h[0], "x-mse-consumer") && h[1] != "" {
-				m.UserID, m.AccessKey = parseConsumerHeader(h[1])
-				break
-			}
+	orgHeader := config.OrganizationIDHeader
+	for _, h := range headers {
+		if strings.EqualFold(h[0], "x-mse-consumer") && h[1] != "" {
+			m.UserID, m.AccessKey = parseConsumerHeader(h[1])
+		}
+		if strings.EqualFold(h[0], orgHeader) && h[1] != "" {
+			v := h[1]
+			m.OrganizationID = &v
 		}
 	}
 	return m
@@ -609,7 +624,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		return types.ActionContinue
 	}
 	headers = processRequestBody(ctx, body, headers)
-	ctx.SetContext(BaseMetricsKey, buildBaseMetrics(ctx))
+	ctx.SetContext(BaseMetricsKey, buildBaseMetrics(ctx, config, headers))
 	_ = proxywasm.ReplaceHttpRequestHeaders(headers)
 	return types.ActionContinue
 }
@@ -1002,6 +1017,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		CompletedAt:         time.Now().UnixMilli(),
 		UserID:              base.UserID,
 		AccessKey:           base.AccessKey,
+		OrganizationID:      base.OrganizationID,
 		ModelID:             modelID,
 		ModelRouteID:        modelRouteID,
 		ProviderID:          providerID,
