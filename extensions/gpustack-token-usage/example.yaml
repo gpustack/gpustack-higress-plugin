@@ -23,6 +23,10 @@ spec:
     # present on the inbound request it is forwarded as `organization_id`
     # on the metrics-report payload. Defaults to X-Organization-Id.
     # organizationIDHeader: X-Organization-Id
+    # Optional: byte cap for the non-streaming sniff path; bounds both the
+    # response buffer and the gzip-decoded size to guard against OOM and zip
+    # bombs. Over-cap bodies are not tracked for usage. Default 10485760 (10MiB).
+    # maxResponseBodyBytes: 10485760
     # Optional: metrics-report endpoint.
     # endpoint:
     #   service_name: gpustack-server.gpustack.svc.cluster.local

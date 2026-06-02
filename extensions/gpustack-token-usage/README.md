@@ -56,6 +56,13 @@ additionalClusterNameRegexps:
 # optional — if absent, `organization_id` is omitted from the payload.
 # Default: X-Organization-Id
 organizationIDHeader: X-Organization-Id
+
+# Optional: byte cap for the non-streaming sniff path. It bounds both the
+# accumulated response buffer and the gzip-decoded size, protecting the WASM VM
+# against an enormous response (OOM) and a zip bomb (a tiny gzip payload that
+# inflates without limit). A response exceeding the cap is simply not tracked
+# for usage — traffic is never blocked. Default: 10485760 (10 MiB).
+maxResponseBodyBytes: 10485760
 ```
 
 Recommended priority: `400`  
@@ -103,13 +110,13 @@ Both ends must be able to be reconfigured without restart for this to be non-dis
 
 ## Token Usage Injection
 
-For requests whose path matches `enableOnPathSuffix`, the plugin injects additional fields into the `usage` object of the response:
+For **streaming** requests whose path matches `enableOnPathSuffix`, the plugin injects additional timing fields into the `usage` object of the SSE response:
 
 | Field | Description |
 | --- | --- |
-| `time_to_first_token_ms` | Milliseconds from request start to first response token (streaming only) |
-| `time_per_output_token_ms` | Average milliseconds per output token (streaming only) |
-| `tokens_per_second` | Output token throughput |
+| `time_to_first_token_ms` | Milliseconds from request start to first response token |
+| `time_per_output_token_ms` | Average milliseconds per output token |
+| `tokens_per_second` | Output token throughput (excludes time-to-first-token) |
 
 **Streaming example** — original usage chunk:
 
@@ -124,7 +131,21 @@ data: {"usage": {"prompt_tokens": 50, "completion_tokens": 100, "total_tokens": 
        "time_to_first_token_ms": 123, "time_per_output_token_ms": 45.46, "tokens_per_second": 6.67}}
 ```
 
-**Non-streaming** — `tokens_per_second` is injected into `usage.tokens_per_second` in the JSON response body.
+**Non-streaming responses are not modified.** Endpoints such as `/v1/embeddings` and `stream: false` completions are *sniffed* for usage — the proxy reads token counts for the metrics report but forwards the response body byte-for-byte to the client. The timing fields above are streaming-specific (TTFT / TPOT have no meaning when the whole response arrives at once) and are therefore not injected on this path.
+
+### Response body handling: streaming vs non-streaming
+
+The two paths differ in how they treat the response body and `Accept-Encoding`:
+
+| | Streaming (SSE) | Non-streaming (single JSON) |
+| --- | --- | --- |
+| Body rewritten? | Yes (usage extras injected / usage-only chunk stripped) | No — forwarded verbatim |
+| `Accept-Encoding` | **Stripped** from the upstream request, so the SSE body arrives as plaintext the plugin can edit | **Left intact** — upstream may `gzip` and the client keeps compression |
+| Usage parsing | Incremental, per SSE chunk | Chunks are buffered, then decoded (per the upstream `Content-Encoding`) and parsed **once** at end-of-stream |
+
+Why the split matters: a non-streaming JSON body carries `usage` at the very **tail**, after a potentially huge payload (e.g. embedding vectors), so Envoy delivers it across several chunks and it is frequently `gzip`-compressed. Parsing per-chunk on the raw (compressed, fragmented) bytes would never find `usage`. The plugin therefore accumulates the full body and decodes it locally. Only `identity` and `gzip` content-encodings are supported; any other encoding (e.g. `br`) is logged and the request is reported without token counts (fail-open, traffic is never blocked).
+
+Both the accumulated buffer and the gzip-decoded output are bounded by `maxResponseBodyBytes` (default 10 MiB). This protects the WASM VM from an OOM on an enormous response and from a zip bomb (a tiny compressed payload that inflates without limit). A body that exceeds the cap is dropped from usage tracking — it is never buffered further and the request is reported without token counts, but traffic still flows untouched.
 
 ## Metrics Reporting
 

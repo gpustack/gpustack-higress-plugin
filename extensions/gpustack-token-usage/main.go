@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,6 +44,15 @@ const (
 	// organization_id metric attribute is extracted. Override via the
 	// `organizationIDHeader` config field.
 	defaultOrganizationIDHeader = "X-Organization-Id"
+
+	// defaultMaxResponseBodyBytes caps both the accumulated raw buffer and the
+	// gzip-decoded output on the non-streaming sniff path. It bounds WASM-VM
+	// memory against an enormous response (OOM) and a zip bomb (a tiny gzip
+	// payload that inflates to gigabytes). A body exceeding the cap is not
+	// tracked for usage — the plugin stays fail-open and never blocks traffic.
+	// Override via the `maxResponseBodyBytes` config field. 10 MiB comfortably
+	// covers large embedding batches while keeping peak memory bounded.
+	defaultMaxResponseBodyBytes = 10 * 1024 * 1024
 )
 
 const (
@@ -67,6 +77,29 @@ const (
 	MetricsReportedKey     = "gpustack_metrics_reported"
 	RequestHeadersKey      = "gpustack_headers"
 	MultipartContentType   = "gpustack_multipart_content_type"
+
+	// ResponseContentEncodingKey holds the upstream response's
+	// content-encoding header (e.g. "gzip"), captured on the non-streaming
+	// path. We deliberately keep gzip on non-streaming responses (the plugin
+	// only sniffs them, never rewrites their body) so the client retains
+	// compression; the accumulated body buffer is decoded once at
+	// end-of-stream purely to read usage. Streaming requests instead strip
+	// accept-encoding upstream because they DO rewrite the SSE chunks.
+	ResponseContentEncodingKey = "gpustack_response_content_encoding"
+
+	// NonStreamBodyBufferKey accumulates the (possibly gzip-compressed) raw
+	// response chunks for a non-streaming response. The usage object sits at
+	// the tail of a single JSON document after a potentially huge payload
+	// (e.g. embedding vectors), so Envoy delivers it across multiple chunks;
+	// parsing requires the complete body. Buffering the still-compressed
+	// bytes is cheaper than the decoded form. Decoded + parsed once at
+	// end-of-stream.
+	NonStreamBodyBufferKey = "gpustack_nonstream_body_buffer"
+
+	// BufferExceededKey latches once the non-streaming buffer passes
+	// MaxResponseBodyBytes, so subsequent chunks short-circuit instead of
+	// re-checking and re-logging. Usage is not recorded for such a response.
+	BufferExceededKey = "gpustack_buffer_exceeded"
 
 	// StripUsageChunkKey is set when the user's request body had explicit
 	// stream_options.include_usage:false; we override to true to guarantee
@@ -113,6 +146,13 @@ func init() {
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 		wrapper.ProcessStreamDone(onHttpStreamDone),
+		// Periodically rebuild the VM to bound long-running memory-leak
+		// accumulation — aligned with gpustack-rate-limit and Higress AI
+		// plugin conventions. Per-request transient memory on the
+		// non-streaming sniff path peaks near 2×maxResponseBodyBytes
+		// (raw buffer + decoded body), so 200 MiB leaves ample headroom.
+		wrapper.WithRebuildAfterRequests[PluginConfig](1000),
+		wrapper.WithRebuildMaxMemBytes[PluginConfig](200 * 1024 * 1024),
 	)
 }
 
@@ -141,6 +181,9 @@ type PluginConfig struct {
 	RealIPHeader         string
 	ClusterNameMatchers  []*regexp.Regexp
 	OrganizationIDHeader string
+	// MaxResponseBodyBytes caps the non-streaming sniff buffer and the
+	// gzip-decoded size (see defaultMaxResponseBodyBytes).
+	MaxResponseBodyBytes int
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
@@ -236,6 +279,8 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 		"/completions",
 		"/responses",
 		"/messages",
+		"/embeddings",
+		"/rerank",
 	})
 
 	endpoint := json.Get("endpoint")
@@ -262,6 +307,12 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	}
 
 	config.RealIPHeader = json.Get("realIPHeader").String()
+
+	if maxBody := json.Get("maxResponseBodyBytes").Int(); maxBody > 0 {
+		config.MaxResponseBodyBytes = int(maxBody)
+	} else {
+		config.MaxResponseBodyBytes = defaultMaxResponseBodyBytes
+	}
 
 	if orgHeader := json.Get("organizationIDHeader").String(); orgHeader != "" {
 		config.OrganizationIDHeader = orgHeader
@@ -524,7 +575,17 @@ func processRequestBody(ctx wrapper.HttpContext, body []byte, headers [][2]strin
 
 	stream := gjson.GetBytes(body, "stream")
 	if ctx.GetBoolContext(ProcessBodyKey, false) {
-		ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
+		streaming := stream.Exists() && stream.Bool()
+		ctx.SetContext(IsStreamingResponse, streaming)
+		// Streaming responses get their SSE chunks rewritten (usage extras
+		// injected / usage-only chunk stripped), so we must see plaintext:
+		// strip accept-encoding upstream. Non-streaming responses are only
+		// sniffed, never rewritten, so we leave accept-encoding intact and
+		// decode the buffered body locally at end-of-stream — the client
+		// keeps gzip+chunked.
+		if streaming {
+			headers = removeHeader("accept-encoding", headers)
+		}
 	}
 
 	if !ctx.GetBoolContext(InjectStreamOptionsKey, false) {
@@ -656,14 +717,39 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 		contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
 		if strings.Contains(contentType, "application/json") {
 			ctx.SetContext(IsStreamingResponse, false)
+			captureResponseContentEncoding(ctx)
 			return types.HeaderStopIteration
 		}
 		return types.ActionContinue
 	}
+	captureResponseContentEncoding(ctx)
 	return types.HeaderStopIteration
 }
 
+// captureResponseContentEncoding stashes the upstream content-encoding so the
+// non-streaming body path can decode the accumulated buffer before parsing
+// usage. Only meaningful for the non-streaming path: streaming requests
+// already stripped accept-encoding upstream, so their responses are plaintext.
+func captureResponseContentEncoding(ctx wrapper.HttpContext) {
+	if enc, err := proxywasm.GetHttpResponseHeader("content-encoding"); err == nil && enc != "" {
+		ctx.SetContext(ResponseContentEncodingKey, enc)
+	}
+}
+
 func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool) []byte {
+	// Non-streaming responses (embeddings, stream:false completions, and
+	// stream:true requests whose upstream answered with a single JSON body)
+	// are sniff-only: pass every chunk through untouched (client keeps
+	// gzip+chunked) while buffering a private copy, then decode+parse usage
+	// once at end-of-stream.
+	if !ctx.GetBoolContext(IsStreamingResponse, false) {
+		handleNonStreamingResponseBody(ctx, data, endOfStream, config.MaxResponseBodyBytes)
+		if endOfStream {
+			ctx.SetContext(ResponseCompletedKey, true)
+		}
+		return data
+	}
+
 	result := processTokenUsage(ctx, data)
 	if endOfStream {
 		ctx.SetContext(ResponseCompletedKey, true)
@@ -672,6 +758,77 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		}
 	}
 	return result
+}
+
+// handleNonStreamingResponseBody accumulates raw response chunks and, at
+// end-of-stream, decodes them per the upstream content-encoding and parses
+// usage into FinalUsageKey. The chunks themselves are never modified — the
+// caller forwards them verbatim — so this is pure observation. On any decode
+// failure (e.g. an unsupported encoding such as brotli) it logs and returns
+// without a usage record, keeping the plugin fail-open.
+//
+// maxBytes bounds both the accumulated raw buffer and the decoded body so a
+// huge response or a zip bomb cannot OOM the WASM VM; an over-cap body is
+// dropped (no usage recorded) rather than blocked.
+func handleNonStreamingResponseBody(ctx wrapper.HttpContext, data []byte, endOfStream bool, maxBytes int) {
+	if ctx.GetBoolContext(BufferExceededKey, false) {
+		return
+	}
+	buf := ctx.GetByteSliceContext(NonStreamBodyBufferKey, nil)
+	if len(buf)+len(data) > maxBytes {
+		proxywasm.LogWarnf("handleNonStreamingResponseBody: response body exceeded %d bytes; stopping buffering to prevent OOM, usage not recorded", maxBytes)
+		ctx.SetContext(NonStreamBodyBufferKey, nil)
+		ctx.SetContext(BufferExceededKey, true)
+		return
+	}
+	buf = append(buf, data...)
+	ctx.SetContext(NonStreamBodyBufferKey, buf)
+	if !endOfStream {
+		return
+	}
+	ctx.SetContext(NonStreamBodyBufferKey, nil)
+
+	encoding := ctx.GetStringContext(ResponseContentEncodingKey, "")
+	body, err := decodeResponseBody(buf, encoding, maxBytes)
+	if err != nil {
+		proxywasm.LogWarnf("handleNonStreamingResponseBody: cannot decode response body (content-encoding=%q): %v; usage not recorded", encoding, err)
+		return
+	}
+	usage := tokenusage.GetTokenUsage(ctx, body)
+	if usage.TotalToken > 0 {
+		ctx.SetContext(FinalUsageKey, usage)
+	}
+}
+
+// decodeResponseBody returns the plaintext body for the given content-encoding.
+// Supports identity (empty/"identity") and gzip; any other encoding is an
+// error. The gzip path is bounded by maxBytes via an io.LimitReader so a
+// highly-compressed zip bomb cannot inflate without limit; a body that decodes
+// past the cap is an error (usage simply not recorded). Pure (no host calls)
+// so it is unit-testable without a proxy-wasm host.
+func decodeResponseBody(body []byte, contentEncoding string, maxBytes int) ([]byte, error) {
+	switch enc := strings.ToLower(strings.TrimSpace(contentEncoding)); {
+	case enc == "" || enc == "identity":
+		return body, nil
+	case strings.Contains(enc, "gzip"):
+		r, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		// Read one byte past the cap so an exactly-at-cap body still succeeds
+		// while anything larger is detected as overflow.
+		out, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(out) > maxBytes {
+			return nil, fmt.Errorf("decoded body exceeds %d bytes (possible zip bomb)", maxBytes)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported content-encoding %q", contentEncoding)
+	}
 }
 
 // onHttpStreamDone is the single emission point for the metrics report.
@@ -699,25 +856,6 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 		ctx.SetContext(TimeToFirstTokenDuration, firstTokenTime-requestStartTime)
 		proxywasm.LogDebugf("processTokenUsage: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
 	}
-	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
-	if !isStreamingResponse {
-		dur, _ := ctx.GetContext(TimeToFirstTokenDuration).(int64)
-		usage := tokenusage.GetTokenUsage(ctx, data)
-		if usage.TotalToken > 0 {
-			ctx.SetContext(FinalUsageKey, usage)
-		}
-		if dur <= 0 || usage.OutputToken == 0 {
-			return data
-		}
-		tps := math.Round(float64(usage.OutputToken)/(float64(dur)/1000)*100) / 100
-		newData, err := sjson.SetBytes(data, "usage.tokens_per_second", tps)
-		if err != nil {
-			return data
-		}
-		_ = proxywasm.ReplaceHttpResponseHeader("content-length", strconv.Itoa(len(newData)))
-		return newData
-	}
-
 	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
 	var rtn = [][]byte{}
 	for chunk := range chunks {
