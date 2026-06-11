@@ -750,7 +750,7 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		return data
 	}
 
-	result := processTokenUsage(ctx, data)
+	result := processTokenUsage(ctx, data, config.MaxResponseBodyBytes)
 	if endOfStream {
 		ctx.SetContext(ResponseCompletedKey, true)
 		if ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
@@ -845,7 +845,7 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
 	reportMetrics(ctx, config)
 }
 
-func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
+func processTokenUsage(ctx wrapper.HttpContext, data []byte, maxBufferBytes int) []byte {
 	requestStartTime, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
 		return data
@@ -859,13 +859,17 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
 	var rtn = [][]byte{}
 	for chunk := range chunks {
-		chunk = mergeLargeUsageChunks(ctx, chunk)
+		chunk = mergeLargeUsageChunks(ctx, chunk, maxBufferBytes)
 		if chunk == nil {
 			rtn = append(rtn, []byte(""))
 			continue
 		}
-		trimed_data := bytes.TrimPrefix(chunk, []byte("data: "))
-		if !json.Valid(trimed_data) {
+		// An SSE event block may carry an "event:"/"id:"/comment prefix ahead
+		// of its "data:" payload (OpenAI Responses API, e.g.
+		// "event: response.completed\ndata: {...}"). Split the data payload out
+		// for inspection while keeping the prefix so it can be re-emitted.
+		prefix, payload, hasData := splitSSEEvent(chunk)
+		if !hasData || !json.Valid(payload) {
 			rtn = append(rtn, chunk)
 			continue
 		}
@@ -874,17 +878,20 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 		// uses this as fallback output-token estimator) and greedily capture
 		// Anthropic message_start usage so a mid-stream cancel still keeps
 		// input_tokens / cache token data on the report.
-		countOutputDeltaChunk(ctx, trimed_data)
-		captureAnthropicMessageStart(ctx, trimed_data)
+		countOutputDeltaChunk(ctx, payload)
+		captureAnthropicMessageStart(ctx, payload)
 
-		result := gjson.GetBytes(trimed_data, "usage")
-		if !result.Exists() {
+		// Usage lives at top-level "usage" (OpenAI Chat Completions, Anthropic
+		// message_delta) or at "response.usage" (OpenAI Responses API). Empty
+		// path means this chunk carries no usage object.
+		usagePath := usageJSONPath(payload)
+		if usagePath == "" {
 			rtn = append(rtn, chunk)
 			continue
 		}
 		ctx.SetContext(SeenUsageChunk, true)
-		proxywasm.LogDebugf("processTokenUsage: valid chunk: %s", string(trimed_data))
-		usageExtra := getUsageExtra(ctx, trimed_data)
+		proxywasm.LogDebugf("processTokenUsage: valid chunk: %s", string(payload))
+		usageExtra := getUsageExtra(ctx, payload)
 		if usageExtra == nil {
 			rtn = append(rtn, chunk)
 			continue
@@ -895,16 +902,88 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte) []byte {
 		// include_usage:false. FinalUsageKey was already populated by
 		// getUsageExtra above, so the report still has the data; the
 		// client just doesn't see the chunk it didn't ask for.
-		if ctx.GetBoolContext(StripUsageChunkKey, false) && isOpenAIUsageOnlyChunk(trimed_data) {
+		if ctx.GetBoolContext(StripUsageChunkKey, false) && usagePath == "usage" && isOpenAIUsageOnlyChunk(payload) {
 			proxywasm.LogDebugf("processTokenUsage: stripping OpenAI usage chunk (client requested include_usage=false)")
 			continue
 		}
 
-		modified := process_data_with_token(trimed_data, usageExtra)
+		modified := process_data_with_token(payload, usagePath, usageExtra)
 		proxywasm.LogDebugf("processTokenUsage: modified: %s", string(modified))
-		rtn = append(rtn, append([]byte("data: "), modified...))
+		rtn = append(rtn, reassembleSSEEvent(prefix, modified))
 	}
 	return bytes.Join(rtn, []byte("\n\n"))
+}
+
+// splitSSEEvent separates a single SSE event block (already newline-normalized
+// by UnifySSEChunk, so only "\n" line endings) into its non-data prefix lines
+// (event:/id:/retry:/comment) and the concatenated data payload. Per the SSE
+// spec, a "data:" field strips one optional leading space and multiple "data:"
+// lines in one event join with "\n". hasData is false when the block carries no
+// data field at all — an SSE control line, a keep-alive comment, or a non-SSE
+// body such as a JSON rate-limit rejection — in which case the caller forwards
+// the block verbatim. Pure (no host calls) so it is unit-testable.
+func splitSSEEvent(block []byte) (prefix []byte, payload []byte, hasData bool) {
+	lines := bytes.Split(block, []byte("\n"))
+	var prefixLines, dataLines [][]byte
+	for _, line := range lines {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			v := bytes.TrimPrefix(line[len("data:"):], []byte(" "))
+			dataLines = append(dataLines, v)
+			continue
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		prefixLines = append(prefixLines, line)
+	}
+	if len(dataLines) == 0 {
+		return block, nil, false
+	}
+	return bytes.Join(prefixLines, []byte("\n")), bytes.Join(dataLines, []byte("\n")), true
+}
+
+// reassembleSSEEvent rebuilds an SSE event block from its prefix lines and a
+// (possibly rewritten) data payload. With no prefix it is the plain
+// "data: <payload>" shape used by OpenAI Chat Completions / Anthropic; with a
+// prefix (e.g. an "event:" line) the prefix is preserved so Responses-API
+// clients that dispatch on the event type still work. A payload that splitSSEEvent
+// joined from multiple "data:" lines (carrying literal newlines) is re-split so
+// each line gets its own "data: " prefix — emitting one "data:" line with
+// embedded newlines would violate the SSE framing and break downstream parsers.
+func reassembleSSEEvent(prefix, payload []byte) []byte {
+	var dataPart []byte
+	if bytes.Contains(payload, []byte("\n")) {
+		lines := bytes.Split(payload, []byte("\n"))
+		dataLines := make([][]byte, 0, len(lines))
+		for _, line := range lines {
+			dataLines = append(dataLines, append([]byte("data: "), line...))
+		}
+		dataPart = bytes.Join(dataLines, []byte("\n"))
+	} else {
+		dataPart = append([]byte("data: "), payload...)
+	}
+	if len(prefix) == 0 {
+		return dataPart
+	}
+	out := make([]byte, 0, len(prefix)+len(dataPart)+1)
+	out = append(out, prefix...)
+	out = append(out, '\n')
+	out = append(out, dataPart...)
+	return out
+}
+
+// usageJSONPath returns the gjson/sjson path at which the usage object lives in
+// this chunk, or "" when none is present. OpenAI Chat Completions, vLLM and
+// Anthropic message_delta expose it at top-level "usage"; the OpenAI Responses
+// API nests it under the response envelope at "response.usage".
+func usageJSONPath(payload []byte) string {
+	if gjson.GetBytes(payload, "usage").Exists() {
+		return "usage"
+	}
+	if gjson.GetBytes(payload, "response.usage").Exists() {
+		return "response.usage"
+	}
+	return ""
 }
 
 // countOutputDeltaChunk increments OutputChunkCountKey when this chunk
@@ -957,6 +1036,16 @@ func isOutputDeltaChunk(data []byte) bool {
 			return true
 		}
 		if th := delta.Get("thinking"); th.Exists() && th.String() != "" {
+			return true
+		}
+	}
+	// OpenAI Responses API streaming: incremental output arrives as events
+	// whose type ends in ".delta" (response.output_text.delta,
+	// response.function_call_arguments.delta, response.reasoning_summary_text.delta,
+	// ...) carrying a non-empty string "delta". Non-delta lifecycle events
+	// (response.output_item.added, response.completed, ...) are excluded.
+	if t := gjson.GetBytes(data, "type").String(); strings.HasSuffix(t, ".delta") {
+		if d := gjson.GetBytes(data, "delta"); d.Type == gjson.String && d.String() != "" {
 			return true
 		}
 	}
@@ -1202,12 +1291,17 @@ func resolveInputCachedToken(usage tokenusage.TokenUsage) int64 {
 	return usage.InputTokenDetails["cached_tokens"] + usage.AnthropicCacheReadInputToken
 }
 
-func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
+// process_data_with_token injects the computed usage extras (TTFT / TPOT / TPS)
+// into the usage object of the data payload. usagePath is the JSON path of the
+// usage object resolved by usageJSONPath ("usage" for OpenAI Chat Completions /
+// Anthropic, "response.usage" for the OpenAI Responses API), so the extras land
+// in the right place regardless of the response shape.
+func process_data_with_token(payload []byte, usagePath string, usageExtra map[string]any) []byte {
 	var err error
-	var rtn = string(bytes.TrimPrefix(data, []byte("data: ")))
+	var rtn = string(payload)
 	for path, value := range usageExtra {
 		var new_data string
-		new_data, err = sjson.Set(rtn, fmt.Sprintf("usage.%s", path), value)
+		new_data, err = sjson.Set(rtn, fmt.Sprintf("%s.%s", usagePath, path), value)
 		if err != nil {
 			continue
 		}
@@ -1256,25 +1350,78 @@ func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
 	return usageExtraInfo
 }
 
-func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte) []byte {
-	trimed_data := bytes.TrimPrefix(chunk, []byte("data: "))
-	if json.Valid(trimed_data) {
-		ctx.SetContext(IncompleteChunk, false)
-		return chunk
-	}
-	if len(bytes.TrimSpace(trimed_data)) == 0 {
-		return chunk
-	}
-	ctx.SetContext(IncompleteChunk, true)
-	deltaMessage := ctx.GetByteSliceContext(IncompleteChunkData, []byte{})
-	trimed_data = append(deltaMessage, trimed_data...)
-	proxywasm.LogDebugf("the delta is stored: %s", string(trimed_data))
+// mergeLargeUsageChunks reassembles a single SSE event whose data payload was
+// split across Envoy delivery chunks. A large event (e.g. the Responses API's
+// "response.completed", which embeds the whole response object) frequently
+// arrives in fragments; the usage tail then lands in a chunk that, on its own,
+// is not valid JSON. This buffers the raw block — event-type prefix included —
+// until the data payload parses as JSON, then returns the complete block.
+//
+// Returns nil while still accumulating (caller emits an empty placeholder).
+// Forwards verbatim any block that is already complete, empty, or carries no
+// "data:" field at all (SSE control lines, keep-alive comments, or a non-SSE
+// body such as a JSON rate-limit rejection — never buffered, so the client
+// still receives it).
+func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte, maxBufferBytes int) []byte {
+	buffered := ctx.GetByteSliceContext(IncompleteChunkData, nil)
 
-	if !json.Valid(trimed_data) {
-		ctx.SetContext(IncompleteChunkData, trimed_data)
-		return nil
+	// Bound the reassembly buffer the same way handleNonStreamingResponseBody
+	// bounds its accumulator: a malformed or never-completing stream must not
+	// grow the buffer without limit and OOM the WASM VM. On overflow, flush
+	// whatever was accumulated (the client already received empty placeholders
+	// for those segments) and stop reassembling — fail-open, usage for this
+	// event simply goes unrecorded.
+	if maxBufferBytes > 0 && len(buffered)+len(chunk) > maxBufferBytes {
+		proxywasm.LogWarnf("mergeLargeUsageChunks: incomplete SSE buffer exceeded %d bytes; flushing and stopping reassembly (usage may be unrecorded)", maxBufferBytes)
+		ctx.SetContext(IncompleteChunk, false)
+		ctx.SetContext(IncompleteChunkData, nil)
+		if len(buffered) == 0 {
+			return chunk
+		}
+		return append(append([]byte(nil), buffered...), chunk...)
 	}
-	ctx.SetContext(IncompleteChunk, false)
-	ctx.SetContext(IncompleteChunkData, nil)
-	return append([]byte("data: "), trimed_data...)
+
+	out, newBuffer := mergeSSEEventState(buffered, chunk)
+	if len(newBuffer) > 0 {
+		ctx.SetContext(IncompleteChunk, true)
+		ctx.SetContext(IncompleteChunkData, newBuffer)
+		proxywasm.LogDebugf("the delta is stored: %s", string(newBuffer))
+	} else {
+		ctx.SetContext(IncompleteChunk, false)
+		ctx.SetContext(IncompleteChunkData, nil)
+	}
+	return out
+}
+
+// mergeSSEEventState is the pure core of mergeLargeUsageChunks: given the raw
+// block buffered so far (nil/empty when not mid-event) and the next
+// "\n\n"-delimited segment, it returns the block to emit (nil while still
+// accumulating) and the buffer to carry into the next call. No ctx/host calls,
+// so it is unit-testable.
+//
+//   - mid-accumulation (buffered non-empty): the segment is the raw
+//     continuation of the previous event's data payload, appended verbatim;
+//     emit once the reassembled payload is valid JSON.
+//   - fresh segment with no "data:" field (SSE control line, comment, or a
+//     non-SSE JSON body such as a rate-limit rejection): forward verbatim.
+//   - fresh complete / empty data payload, or the "[DONE]" stream terminator
+//     (a deliberately non-JSON sentinel): forward verbatim. Without the
+//     "[DONE]" exception it would be mistaken for a truncated JSON fragment,
+//     buffered forever, and the client would never see the end-of-stream mark.
+//   - fresh truncated data payload: buffer the whole raw block (event-type
+//     prefix included) so the prefix survives reassembly.
+func mergeSSEEventState(buffered, chunk []byte) (out []byte, newBuffer []byte) {
+	if len(buffered) > 0 {
+		combined := append(append([]byte(nil), buffered...), chunk...)
+		if _, payload, _ := splitSSEEvent(combined); json.Valid(payload) {
+			return combined, nil
+		}
+		return nil, combined
+	}
+	_, payload, hasData := splitSSEEvent(chunk)
+	trimmed := bytes.TrimSpace(payload)
+	if !hasData || json.Valid(payload) || len(trimmed) == 0 || bytes.Equal(trimmed, []byte("[DONE]")) {
+		return chunk, nil
+	}
+	return nil, append([]byte(nil), chunk...)
 }

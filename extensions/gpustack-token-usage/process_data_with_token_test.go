@@ -7,13 +7,13 @@ import (
 
 func TestProcessDataWithToken(t *testing.T) {
 
-	// 构造一个简单的 JSON 响应体
-	origin := `data: {"id":"chatcmpl-2c66674e-719d-4be4-a0f1-d7cdbd76df30","object":"chat.completion.chunk","created":1762490796,"model":"qwen3-0.6b","choices":[],"usage":{"prompt_tokens":132,"total_tokens":311,"completion_tokens":179}}`
+	// Build a simple JSON response body (payload, without the "data: " prefix).
+	origin := `{"id":"chatcmpl-2c66674e-719d-4be4-a0f1-d7cdbd76df30","object":"chat.completion.chunk","created":1762490796,"model":"qwen3-0.6b","choices":[],"usage":{"prompt_tokens":132,"total_tokens":311,"completion_tokens":179}}`
 	ttft := int64(123)
 	tpot := float64(45.46)
 	tps := float64(6.67)
 
-	result := process_data_with_token([]byte(origin), map[string]any{
+	result := process_data_with_token([]byte(origin), "usage", map[string]any{
 		"time_to_first_token_ms":   ttft,
 		"time_per_output_token_ms": tpot,
 		"tokens_per_second":        tps,
