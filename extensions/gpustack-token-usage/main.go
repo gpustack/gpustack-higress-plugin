@@ -1013,6 +1013,21 @@ func isOutputDeltaChunk(data []byte) bool {
 				hit = true
 				return false
 			}
+			// Reasoning models (qwen3, DeepSeek-R1, ...) served over the
+			// OpenAI-compatible API stream their thinking phase as
+			// delta.reasoning_content (vLLM/SGLang/most backends) or
+			// delta.reasoning (OpenRouter-style). These are billable output
+			// tokens — without counting them, a mid-stream cancel during a
+			// long thinking phase reports output_chunk_count=0 and the
+			// downstream estimator produces 0 completion tokens.
+			if rc := delta.Get("reasoning_content"); rc.Exists() && rc.String() != "" {
+				hit = true
+				return false
+			}
+			if r := delta.Get("reasoning"); r.Exists() && r.String() != "" {
+				hit = true
+				return false
+			}
 			if tc := delta.Get("tool_calls"); tc.IsArray() && len(tc.Array()) > 0 {
 				hit = true
 				return false

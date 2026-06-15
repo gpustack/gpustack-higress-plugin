@@ -266,6 +266,21 @@ func TestIsOutputDeltaChunk(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "openai delta with reasoning_content (qwen3/DeepSeek-R1 thinking)",
+			body: `{"choices":[{"delta":{"content":"","reasoning_content":"let me think"}}]}`,
+			want: true,
+		},
+		{
+			name: "openai delta with empty reasoning_content",
+			body: `{"choices":[{"delta":{"reasoning_content":""}}]}`,
+			want: false,
+		},
+		{
+			name: "openai delta with reasoning (OpenRouter-style)",
+			body: `{"choices":[{"delta":{"reasoning":"thinking..."}}]}`,
+			want: true,
+		},
+		{
 			name: "openai usage-only chunk has empty choices",
 			body: `{"choices":[],"usage":{"total_tokens":150}}`,
 			want: false,
