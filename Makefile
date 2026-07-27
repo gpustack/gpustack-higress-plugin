@@ -11,6 +11,19 @@ DOCKER_TAG := $(shell grep "^version" pyproject.toml | head -1 | sed 's/version 
 DIST_DIR := dist
 BUILD_DIR := build
 
+# Interpreter used to create $(VENV). It must NOT resolve into $(VENV) itself:
+# with the venv activated, $(VENV)/bin is first on PATH, so a plain `python3 -m
+# venv` builds a nested venv whose pyvenv.cfg `home` points at its own bin/.
+# Such a venv breaks unrecoverably once the repo directory is renamed — every
+# script shebang and .git/hooks/pre-commit hardcode the old absolute path.
+#
+# Ask the interpreter for its own sys.base_prefix instead of trying to filter
+# $(VENV)/bin out of PATH: inside a venv base_prefix already points at the real
+# installation, and it stays correct when the repo is reached through a symlink
+# (where $(CURDIR) is the physical path but PATH holds the logical one, so any
+# string comparison against PATH silently fails to match).
+BASE_PYTHON := $(shell python3 -c 'import sys, os; print(os.path.join(sys.base_prefix, "bin", "python3"))' 2>/dev/null)
+
 # Color output
 COLOR_RESET := \033[0m
 COLOR_BOLD := \033[1m
@@ -37,8 +50,14 @@ COLOR_BLUE := \033[34m
 
 # Create virtual environment
 venv:
+	@if [ ! -x "$(BASE_PYTHON)" ]; then \
+		echo "$(COLOR_YELLOW)Error: could not locate a base python3 (got '$(BASE_PYTHON)')$(COLOR_RESET)"; \
+		echo "  Install python3 (>=3.10) system-wide or via pyenv, then retry."; \
+		exit 1; \
+	fi
 	@echo "$(COLOR_BLUE)Creating virtual environment at $(VENV)...$(COLOR_RESET)"
-	@python3 -m venv $(VENV)
+	@echo "  Using $(BASE_PYTHON) ($$($(BASE_PYTHON) --version 2>&1))"
+	@env -u VIRTUAL_ENV -u VIRTUAL_ENV_PROMPT $(BASE_PYTHON) -m venv $(VENV)
 	@echo "$(COLOR_GREEN)✓ Virtual environment created$(COLOR_RESET)"
 	@echo "  Run 'source $(VENV)/bin/activate' to activate"
 
