@@ -24,10 +24,11 @@ default_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins
 
 remote_plugins:
   # Higress official plugins (using default registry + digest for version pinning)
-  - source: ai-proxy:2.0.0
-    name: ai-proxy
-    version: 2.0.0
-    digest: sha256:a3005bed7d70e8281d4bd26bf5520485a4d7b7994b5e67b9b7ab27b9b4b52212
+  #
+  # ai-proxy is no longer fetched from upstream — gpustack-ai-proxy (built
+  # locally, forked at higress commit c8b82797c51a) is a drop-in replacement
+  # that also merges multiple system messages during Claude->OpenAI conversion
+  # (gpustack/gpustack#5934).
 
   - source: ai-statistics:2.0.0
     name: ai-statistics

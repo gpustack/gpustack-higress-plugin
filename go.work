@@ -1,6 +1,7 @@
 go 1.24.4
 
 use (
+	./extensions/gpustack-ai-proxy
 	./extensions/gpustack-generic-proxy-router
 	./extensions/gpustack-model-mapper
 	./extensions/gpustack-rate-limit
