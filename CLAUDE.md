@@ -213,6 +213,17 @@ Request-phase `Eval` uses `check_and_add` (count=1) for `QueryLimits` and `check
 
 Callback body is deliberately minimal (single `response.Array()` read, no `response.Error()` / `response.String()` / `GetProperty` / `LogInfof` between callback entry and `SendHttpResponseWithDetail`) to match the known-good shape of `cluster-key-rate-limit`. Extra hostcalls in between may confuse Envoy's async-local-reply path on some Higress builds — keep this pattern when refactoring.
 
+### gpustack-ai-proxy
+
+**Vendored fork** of the Higress `ai-proxy` plugin, copied verbatim from higress commit [`c8b82797c51a`](https://github.com/alibaba/higress/tree/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy) and maintained here. Unlike the other plugins in this repo it is **not** an original implementation — treat upstream as the source of truth for everything except the one local patch below. `VERSION` is `2.0.0-patched` (upstream ships this code as OCI `ai-proxy:2.0.0`; the `-patched` suffix marks the divergence). It is the largest plugin by far (~10 MiB wasm) and the only one with sub-packages (`config/`, `provider/`, `util/`, `test/`).
+
+- **The only functional divergence from upstream is `mergeSystemMessages` in [claude_to_openai.go](extensions/gpustack-ai-proxy/provider/claude_to_openai.go)** (gpustack/gpustack#5934). Claude clients (notably Claude Code) send a system-role message *inside* the `messages` array **in addition to** Claude's top-level `system` field. Upstream's converter prepends the top-level `system` and leaves the embedded one where it was, producing two system messages with one of them not at index 0 — strict OpenAI-compatible backends (vLLM) then reject the request with `System message must be at the beginning.`. The patch collapses every system-role message into a single leading one: 0 → unchanged, 1 → preserved verbatim but moved to front, ≥2 → contents concatenated into one block array. `systemContentBlocks` normalises `string` vs `[]chatMessageContent` content so block-form system messages keep their `cache_control`.
+- **Every `.go` file carries a 4-line attribution header** naming its exact upstream URL at the fork commit. Keep it when editing — it is the only way to tell "we changed this" from "upstream looks like this" when re-syncing.
+- **Four upstream files were deliberately deleted** because this repo builds with `extensions/Makefile` (plain `go build` → wasm) + `scripts/generate_metadata.py`, never `hgctl`: `option.yaml` (hgctl project config), `Makefile` (upstream's tinygo single-plugin build), `envoy.yaml` (hgctl local-test Envoy config), and `.gitignore` (hgctl's allowlist-style rules, which swallow `VERSION` and fight the root `.gitignore`). `README_dev.md` is upstream's hgctl dev doc, kept only for reference with a fork note prepended — it still describes the deleted `envoy.yaml`.
+- `pluginName` is `"gpustack-ai-proxy"`, **not** upstream's `"ai-proxy"`. It flows into log prefixes and `response_code_details=via_wasm::...<pluginName>.<detail>`, so keeping upstream's value would make our fork indistinguishable from a real upstream `ai-proxy` filter in access logs.
+- **Upstream `ai-proxy` is no longer fetched in `remote_plugins.yaml`** — same treatment as model-router/model-mapper. This fork is a drop-in replacement (config schema untouched), and shipping both would double ~10 MiB of wasm in the wheel for no benefit.
+- `test/` holds upstream's hgctl e2e helper package. Nothing in the build or in `go test ./...` depends on it; it is retained purely to keep the diff against upstream small.
+
 ## Remote Plugins
 
 Configured in `extensions/remote_plugins.yaml`. Require `oras` (`brew install oras`).
@@ -220,8 +231,8 @@ Configured in `extensions/remote_plugins.yaml`. Require `oras` (`brew install or
 ```yaml
 default_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins
 remote_plugins:
-  - source: ai-proxy:2.0.0    # uses default_registry
-    name: ai-proxy
+  - source: ai-statistics:2.0.0    # uses default_registry
+    name: ai-statistics
     version: 2.0.0
     digest: sha256:...         # optional, for pinning
   - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0  # full OCI URL
