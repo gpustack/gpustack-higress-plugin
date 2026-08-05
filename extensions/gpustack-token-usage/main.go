@@ -1129,8 +1129,14 @@ func parseConsumerHeader(consumer string) (userID *int64, accessKey *string) {
 // Formats: "ai-route-route-<id>.internal" or "ai-route-route-<id>.fallback.internal".
 // The dot-suffix is optional (mirrors parseClusterName's provider branch) so a
 // bare "ai-route-route-<id>" is also accepted.
+//
+// Higress may namespace-qualify the route name ("gpustack-system/ai-route-route-2.internal"),
+// so anything up to and including the last "/" is stripped first.
 func parseRouteName(routeName string) *int64 {
 	const prefix = "ai-route-route-"
+	if idx := strings.LastIndex(routeName, "/"); idx != -1 {
+		routeName = routeName[idx+1:]
+	}
 	if !strings.HasPrefix(routeName, prefix) {
 		return nil
 	}
