@@ -3,6 +3,17 @@
 /extensions/*/main.wasm
 /extensions/*/plugin.wasm
 
+# A bare `go build` in a plugin directory (rather than the wasm cross-build the
+# Makefile runs) drops a host executable named after that directory. It has no
+# extension, so the rules above cannot catch it; each plugin needs its own line.
+/extensions/gpustack-ai-proxy/gpustack-ai-proxy
+/extensions/gpustack-ext-auth/gpustack-ext-auth
+/extensions/gpustack-generic-proxy-router/gpustack-generic-proxy-router
+/extensions/gpustack-model-mapper/gpustack-model-mapper
+/extensions/gpustack-rate-limit/gpustack-rate-limit
+/extensions/gpustack-set-header-pre-route/gpustack-set-header-pre-route
+/extensions/gpustack-token-usage/gpustack-token-usage
+
 # Python package built plugins (generated at build time)
 /gpustack_higress_plugins/plugins/
 /gpustack_higress_plugins/manifest.json
