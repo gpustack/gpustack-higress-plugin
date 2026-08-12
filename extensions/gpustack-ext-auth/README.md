@@ -44,7 +44,7 @@ spec:
       keys:
         "3192253c1f4a9b7e":
           exp: 1790000000 # Unix seconds; null or absent means never
-          digest: "sha256$<salt>$<hash>"
+          digest: "s128$<salt>$<hash>"
           user_id: 7
       refs:
         "58": { exp: null } # keyed by api_keys.id
@@ -184,6 +184,53 @@ Beyond `deleted_at IS NULL`, `keys` and `refs` must exclude:
 - **Inactive owners.** The server rejects a deactivated user's key.
 
 Custom keys never carry a digest, so they land in `refs`, never `keys`.
+
+### Digest constructions
+
+Two are accepted, distinguished by the value's own prefix.
+
+| Prefix | Layout | Length |
+| --- | --- | --- |
+| `sha256` | `sha256$<32 hex salt>$<64 hex hash>` — as the server stores it | 104 |
+| `s128` | `s128$<same salt>$<b64url hash>`, hash truncated to its leading 16 bytes | 60 |
+
+The second is **derived from** the first, not a separate hash: same salt, same
+hashed input, same digest, with the trailing 16 bytes dropped and the remainder
+re-encoded. So the server keeps the long form in its database and shortens it on
+the way into this config, which means existing keys shrink on the next reconcile
+— no migration, and none is possible anyway, since the plaintext needed to
+rewrite a stored digest stops reaching the server once its key is authenticated
+here.
+
+The hashed input is the same for both: the salt's **text** followed by the
+secret, no separator. The salt contributes its text, not the bytes that text
+encodes — decoding it first is the obvious-looking mistake and yields a digest
+that never matches.
+
+Truncating to 128 bits is not a weakening. The secret being verified is 128 bits
+of CSPRNG output, so a second preimage costs 2^128 — exactly what guessing the
+secret outright costs. The length is pinned to that and is deliberately not
+configurable: it is a constant to reason about, not a knob that can be set to 64
+and keep working, silently, at 2^64.
+
+Length matters because this table ships inside a WasmPlugin CR, and etcd caps an
+object at ~1.5 MiB: 60 characters instead of 104 is the difference between
+roughly 6000 and 8600 keys authenticating at the gateway rather than at the
+server.
+
+A prefix rather than a config field is also what keeps a rollback safe. An older
+gateway reading a value it cannot name falls through to the server; one that
+recognised `sha256` and then compared a truncated hash against a full one would
+reject outright — a 401 rather than a slower path.
+
+The base64url encoding is **unpadded** (22 characters, no trailing `=`), and the
+hash's length is checked against the prefix before anything is compared. A value
+whose hash is the wrong length for the construction it names — padded, full-length
+under `s128`, truncated under `sha256` — is treated as *unusable* rather than as a
+mismatch, so the request falls through to the server exactly as an unknown prefix
+would. That distinction is the whole point: a wrong length means the writer and
+this build disagree about the construction, and spending a permanent 401 on that
+would take out every key written that way at once.
 
 A public route's `matchRules` entry must list **both** ingress names, primary and
 `.fallback`; `route_ingress_names_for_plugins` returns both. The route gate must

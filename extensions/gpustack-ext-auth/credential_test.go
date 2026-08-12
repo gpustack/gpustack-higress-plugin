@@ -21,6 +21,103 @@ const (
 	vectorDigest = "sha256$4f3c2a1b9e8d7c6b5a4938271605f4e3$7ca1547a67b46a04ee5dc4ff669ae460680a8f82e1714a679c086cc401b5748f"
 )
 
+// The truncated form of that same value, which is what the server puts in the
+// config:
+//
+//	base64url(bytes.fromhex(hash)[:16])
+//
+// Same salt, same hashed input, same hash -- only the last 16 bytes of the
+// expected value are dropped and the remainder re-encoded. Nothing is
+// recomputed, which is why an existing key can be shortened without its
+// plaintext.
+const truncatedVectorDigest = "s128$4f3c2a1b9e8d7c6b5a4938271605f4e3$fKFUeme0agTuXcT_ZprkYA"
+
+func TestVerifyTruncatedSecretKeyDigestMatchesServerVector(t *testing.T) {
+	match, usable := verifySecretKeyDigest(truncatedVectorDigest, vectorSecret)
+	if !usable {
+		t.Fatalf("truncated digest reported unusable; the value format diverged from the server")
+	}
+	if !match {
+		t.Fatalf("truncated digest did not verify against the secret it was built from")
+	}
+}
+
+// Both constructions have to keep working at once: a row carries whichever the
+// server wrote when the key was created, and existing rows are never rewritten
+// -- the plaintext needed to do so only passes through the server on the paths
+// this plugin has taken over.
+func TestBothDigestConstructionsCoexist(t *testing.T) {
+	for name, digest := range map[string]string{
+		"hex":       vectorDigest,
+		"truncated": truncatedVectorDigest,
+	} {
+		if match, usable := verifySecretKeyDigest(digest, vectorSecret); !match || !usable {
+			t.Errorf("%s: match=%v usable=%v, want both true", name, match, usable)
+		}
+		if match, _ := verifySecretKeyDigest(digest, "0000000000000000c11c75ed6334ea95"); match {
+			t.Errorf("%s: a wrong secret verified", name)
+		}
+	}
+}
+
+// A hash written at the wrong length for the algorithm it is filed under means
+// the server and this build disagree about the construction. That must never
+// verify -- truncation is the whole point of the compact form, so a prefix
+// comparison would silently accept a shorter hash than the name promises.
+//
+// It must also come back *unusable* rather than merely unequal. Every case here
+// is a value the construction could not have produced, which makes it bad column
+// data: the server is the one that can still authenticate the key, so the
+// request goes there. Reporting a mismatch instead would spend a permanent 401
+// on what may well be a valid key -- and on the padded-base64 line, on every key
+// at once.
+func TestWrongLengthDigestIsUnusableNotAMismatch(t *testing.T) {
+	padded := "s128$" + vectorSalt + "$fKFUeme0agTuXcT_ZprkYA=="
+	fullHashUnderCompactName := "s128$" + vectorSalt + "$7ca1547a67b46a04ee5dc4ff669ae460680a8f82e1714a679c086cc401b5748f"
+	truncatedHashUnderHexName := "sha256$" + vectorSalt + "$fKFUeme0agTuXcT_ZprkYA"
+
+	for name, digest := range map[string]string{
+		"padded base64":                 padded,
+		"full hash under compact name":  fullHashUnderCompactName,
+		"truncated hash under hex name": truncatedHashUnderHexName,
+		"over-long":                     truncatedVectorDigest + "extra",
+		"empty hash":                    "s128$" + vectorSalt + "$",
+	} {
+		match, usable := verifySecretKeyDigest(digest, vectorSecret)
+		if match {
+			t.Errorf("%s: verified against the secret it was not built for", name)
+		}
+		if usable {
+			t.Errorf("%s: reported usable, so a valid key would be rejected instead of sent to the server", name)
+		}
+	}
+}
+
+// Verification runs once per authenticated request, inside a wasm VM where the
+// garbage it makes is more expensive than the same garbage on the host. Both
+// functions are written to keep the salt, the hash and its encoding on the
+// stack, which is not something a reader would infer from the code -- the
+// hand-rolled `$` scan in particular reads like a strings.Split that someone
+// forgot to simplify. This is what says otherwise, and what fails if anyone
+// does simplify it.
+//
+// A digest that carries an over-long secret is deliberately not covered: that
+// path falls back to the heap on purpose, since the secret comes from the
+// client and is not bounded.
+func TestDigestVerificationDoesNotAllocate(t *testing.T) {
+	for name, digest := range map[string]string{
+		"hex":       vectorDigest,
+		"truncated": truncatedVectorDigest,
+	} {
+		allocs := testing.AllocsPerRun(100, func() {
+			verifySecretKeyDigest(digest, vectorSecret)
+		})
+		if allocs != 0 {
+			t.Errorf("%s: %v allocations per verification, want 0", name, allocs)
+		}
+	}
+}
+
 func TestVerifySecretKeyDigestMatchesServerVector(t *testing.T) {
 	match, usable := verifySecretKeyDigest(vectorDigest, vectorSecret)
 	if !usable {
