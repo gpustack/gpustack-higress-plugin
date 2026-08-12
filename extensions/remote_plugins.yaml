@@ -35,10 +35,9 @@ remote_plugins:
     version: 2.0.0
     digest: sha256:237a93b4fcaddedc80fc714af4f234ea95ab19ddc13101f6b5f34e7edec5527f
 
-  - source: ext-auth:2.0.0
-    name: ext-auth
-    version: 2.0.0
-    digest: sha256:b02da08e0dd519ee0180696f062bb15a04b37de0a88a2c1b46836c07d1e9adab
+  # ext-auth is no longer fetched from upstream — gpustack-ext-auth (built
+  # locally) replaces it on inference routes, authenticating API keys at the
+  # gateway and calling /token-auth for authorization only.
 
   # model-router and model-mapper are no longer fetched from upstream —
   # gpustack-generic-proxy-router and gpustack-model-mapper (built locally)
