@@ -323,3 +323,59 @@ func TestAuthoritativeHeadersCollapseDuplicates(t *testing.T) {
 		t.Errorf("gateway token = %v, want only the configured value", values)
 	}
 }
+
+// The server's authenticate_request is an if/elif chain -- basic, then cookie,
+// then bearer / x-api-key -- so a cookie or basic credential means the bearer
+// is never reached there. Deciding from it here would answer a different
+// question than the one being stood in for, in three ways that are all silent.
+func TestAServerFirstCredentialSuspendsLocalAuthentication(t *testing.T) {
+	config := PluginConfig{
+		LocalAuth: LocalAuth{
+			Enabled: true,
+			Keys: map[string]keyEntry{
+				"3192253c1f4a9b7e": {Digest: vectorDigest, UserID: 7},
+			},
+		},
+	}
+	good := "gpustack_3192253c1f4a9b7e_" + vectorSecret
+	bad := "gpustack_3192253c1f4a9b7e_ffffffffffffffffffffffffffffffff"
+
+	for name, tc := range map[string]struct {
+		credential string
+		extra      [2]string
+		want       identityState
+	}{
+		// Without a second carrier the table did hold everything needed, and
+		// both verdicts stand.
+		"bearer alone, good secret": {good, [2]string{}, identityResolved},
+		"bearer alone, bad secret":  {bad, [2]string{}, identityRejected},
+		// A valid session beside a mistyped key authenticates on the server;
+		// rejecting here would 401 a request the platform would have served.
+		"cookie, bad secret": {bad, [2]string{"cookie", "gpustack_session=x"}, identityUnresolved},
+		// And beside a valid key the server authenticates *as the session*, so
+		// the consumer names the user and the key's scope does not apply.
+		// Asserting the key here would diverge on both.
+		"cookie, good secret": {good, [2]string{"cookie", "gpustack_session=x"}, identityUnresolved},
+		"basic, good secret":  {good, [2]string{"authorization", "Basic dXNlcjpwdw=="}, identityUnresolved},
+		// The scheme is case-insensitive, and it is now matched over a slice of
+		// the header rather than a lower-cased copy of the whole of it.
+		"basic in lower case": {good, [2]string{"authorization", "basic dXNlcjpwdw=="}, identityUnresolved},
+	} {
+		t.Run(name, func(t *testing.T) {
+			headers := [][2]string{{"authorization", "Bearer " + tc.credential}}
+			if tc.extra[0] != "" {
+				// A basic credential occupies Authorization itself, so it
+				// replaces the bearer rather than joining it.
+				if tc.extra[0] == "authorization" {
+					headers = [][2]string{tc.extra}
+				} else {
+					headers = append(headers, tc.extra)
+				}
+			}
+
+			if got := resolveIdentityTiers(config, headers, time.Unix(1700000000, 0)).State; got != tc.want {
+				t.Errorf("state = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

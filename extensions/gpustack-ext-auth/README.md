@@ -147,6 +147,32 @@ step of its own — removing the entry is the whole of it.
 
 Anything still unnamed goes to the server with its credential, as before.
 
+### A cookie or basic credential suspends tiers 1 and 2
+
+The server's `authenticate_request` is an if/elif chain — basic, then cookie,
+then bearer / x-api-key — so whenever one of the first two is present the bearer
+is **never reached** there. Naming the caller from that bearer here would answer
+a different question than the one this plugin stands in for, so tiers 1 and 2 do
+not run and the request goes to the server with its credentials.
+
+Three ways it would otherwise diverge, all silent:
+
+| Request | Server | Without this rule |
+| --- | --- | --- |
+| Valid cookie + mistyped bearer | Allowed, as the session | **401** |
+| Valid cookie + valid bearer | Allowed as the session: consumer names the *user*, and the key's `scope` / `allowed_model_names` do not apply | Allowed as the *key*, with both |
+| Expired cookie + valid bearer | **401** — the cookie branch is taken and returns nobody rather than falling through | Allowed |
+
+Tier 0 is exempt. A marker records a decision the server already made, or a
+public-route skip, and the fallback pass that reads it is an internal redirect
+of the very same request. Tier 3 is unreachable here anyway, since it requires
+that no credential at all be present.
+
+The cost is confined to requests carrying both a session and an API key, which
+is not a shape any first-party client produces: the console authenticates with
+its cookie alone, and a copied code sample runs outside the browser with only
+its key.
+
 The verification cache is keyed by `sha256(credential)` and holds the
 `api_keys.id` and consumer the server returned. It is written once per
 credential rather than per request, read only on the paths that reach tier 2,
@@ -156,6 +182,13 @@ server until its config push lands, instead of hitting and failing a re-check.
 
 Because a tier-2 hit is a *resolved* identity, a custom key survives a server
 outage under `failure_mode_allow_authenticated` exactly as a tier-1 one does.
+
+The cache is append-only. Shared data has no TTL, no delete and no way to
+enumerate keys, so an entry for a revoked key is not reclaimed — it simply stops
+passing the `refs` re-check. The bound is the number of distinct custom-key
+credentials one Envoy process has seen, which is why nothing here needs to be
+evicted; if that ever stops holding, an expiry stamp inside the value is the
+mechanism to add, since the platform offers none.
 
 ### Headers the plugin handles itself
 
