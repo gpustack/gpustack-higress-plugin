@@ -29,7 +29,27 @@ import (
 //
 // `vm_id` is never set anywhere in the higress -> istio -> envoy chain, so
 // shared data is one namespace per Envoy process, shared with every other wasm
-// plugin running in it.
+// plugin running in it. There is no configuration escape: `buildVMConfig` in
+// istiod sets only Runtime, Code and EnvironmentVariables, and the WasmPlugin
+// API exposes no `vm_id` at all.
+//
+// Entries are therefore unauthenticated, and deliberately so. Authenticating
+// them -- a MAC over the value, or deriving the key with `auth_cache.signing_key`
+// so it cannot be computed -- would defend against a co-resident plugin writing
+// an entry that names someone else. But every way of becoming that co-resident
+// plugin already carries something stronger:
+//
+//   - installing a WasmPlugin needs write access to the gateway namespace,
+//     which comes with read access to this plugin's own CR, and
+//     `auth_cache.signing_key` is in it -- markers can then be forged outright;
+//   - substituting or compromising a module that is already installed gives
+//     code execution inside the sandbox, and any filter on the chain can read
+//     every request's headers, i.e. harvest API keys in plaintext.
+//
+// A MAC would be hardening against an attacker who has already won by a
+// shorter route, so the cost of the check buys nothing. What it would still
+// catch is narrow: a legitimately installed plugin with a bug that lets an
+// attacker steer both the key and the value it writes.
 const verificationKeyPrefix = "gpustack-ext-auth:v:"
 
 // verificationCacheKey indexes an entry by the credential's digest.
