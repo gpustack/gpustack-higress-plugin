@@ -178,9 +178,9 @@ func TestAnonymousRequestOnPublicRouteIsAllowedLocally(t *testing.T) {
 }
 
 // Any credential at all reintroduces the ambiguity this shortcut relies on not
-// existing: /token-auth tries bearer, then x-api-key, then cookie, so a bad
-// bearer alongside a valid cookie still authenticates and the consumer would be
-// a real identity rather than "none".
+// existing: /token-auth tries basic, then cookie, then bearer / x-api-key, so a
+// bad bearer alongside a valid cookie still authenticates and the consumer would
+// be a real identity rather than "none".
 func TestAnyCredentialDisqualifiesTheAnonymousShortcut(t *testing.T) {
 	for _, header := range []string{"authorization", "x-api-key", "cookie"} {
 		t.Run(header, func(t *testing.T) {

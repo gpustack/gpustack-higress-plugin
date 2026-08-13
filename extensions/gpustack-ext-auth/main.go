@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -396,6 +397,19 @@ func resolveIdentityTiers(config PluginConfig, requestHeaders [][2]string, now t
 	if id, ok := resolveFromMarker(config, requestHeaders, now); ok {
 		return id
 	}
+	// Tiers 1 and 2 read the API key, and the server would not have. Its
+	// authenticate_request is an if/elif chain -- basic, then cookie, then
+	// bearer / x-api-key -- so whenever one of the first two is present the
+	// bearer is never reached, and answering from it here would answer a
+	// different question than the one being stood in for.
+	//
+	// Tier 0 above is exempt: a marker records a decision the server already
+	// made, or a public-route skip, and the fallback pass that reads it is an
+	// internal redirect of the very same request. Tier 3 is unreachable anyway,
+	// since it requires that no credential at all be present.
+	if hasServerFirstCredential(requestHeaders) {
+		return identity{State: identityUnresolved}
+	}
 	if id, decided := resolveFromKeys(config, requestHeaders, now); decided {
 		return id
 	}
@@ -410,6 +424,36 @@ func resolveIdentityTiers(config PluginConfig, requestHeaders [][2]string, now t
 		return id
 	}
 	return identity{State: identityUnresolved}
+}
+
+// hasServerFirstCredential reports whether the request carries a credential the
+// server would consult before the API key, making anything this plugin decides
+// from that key a different answer than the server's.
+//
+// Three ways it diverges, all from the same cause, and all silent:
+//
+//   - a valid session cookie beside a mistyped bearer authenticates on the
+//     server and would be rejected here;
+//   - a valid session cookie beside a valid bearer authenticates *as the
+//     session* there, so the consumer names the user rather than the key and
+//     the key's scope and allowed_model_names do not apply -- while here the
+//     key would be asserted, with both;
+//   - an expired session cookie beside a valid bearer is a 401 on the server,
+//     because the cookie branch is taken and returns nobody rather than falling
+//     through, and would be allowed here.
+//
+// Only cookie and basic qualify. x-api-key sits in the same branch as the
+// bearer, so tier 1 has already had its say about it.
+func hasServerFirstCredential(requestHeaders [][2]string) bool {
+	if extractHeader(requestHeaders, headerCookie) != "" {
+		return true
+	}
+	authorization := extractHeader(requestHeaders, headerAuthorization)
+	// Folded over the sliced prefix rather than the whole header: a bearer JWT
+	// runs to kilobytes, and lower-casing one on every request would allocate a
+	// copy of it to read six bytes.
+	const basic = "basic "
+	return len(authorization) >= len(basic) && strings.EqualFold(authorization[:len(basic)], basic)
 }
 
 // resolveFromKeys is tier 1: parse the credential, look the access key up, and
@@ -446,11 +490,11 @@ func resolveFromKeys(config PluginConfig, requestHeaders [][2]string, now time.T
 //
 // This is the one case where "the server would have allowed it" is knowable
 // without asking. The ambiguity that keeps other unresolved credentials going to
-// the server is that /token-auth tries bearer, then x-api-key, then cookie -- a
-// bad bearer alongside a valid session cookie still authenticates, and the
-// consumer would be a real identity rather than `none`. With none of the three
-// present there is nothing left for the server to succeed with, so its answer is
-// fixed: allow, consumer `none`.
+// the server is that /token-auth tries basic, then cookie, then bearer /
+// x-api-key -- a bad bearer alongside a valid session cookie still
+// authenticates, and the consumer would be a real identity rather than `none`.
+// With none of them present there is nothing left for the server to succeed
+// with, so its answer is fixed: allow, consumer `none`.
 //
 // It matters because anonymous access is the defining use of a public model, and
 // without this it would be the one kind of public traffic that still needs a
