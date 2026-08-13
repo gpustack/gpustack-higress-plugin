@@ -18,14 +18,21 @@ import (
 // str key as UTF-8, so decoding the hex here would silently reject everything.
 const (
 	vectorMarkerKey   = "c39da1d83cc7b6640483842edfc77bfc0d6c6f84e9cda9fda44a3fd3b6b6d533"
-	vectorMarkerToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiYWs6MzE5MjI1M2MxZjRhOWI3ZSIsImNvbnN1bWVyIjoiMzE5MjI1M2MxZjRhOWI3ZS5ncHVzdGFjay03IiwibW9kZWwiOiJteS1vcmcvcXdlbjMtOGIifSwiZXhwIjoxODkzNDU2MDAwfQ._GpMHfjcHSEMuZ3ucvBaZe35oN9ZsYPYm4vj938VYkg"
+	vectorMarkerToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXRhIjp7ImlkIjoiYWs6MzE5MjI1M2MxZjRhOWI3ZSIsImNvbnN1bWVyIjoiMzE5MjI1M2MxZjRhOWI3ZS5ncHVzdGFjay03IiwibW9kZWwiOiJteS1vcmcvcXdlbjMtOGIiLCJyb3V0ZSI6Im5zL2FpLXJvdXRlLXJvdXRlLTQyLmludGVybmFsIn0sImV4cCI6MTg5MzQ1NjAwMH0.BWBnPtKF2NbQuG8Cf9wZy6o_ZCw_9wcAvkygBgdyzMk"
 	vectorMarkerExp   = 1893456000
+	// The route the vector was minted on, and the one the redirect pass runs
+	// under. A marker is only honoured when those differ -- see
+	// resolveFromMarker -- so tests that expect one to verify must say they are
+	// on the fallback pass.
+	vectorMarkerRoute   = "ns/ai-route-route-42.internal"
+	vectorFallbackRoute = "ns/ai-route-route-42.fallback.internal"
 )
 
 var vectorMarkerClaims = markerClaims{
 	ID:       "ak:3192253c1f4a9b7e",
 	Consumer: "3192253c1f4a9b7e.gpustack-7",
 	Model:    "my-org/qwen3-8b",
+	Route:    vectorMarkerRoute,
 }
 
 func markerNow() time.Time { return time.Unix(vectorMarkerExp-60, 0) }
@@ -54,7 +61,7 @@ func TestSignMarkerMatchesPyJWTByteForByte(t *testing.T) {
 
 func TestSignMarkerRoundTrip(t *testing.T) {
 	now := time.Unix(1_790_000_000, 0)
-	claims := markerClaims{ID: "ref:58", Consumer: "none", Model: "my-org/qwen3-8b"}
+	claims := markerClaims{ID: "ref:58", Consumer: "none", Model: "my-org/qwen3-8b", Route: vectorMarkerRoute}
 
 	token, err := signMarker([]byte(vectorMarkerKey), claims, now.Add(markerTTL))
 	if err != nil {
@@ -189,7 +196,7 @@ func TestResolveFromMarker(t *testing.T) {
 	}
 
 	t.Run("resolves on the fallback pass", func(t *testing.T) {
-		id := resolveIdentity(markerTestConfig(), headers(vectorMarkerToken, "my-org/qwen3-8b"), markerNow())
+		id := resolveIdentity(markerTestConfig(), headers(vectorMarkerToken, "my-org/qwen3-8b"), vectorFallbackRoute, markerNow())
 		if id.State != identityResolved {
 			t.Fatalf("state = %v, want resolved", id.State)
 		}
@@ -199,7 +206,7 @@ func TestResolveFromMarker(t *testing.T) {
 	})
 
 	t.Run("model binding is enforced", func(t *testing.T) {
-		id := resolveIdentity(markerTestConfig(), headers(vectorMarkerToken, "my-org/other-model"), markerNow())
+		id := resolveIdentity(markerTestConfig(), headers(vectorMarkerToken, "my-org/other-model"), vectorFallbackRoute, markerNow())
 		if id.State != identityUnresolved {
 			t.Error("a marker was honoured for a model it was not issued for")
 		}
@@ -208,7 +215,7 @@ func TestResolveFromMarker(t *testing.T) {
 	t.Run("no signing key means markers are untouched", func(t *testing.T) {
 		config := markerTestConfig()
 		config.AuthCache.SigningKey = nil
-		id := resolveIdentity(config, headers(vectorMarkerToken, "my-org/qwen3-8b"), markerNow())
+		id := resolveIdentity(config, headers(vectorMarkerToken, "my-org/qwen3-8b"), vectorFallbackRoute, markerNow())
 		if id.State != identityUnresolved {
 			t.Error("a marker was trusted without a key configured")
 		}
@@ -217,7 +224,7 @@ func TestResolveFromMarker(t *testing.T) {
 	t.Run("kill switch disables tier 0 as well", func(t *testing.T) {
 		config := markerTestConfig()
 		config.LocalAuth.Enabled = false
-		id := resolveIdentity(config, headers(vectorMarkerToken, "my-org/qwen3-8b"), markerNow())
+		id := resolveIdentity(config, headers(vectorMarkerToken, "my-org/qwen3-8b"), vectorFallbackRoute, markerNow())
 		if id.State != identityUnresolved {
 			t.Error("local_auth off must stop the plugin touching markers at all")
 		}
@@ -225,12 +232,13 @@ func TestResolveFromMarker(t *testing.T) {
 
 	t.Run("a server-minted marker carries no id", func(t *testing.T) {
 		serverStyle, err := signMarker([]byte(vectorMarkerKey),
-			markerClaims{Consumer: "3192253c1f4a9b7e.gpustack-7", Model: "my-org/qwen3-8b"},
+			markerClaims{Consumer: "3192253c1f4a9b7e.gpustack-7", Model: "my-org/qwen3-8b",
+				Route: vectorMarkerRoute},
 			time.Unix(vectorMarkerExp, 0))
 		if err != nil {
 			t.Fatalf("signMarker: %v", err)
 		}
-		id := resolveIdentity(markerTestConfig(), headers(serverStyle, "my-org/qwen3-8b"), markerNow())
+		id := resolveIdentity(markerTestConfig(), headers(serverStyle, "my-org/qwen3-8b"), vectorFallbackRoute, markerNow())
 		if id.State != identityUnresolved {
 			t.Error("a consumer with no identity must fall through to be forwarded, not be asserted")
 		}
@@ -241,7 +249,7 @@ func TestMarkerClaimsFor(t *testing.T) {
 	resolved := identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e"}
 
 	t.Run("mints for a resolved identity", func(t *testing.T) {
-		claims, ok := markerClaimsFor(markerTestConfig(), resolved, "my-org/qwen3-8b", "3192253c1f4a9b7e.gpustack-7")
+		claims, ok := markerClaimsFor(markerTestConfig(), resolved, "my-org/qwen3-8b", "3192253c1f4a9b7e.gpustack-7", vectorMarkerRoute)
 		if !ok || claims != vectorMarkerClaims {
 			t.Errorf("ok=%v claims=%+v, want %+v", ok, claims, vectorMarkerClaims)
 		}
@@ -249,7 +257,7 @@ func TestMarkerClaimsFor(t *testing.T) {
 
 	t.Run("mints for a ref identity", func(t *testing.T) {
 		claims, ok := markerClaimsFor(markerTestConfig(),
-			identity{State: identityResolved, Ref: "58"}, "m", "c")
+			identity{State: identityResolved, Ref: "58"}, "m", "c", vectorMarkerRoute)
 		if !ok || claims.ID != "ref:58" {
 			t.Errorf("ok=%v claims=%+v", ok, claims)
 		}
@@ -278,7 +286,7 @@ func TestMarkerClaimsFor(t *testing.T) {
 			},
 		}
 		for _, tc := range cases {
-			if _, ok := markerClaimsFor(tc.config, tc.id, tc.model, tc.consumer); ok {
+			if _, ok := markerClaimsFor(tc.config, tc.id, tc.model, tc.consumer, vectorMarkerRoute); ok {
 				t.Errorf("%s: minted a marker that should have been declined", tc.name)
 			}
 		}
@@ -316,12 +324,12 @@ func TestMarkerStopsResolvingOnceRevoked(t *testing.T) {
 		{"x-gpustack-auth-cache", vectorMarkerToken},
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
 	}
-	if id := resolveIdentity(config, headers, markerNow()); id.State != identityResolved {
+	if id := resolveIdentity(config, headers, vectorFallbackRoute, markerNow()); id.State != identityResolved {
 		t.Fatalf("precondition: a live key must resolve, got %v", id.State)
 	}
 
 	config.LocalAuth.Keys = map[string]keyEntry{}
-	if id := resolveIdentity(config, headers, markerNow()); id.State != identityUnresolved {
+	if id := resolveIdentity(config, headers, vectorFallbackRoute, markerNow()); id.State != identityUnresolved {
 		t.Error("a marker outlived its key: revocation must take effect on the next request")
 	}
 }
@@ -336,7 +344,7 @@ func TestMarkerStopsResolvingOnceExpired(t *testing.T) {
 	id := resolveIdentity(config, [][2]string{
 		{"x-gpustack-auth-cache", vectorMarkerToken},
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
-	}, markerNow())
+	}, vectorFallbackRoute, markerNow())
 	if id.State != identityUnresolved {
 		t.Error("an expired key must not be revived by a marker signed while it was live")
 	}
@@ -347,7 +355,8 @@ func TestMarkerStopsResolvingOnceExpired(t *testing.T) {
 func TestMarkerRefIdentityChecksRefsTable(t *testing.T) {
 	config := markerTestConfig()
 	token, err := signMarker([]byte(vectorMarkerKey),
-		markerClaims{ID: "ref:58", Consumer: "c.gpustack-9", Model: "my-org/qwen3-8b"},
+		markerClaims{ID: "ref:58", Consumer: "c.gpustack-9", Model: "my-org/qwen3-8b",
+			Route: vectorMarkerRoute},
 		time.Unix(vectorMarkerExp, 0))
 	if err != nil {
 		t.Fatalf("signMarker: %v", err)
@@ -357,12 +366,12 @@ func TestMarkerRefIdentityChecksRefsTable(t *testing.T) {
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
 	}
 
-	if id := resolveIdentity(config, headers, markerNow()); id.State != identityUnresolved {
+	if id := resolveIdentity(config, headers, vectorFallbackRoute, markerNow()); id.State != identityUnresolved {
 		t.Error("a ref absent from refs must not resolve")
 	}
 
 	config.LocalAuth.Refs = map[string]refEntry{"58": {}}
-	id := resolveIdentity(config, headers, markerNow())
+	id := resolveIdentity(config, headers, vectorFallbackRoute, markerNow())
 	if id.State != identityResolved || id.Ref != "58" {
 		t.Errorf("a ref listed in refs must resolve, got %+v", id)
 	}
@@ -397,7 +406,7 @@ func TestIdentityRecordsItsSource(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveIdentity(config, tc.headers, markerNow()).Source; got != tc.want {
+			if got := resolveIdentity(config, tc.headers, vectorFallbackRoute, markerNow()).Source; got != tc.want {
 				t.Errorf("source = %v, want %v", got, tc.want)
 			}
 		})
@@ -406,7 +415,7 @@ func TestIdentityRecordsItsSource(t *testing.T) {
 	// Anonymity only arises on a public route.
 	public := markerTestConfig()
 	public.AccessPolicy = accessPolicyPublic
-	if got := resolveIdentity(public, [][2]string{model}, markerNow()).Source; got != sourceAnonymous {
+	if got := resolveIdentity(public, [][2]string{model}, vectorFallbackRoute, markerNow()).Source; got != sourceAnonymous {
 		t.Errorf("source = %v, want %v", got, sourceAnonymous)
 	}
 }
@@ -428,7 +437,7 @@ func TestRejectedMarkerIsReported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("signMarker: %v", err)
 	}
-	id := resolveIdentity(config, headers(wrongKey), markerNow())
+	id := resolveIdentity(config, headers(wrongKey), vectorFallbackRoute, markerNow())
 	if !id.MarkerRejected {
 		t.Error("an unverifiable marker was not reported")
 	}
@@ -436,13 +445,83 @@ func TestRejectedMarkerIsReported(t *testing.T) {
 		t.Errorf("source = %v, want the tier-1 fallback", id.Source)
 	}
 
-	if resolveIdentity(config, headers(vectorMarkerToken), markerNow()).MarkerRejected {
+	if resolveIdentity(config, headers(vectorMarkerToken), vectorFallbackRoute, markerNow()).MarkerRejected {
 		t.Error("a valid marker was reported as rejected")
 	}
 	if resolveIdentity(config, [][2]string{
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
 		{"authorization", "Bearer gpustack_3192253c1f4a9b7e_" + vectorSecret},
-	}, markerNow()).MarkerRejected {
+	}, vectorFallbackRoute, markerNow()).MarkerRejected {
 		t.Error("an absent marker was reported as rejected")
+	}
+}
+
+// Nothing strips a client-supplied copy of the marker header, and the marker
+// travels on the *upstream* request -- so whoever receives those requests (a
+// worker, an APM, a third-party provider) gets a fresh bearer for the caller
+// with every one. What stops that from being a standing ability to act as them
+// is that a marker is only honoured on a pass other than the one that minted
+// it, which for a redirect means a different route name.
+func TestMarkerIsRefusedOnTheRouteThatMintedIt(t *testing.T) {
+	headers := [][2]string{
+		{"x-gpustack-auth-cache", vectorMarkerToken},
+		{"x-higress-llm-model", "my-org/qwen3-8b"},
+	}
+
+	replayed := resolveIdentity(markerTestConfig(), headers, vectorMarkerRoute, markerNow())
+	if replayed.State == identityResolved {
+		t.Error("a marker replayed on the route it names must not resolve an identity")
+	}
+	if !replayed.MarkerRejected {
+		t.Error("the rejection should be visible, so the request falls back to its credential")
+	}
+
+	onFallback := resolveIdentity(markerTestConfig(), headers, vectorFallbackRoute, markerNow())
+	if onFallback.State != identityResolved {
+		t.Error("the pass the marker exists for must still resolve")
+	}
+}
+
+// A marker minted before the route claim existed cannot be placed, so it is not
+// honoured. Rejecting rather than trusting is the safe direction: the request
+// falls back to its credential.
+func TestMarkerWithoutARouteIsRefused(t *testing.T) {
+	token, err := signMarker([]byte(vectorMarkerKey),
+		markerClaims{ID: "ak:3192253c1f4a9b7e", Consumer: "c.gpustack-7", Model: "m"},
+		time.Unix(vectorMarkerExp, 0))
+	if err != nil {
+		t.Fatalf("signMarker: %v", err)
+	}
+
+	id := resolveIdentity(markerTestConfig(), [][2]string{
+		{"x-gpustack-auth-cache", token},
+		{"x-higress-llm-model", "m"},
+	}, vectorFallbackRoute, markerNow())
+
+	if id.State == identityResolved {
+		t.Error("a marker with no route claim must not resolve an identity")
+	}
+}
+
+// Every allowing pass re-mints, the redirect pass included. Stamping that
+// pass's own route would produce a marker naming the fallback route -- which
+// differs from the main route and would then be accepted when replayed there,
+// reopening what TestMarkerIsRefusedOnTheRouteThatMintedIt closes.
+func TestReMintingKeepsTheRouteTheMarkerWasMintedOn(t *testing.T) {
+	fromMarker := identity{
+		State:     identityResolved,
+		Source:    sourceMarker,
+		AccessKey: "3192253c1f4a9b7e",
+		Route:     vectorMarkerRoute,
+	}
+
+	claims, ok := markerClaimsFor(markerTestConfig(), fromMarker,
+		"my-org/qwen3-8b", "3192253c1f4a9b7e.gpustack-7", vectorFallbackRoute)
+
+	if !ok {
+		t.Fatal("the redirect pass must still be able to mint")
+	}
+	if claims.Route != vectorMarkerRoute {
+		t.Errorf("route = %q, want the route of the first mint (%q)", claims.Route, vectorMarkerRoute)
 	}
 }

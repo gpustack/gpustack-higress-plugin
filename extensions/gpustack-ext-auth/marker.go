@@ -74,6 +74,9 @@ type markerClaims struct {
 	ID       string `json:"id"`
 	Consumer string `json:"consumer"`
 	Model    string `json:"model"`
+	// Route the marker was minted on, which is how a replay is told from the
+	// pass it exists for. See resolveFromMarker.
+	Route string `json:"route"`
 }
 
 type markerPayload struct {

@@ -250,7 +250,7 @@ func TestResolveIdentity(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveIdentity(tc.config(), tc.headers, now)
+			got := resolveIdentity(tc.config(), tc.headers, vectorFallbackRoute, now)
 			if got.State != tc.wantState {
 				t.Fatalf("state = %v, want %v. %s", got.State, tc.wantState, tc.why)
 			}
@@ -373,7 +373,7 @@ func TestAServerFirstCredentialSuspendsLocalAuthentication(t *testing.T) {
 				}
 			}
 
-			if got := resolveIdentityTiers(config, headers, time.Unix(1700000000, 0)).State; got != tc.want {
+			if got := resolveIdentityTiers(config, headers, vectorFallbackRoute, time.Unix(1700000000, 0)).State; got != tc.want {
 				t.Errorf("state = %v, want %v", got, tc.want)
 			}
 		})
