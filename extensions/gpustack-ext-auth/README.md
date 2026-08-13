@@ -147,6 +147,26 @@ step of its own — removing the entry is the whole of it.
 
 Anything still unnamed goes to the server with its credential, as before.
 
+### A marker is only honoured on a pass other than the one that minted it
+
+Nothing strips a client-supplied `x-gpustack-auth-cache`, and a marker travels
+on the **upstream** request — so whoever receives those requests, whether a
+worker, an APM or a third-party provider, is handed a fresh bearer for the
+caller with every one of them.
+
+What keeps that from being a standing ability to act as that caller is the
+`route` claim. A marker records the route it was minted on, and tier 0 refuses
+one whose route matches the route the request is currently on. The redirect
+pass runs under the fallback route, so it still resolves; a replay on the route
+the marker names does not, and the model binding leaves nowhere else to replay
+it. A marker carrying no route at all is refused for the same reason — it
+cannot be placed.
+
+The claim is set by the **first** mint and carried forward. Every allowing pass
+re-mints, the redirect pass included, and stamping that pass's own route would
+produce a marker naming the fallback route — which differs from the main route
+and would then be accepted when replayed there.
+
 ### A cookie or basic credential suspends tiers 1 and 2
 
 The server's `authenticate_request` is an if/elif chain — basic, then cookie,
