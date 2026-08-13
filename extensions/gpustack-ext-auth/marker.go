@@ -16,8 +16,24 @@ import (
 // succeed and the marker is the only surviving statement of who is calling.
 //
 // It is a bearer credential, so it is deliberately narrow: bound to one model,
-// valid for five minutes, and never seen by a client (it rides the upstream
-// request, not the response).
+// valid for five minutes, and never returned to a client -- it rides the
+// upstream request, not the response.
+//
+// Riding the upstream request does mean the model backend receives it, and for
+// a route pointing at a third-party provider that is off-premises. This is
+// accepted rather than solved, because it cannot be solved here: the fallback
+// pass is an internal redirect that replays the request *as ai-proxy left it*,
+// so a marker stripped before the upstream call is a marker the fallback pass
+// does not have either. Removing it would trade an outbound bearer for a
+// fallback that no longer works without a live server.
+//
+// What the holder of a leaked one can do is bounded by the same three
+// properties: act as that caller, against that one model, on this gateway, for
+// at most five minutes. It carries no key material, so the API key behind it
+// stays secret, and the server does not accept it -- the server signs its own
+// with a different key. Revocation reaches it too: the identity a marker names
+// is re-checked against `keys` / `refs` before use, so deleting the key
+// invalidates every marker naming it, in flight or not.
 
 // jwtHeaderB64 is the encoded `{"alg":"HS256","typ":"JWT"}`, precomputed
 // because it never varies.
