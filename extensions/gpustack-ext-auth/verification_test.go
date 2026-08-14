@@ -107,12 +107,29 @@ func TestTier2SurvivesAnOutage(t *testing.T) {
 	}
 }
 
+// stubVerificationWrites records host writes (store and evict) so tests can
+// assert on them without a proxy-wasm host. Returns the recorder.
+func stubVerificationWrites(t *testing.T) *map[string][]byte {
+	t.Helper()
+	writes := map[string][]byte{}
+	original := writeVerification
+	writeVerification = func(key string, value []byte) error {
+		writes[key] = value
+		return nil
+	}
+	t.Cleanup(func() { writeVerification = original })
+	return &writes
+}
+
 // Revocation needs no cache-invalidation step: dropping the ref from `refs` is
-// enough, because a hit is always re-checked against it.
+// enough, because a hit is always re-checked against it. And a hit whose ref is
+// gone evicts its own dead entry -- the one reclamation the shared-data ABI
+// allows.
 func TestTier2HitIsRecheckedAgainstRefs(t *testing.T) {
 	stubVerificationCache(t, map[string][2]string{
 		customCredential: {"58", "abc123.gpustack-9"},
 	})
+	writes := stubVerificationWrites(t)
 	credential := [][2]string{{"authorization", "Bearer " + customCredential}}
 	now := time.Unix(1_790_000_000, 0)
 
@@ -121,15 +138,24 @@ func TestTier2HitIsRecheckedAgainstRefs(t *testing.T) {
 		t.Fatal("precondition: a live ref must resolve")
 	}
 
+	// Refs empty: the lookup is skipped entirely, so there is nothing to evict.
 	config.LocalAuth.Refs = map[string]refEntry{}
 	if id := resolveIdentity(config, credential, vectorMarkerConn, now); id.State != identityUnresolved {
 		t.Error("a revoked ref still resolved from the cache")
 	}
+	if len(*writes) != 0 {
+		t.Errorf("empty refs must not reach the host, got writes %v", *writes)
+	}
 
+	// Ref present but expired: the entry is dead, and presenting it evicts it.
 	expired := now.Unix() - 1
 	config.LocalAuth.Refs = map[string]refEntry{"58": {Exp: &expired}}
 	if id := resolveIdentity(config, credential, vectorMarkerConn, now); id.State != identityUnresolved {
 		t.Error("an expired ref still resolved from the cache")
+	}
+	key := verificationCacheKey(customCredential)
+	if value, ok := (*writes)[key]; !ok || len(value) != 0 {
+		t.Errorf("a dead entry must be tombstoned to empty, got (%q, present=%v)", value, ok)
 	}
 }
 
@@ -191,4 +217,17 @@ func TestStoreVerificationRequiresAKnownRef(t *testing.T) {
 	disabled := config
 	disabled.LocalAuth.Enabled = false
 	storeVerification(disabled, customCredential, "58", "abc123.gpustack-9")
+}
+
+// The positive case: a live ref is written under the credential's digest key,
+// as `<ref>|<consumer>`.
+func TestStoreVerificationWritesALiveRef(t *testing.T) {
+	writes := stubVerificationWrites(t)
+
+	storeVerification(tier2Config(), customCredential, "58", "abc123.gpustack-9")
+
+	key := verificationCacheKey(customCredential)
+	if got := string((*writes)[key]); got != "58|abc123.gpustack-9" {
+		t.Errorf("stored %q, want %q", got, "58|abc123.gpustack-9")
+	}
 }

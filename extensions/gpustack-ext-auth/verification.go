@@ -4,26 +4,51 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/wasm-go/pkg/log"
 )
 
 // The verification cache remembers which identity a credential turned out to
-// be, for credentials this gateway cannot verify itself -- custom keys, and
-// generated keys whose digest has not been backfilled yet.
+// be, for credentials this gateway cannot verify itself: custom keys in a
+// deployment that keeps them out of the `keys` table.
 //
 // It answers "who is this", never "may they". A hit still goes to the server
 // for authorization while the server is up; what it removes is the
-// authentication half, and with it the reason a custom key could not survive an
+// authentication half, and with it the reason such a key could not survive an
 // outage. Because the identity is resolved, the ordinary
 // failure_mode_allow_authenticated path applies -- no separate decision replay
 // is needed.
+//
+// This is the plugin's only use of shared data (markers are stateless JWTs), so
+// it is the whole of its shared-data footprint. That footprint is conditional:
+// it exists only where `refs` is non-empty, which is only where
+// GATEWAY_AUTH_ALLOW_CUSTOM_KEYS is off. In the default configuration custom
+// keys carry a digest and resolve at tier 1, `refs` is empty, and both halves
+// below short-circuit before touching shared data -- the cache is inert and
+// nothing is stored. It earns its keep only in the switch-off deployment, where
+// it is what lets a custom key stay served through a server outage without its
+// hash ever being published to the CR.
+//
+// Its survival guarantee is partial, and worth stating: only a credential seen
+// (and vouched for) before an outage has a warm entry. One first presented
+// during the outage is a miss, resolves to nothing, and is refused -- unlike a
+// tier-1 key, which is always local.
 //
 // Unlike a decision cache this is written once per credential rather than once
 // per request, read only on the paths that reach tier 2 (a key with a digest
 // resolves at tier 1 and never touches shared data), and invalidated by `refs`
 // membership rather than by time.
+//
+// Growth is the cost of that. Shared data has no TTL and cannot be enumerated
+// or deleted (only overwritten), so an entry for a credential never presented
+// again cannot be reclaimed until the pod restarts. The bound is the number of
+// distinct valid switch-off custom credentials a pod sees in its lifetime --
+// not per-request, and zero in the default configuration -- and the live
+// working set within that is itself bounded by the `refs` byte budget in the
+// CR. evictVerification claws back only the one case the ABI permits: an entry
+// whose key was revoked and is still being presented.
 
 // verificationKeyPrefix namespaces the shared-data keys.
 //
@@ -83,14 +108,19 @@ func decodeVerification(raw []byte) (ref, consumer string, ok bool) {
 	return entry[:separator], entry[separator+1:], true
 }
 
-// lookupVerification is a variable so tests can exercise tier 2 without a
-// proxy-wasm host.
+// lookupVerification and writeVerification are variables so tests can exercise
+// tier 2 -- reads, writes and evictions -- without a proxy-wasm host. Both host
+// calls in this file go through them.
 var lookupVerification = func(credential string) (ref, consumer string, ok bool) {
 	raw, _, err := proxywasm.GetSharedData(verificationCacheKey(credential))
 	if err != nil || len(raw) == 0 {
 		return "", "", false
 	}
 	return decodeVerification(raw)
+}
+
+var writeVerification = func(key string, value []byte) error {
+	return proxywasm.SetSharedData(key, value, 0)
 }
 
 // storeVerification records what the server said a credential was.
@@ -108,21 +138,44 @@ func storeVerification(config PluginConfig, credential, ref, consumer string) {
 	if _, live := config.LocalAuth.Refs[ref]; !live {
 		return
 	}
-	if err := proxywasm.SetSharedData(
-		verificationCacheKey(credential), encodeVerification(ref, consumer), 0); err != nil {
+	if err := writeVerification(
+		verificationCacheKey(credential), encodeVerification(ref, consumer)); err != nil {
 		log.Warnf("%s: failed to cache the identity for ref %s: %v", pluginName, ref, err)
+	}
+}
+
+// evictVerification tombstones a cache entry whose identity `refs` no longer
+// vouches for.
+//
+// Called on a failed re-check, where the credential is in hand and the entry is
+// known dead -- the one reclamation this ABI allows, since shared data cannot
+// be enumerated to sweep later. The value is cleared rather than the entry
+// deleted (there is no delete, and an empty value is what lookupVerification
+// reads as a miss); the key string itself stays, so this reclaims the value of
+// a revoked-and-still-presented entry, not its footprint entirely. Once cleared
+// it is not re-cached: the next presentation is a miss, goes to the server, and
+// the server refuses a revoked key rather than returning a ref.
+func evictVerification(credential string) {
+	if credential == "" {
+		return
+	}
+	if err := writeVerification(verificationCacheKey(credential), nil); err != nil {
+		log.Warnf("%s: failed to evict a stale verification entry: %v", pluginName, err)
 	}
 }
 
 // resolveFromVerificationCache is tier 2.
 //
 // The entry is trusted for the identity it names, then that identity is checked
-// against `refs` by the caller exactly as a marker-derived one is -- which is
-// what makes revocation take effect without any cache-invalidation step.
-func resolveFromVerificationCache(config PluginConfig, requestHeaders [][2]string) (identity, bool) {
+// against `refs` here -- exactly as the marker path checks its own -- which is
+// what makes revocation take effect without any time-based invalidation. A
+// failed re-check evicts the dead entry and falls through to unresolved,
+// leaving the server authoritative.
+func resolveFromVerificationCache(config PluginConfig, requestHeaders [][2]string, now time.Time) (identity, bool) {
 	// Nothing to validate a hit against, so a lookup could only produce an
 	// identity that has to be discarded. Also keeps the host call off every
-	// request in deployments that have no refs at all.
+	// request in deployments that have no refs at all -- i.e. every deployment
+	// that has not turned GATEWAY_AUTH_ALLOW_CUSTOM_KEYS off.
 	if len(config.LocalAuth.Refs) == 0 {
 		return identity{}, false
 	}
@@ -132,6 +185,12 @@ func resolveFromVerificationCache(config PluginConfig, requestHeaders [][2]strin
 	}
 	ref, consumer, ok := lookupVerification(credential)
 	if !ok || ref == "" || consumer == "" {
+		return identity{}, false
+	}
+	// A cache entry names a ref, never an access key -- the credential behind it
+	// is unverifiable here, which is why it went to refs rather than keys.
+	if !identityStillValid(config, "", ref, now) {
+		evictVerification(credential)
 		return identity{}, false
 	}
 	return identity{
