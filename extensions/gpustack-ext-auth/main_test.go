@@ -47,6 +47,11 @@ var testRequestInfo = requestInfo{
 	Scheme: "https",
 }
 
+// testConn stands in for source.address on the authz-header tests. Its value is
+// immaterial to those; the connection binding it feeds is exercised by
+// TestBuildAuthzRequestHeadersSendsTheDownstreamConnection and the marker tests.
+const testConn = "10.42.0.1:64586"
+
 func TestBuildAuthzRequestHeadersFormAForwardsCredential(t *testing.T) {
 	config := testConfig(t)
 	requestHeaders := [][2]string{
@@ -56,7 +61,7 @@ func TestBuildAuthzRequestHeadersFormAForwardsCredential(t *testing.T) {
 		{"accept", "*/*"},
 	}
 
-	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved})
+	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved}, testConn)
 
 	// Authorization is forwarded even though allowed_headers never lists it --
 	// that unconditional forward is what makes today's /token-auth work.
@@ -87,7 +92,7 @@ func TestBuildAuthzRequestHeadersFormBStripsEveryCredential(t *testing.T) {
 	}
 
 	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders,
-		identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7})
+		identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7}, testConn)
 
 	if got.Get(headerAccessKey) != "3192253c1f4a9b7e" {
 		t.Fatalf("form B must assert the resolved access key, got %q", got.Get(headerAccessKey))
@@ -115,7 +120,7 @@ func TestBuildAuthzRequestHeadersDropsClientSuppliedAssertion(t *testing.T) {
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
 	}
 
-	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved})
+	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved}, testConn)
 
 	if got.Get(headerAccessKey) != "" {
 		t.Fatalf("a client-supplied identity assertion must never reach the server, got %q", got.Get(headerAccessKey))
@@ -126,15 +131,43 @@ func TestBuildAuthzRequestHeadersForwardsMarkerWithoutBeingListed(t *testing.T) 
 	config := testConfig(t)
 	requestHeaders := [][2]string{{"x-gpustack-auth-cache", "signed.marker.value"}}
 
-	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved})
+	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders, identity{State: identityUnresolved}, testConn)
 
 	if got.Get("X-Gpustack-Auth-Cache") != "signed.marker.value" {
 		t.Error("the marker is the plugin's own protocol with the server and must not require an allowed_headers entry")
 	}
 }
 
+func TestBuildAuthzRequestHeadersSendsTheDownstreamConnection(t *testing.T) {
+	got := buildAuthzRequestHeaders(testConfig(t), testRequestInfo, nil, identity{State: identityUnresolved}, testConn)
+
+	if got.Get(headerDownstreamConn) != testConn {
+		t.Errorf("the server needs the connection to bind its marker to; got %q, want %q",
+			got.Get(headerDownstreamConn), testConn)
+	}
+}
+
+// The value must name the connection the client is actually on. A client that
+// supplies its own copy -- to make its marker verify on a connection that is
+// not the one it was minted on -- must have it overwritten, not merged.
+func TestBuildAuthzRequestHeadersOverwritesAClientSuppliedConnection(t *testing.T) {
+	config := testConfig(t)
+	// Widen allowed_headers so the client copy would otherwise be carried through.
+	config.Authz.AllowedHeaders = mustHeaderMatcher(t, `[{"prefix":"x-"}]`)
+	requestHeaders := [][2]string{
+		{"x-gpustack-downstream-conn", "203.0.113.9:1111"}, // the victim's connection
+	}
+
+	got := buildAuthzRequestHeaders(config, testRequestInfo, requestHeaders,
+		identity{State: identityUnresolved}, testConn)
+
+	if values := got.Values("X-Gpustack-Downstream-Conn"); len(values) != 1 || values[0] != testConn {
+		t.Fatalf("a client-supplied connection reached the server: %v", values)
+	}
+}
+
 func TestBuildAuthzRequestHeadersSetsForwardAuthMetadata(t *testing.T) {
-	got := buildAuthzRequestHeaders(testConfig(t), testRequestInfo, nil, identity{State: identityUnresolved})
+	got := buildAuthzRequestHeaders(testConfig(t), testRequestInfo, nil, identity{State: identityUnresolved}, testConn)
 
 	for name, want := range map[string]string{
 		headerOriginalMethod:   "POST",
@@ -250,7 +283,7 @@ func TestResolveIdentity(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := resolveIdentity(tc.config(), tc.headers, vectorFallbackRoute, now)
+			got := resolveIdentity(tc.config(), tc.headers, vectorMarkerConn, now)
 			if got.State != tc.wantState {
 				t.Fatalf("state = %v, want %v. %s", got.State, tc.wantState, tc.why)
 			}
@@ -275,7 +308,7 @@ func TestBuildAuthzRequestHeadersDropsClientSuppliedConsumer(t *testing.T) {
 	got := buildAuthzRequestHeaders(config, testRequestInfo, [][2]string{
 		{"x-mse-consumer", "admin.gpustack-1"},
 		{"x-higress-llm-model", "my-org/qwen3-8b"},
-	}, identity{State: identityUnresolved})
+	}, identity{State: identityUnresolved}, testConn)
 
 	if got.Get(headerConsumer) != "" {
 		t.Fatalf("a client-supplied consumer reached the authorization call: %q", got.Get(headerConsumer))
@@ -292,7 +325,7 @@ func TestBuildAuthzRequestHeadersPreservesDuplicates(t *testing.T) {
 		{"cookie", "b=2"},
 		{"x-forwarded-for", "203.0.113.1"},
 		{"x-forwarded-for", "198.51.100.7"},
-	}, identity{State: identityUnresolved})
+	}, identity{State: identityUnresolved}, testConn)
 
 	if values := got.Values("Cookie"); len(values) != 2 {
 		t.Errorf("Cookie = %v, want both values forwarded", values)
@@ -311,14 +344,14 @@ func TestAuthoritativeHeadersCollapseDuplicates(t *testing.T) {
 	stripped := buildAuthzRequestHeaders(config, testRequestInfo, [][2]string{
 		{"cookie", "a=1"},
 		{"cookie", "b=2"},
-	}, identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7})
+	}, identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7}, testConn)
 	if values := stripped.Values("Cookie"); len(values) != 0 {
 		t.Errorf("form B left %v behind", values)
 	}
 
 	overridden := buildAuthzRequestHeaders(config, testRequestInfo, [][2]string{
 		{"x-gpustack-auth-token", "client-supplied"},
-	}, identity{State: identityUnresolved})
+	}, identity{State: identityUnresolved}, testConn)
 	if values := overridden.Values("X-Gpustack-Auth-Token"); len(values) != 1 || values[0] != "derived-token" {
 		t.Errorf("gateway token = %v, want only the configured value", values)
 	}
@@ -373,7 +406,7 @@ func TestAServerFirstCredentialSuspendsLocalAuthentication(t *testing.T) {
 				}
 			}
 
-			if got := resolveIdentityTiers(config, headers, vectorFallbackRoute, time.Unix(1700000000, 0)).State; got != tc.want {
+			if got := resolveIdentityTiers(config, headers, vectorMarkerConn, time.Unix(1700000000, 0)).State; got != tc.want {
 				t.Errorf("state = %v, want %v", got, tc.want)
 			}
 		})

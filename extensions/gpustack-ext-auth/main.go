@@ -131,11 +131,6 @@ type identity struct {
 	// server's to supply on the authorization response.
 	Consumer string
 
-	// Route is the route a marker was minted on, carried forward so that
-	// re-minting on the redirect pass does not restate it as the route that
-	// pass is running under. See markerClaimsFor.
-	Route string
-
 	// MarkerRejected records that a marker header was present but produced no
 	// identity -- a bad signature, a model mismatch, or an entry no longer in
 	// the tables. Reported rather than logged in place, for the same reason as
@@ -169,6 +164,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// The safety gate. Routes outside this list belong to someone else -- other
 	// tenants on a shared gateway, the control-plane mirror ingress -- and must
 	// pass through untouched.
+	// Held rather than read twice: the debug log below wants it too, and its
+	// arguments are evaluated whether or not the level is enabled, so calling
+	// again there would cost a host call on every authorized request.
 	routeName := currentRouteName()
 	if !matchesRoute(config.RouteMatchRegexes, routeName) {
 		return types.ActionContinue
@@ -201,7 +199,10 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 		return types.ActionPause
 	}
 
-	id := resolveIdentity(config, requestHeaders, routeName, time.Now())
+	// Read once and threaded: the redirect pass both verifies a marker and
+	// mints a fresh one, so resolving it per use would double the host calls.
+	conn := downstreamConnection()
+	id := resolveIdentity(config, requestHeaders, conn, time.Now())
 	if id.MarkerRejected {
 		log.Debugf("%s: an auth marker was present but did not verify; falling back to the credential",
 			pluginName)
@@ -231,14 +232,15 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	}
 
 	if consumer, ok := publicSkipConsumer(config, id); ok {
-		return skipAuthz(config, id, consumer, extractHeader(requestHeaders, headerLLMModel), routeName)
+		return skipAuthz(config, id, consumer, extractHeader(requestHeaders, headerLLMModel), conn)
 	}
 
 	// Debug rather than Info: this fires on every request that does call the
 	// server, where wasm-go already logs the call itself. The skip path logs at
 	// the same level for symmetry -- see skipAuthz, where it is the only trace a
 	// request leaves in the plugin's own logs.
-	log.Debugf("%s: authorizing %s via the server (%s)", pluginName, describeCaller(id), describeForm(id))
+	log.Debugf("%s: authorizing %s via the server (%s) on %s from %s",
+		pluginName, describeCaller(id), describeForm(id), routeName, conn)
 
 	info := requestInfo{
 		Method: ctx.Method(),
@@ -246,7 +248,25 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 		Host:   ctx.Host(),
 		Scheme: ctx.Scheme(),
 	}
-	return dispatchAuthz(config, info, requestHeaders, id, routeName)
+	return dispatchAuthz(config, info, requestHeaders, id, conn)
+}
+
+// downstreamConnection identifies the client connection this request arrived
+// on, as `<ip>:<port>`, empty when the property cannot be read.
+//
+// Not a header: it is the peer address of the socket, so a client can neither
+// set it nor choose it. That is the whole reason a marker can be bound to it.
+//
+// Per-connection rather than per-process, which rules out the obvious
+// alternative: Envoy's connection id is a counter that restarts at zero in
+// every gateway pod, and a marker signed on one pod verifies on any other, so
+// two pods hand out colliding ids by construction.
+func downstreamConnection() string {
+	address, err := proxywasm.GetProperty([]string{"source", "address"})
+	if err != nil {
+		return ""
+	}
+	return string(address)
 }
 
 // currentRouteName reads Envoy's route_name property, empty when there is none
@@ -336,7 +356,7 @@ func localConsumer(id identity) (string, bool) {
 // happens because /token-auth answers with a dummy value, so a skip that did not
 // reproduce it would silently start forwarding a credential that never used to
 // travel this far.
-func skipAuthz(config PluginConfig, id identity, consumer, model, routeName string) types.Action {
+func skipAuthz(config PluginConfig, id identity, consumer, model, conn string) types.Action {
 	// A public route makes no server call, so nothing else in the request path
 	// logs anything: without this the plugin is indistinguishable from not being
 	// in the chain at all. The always-on signal is X-Mse-Consumer reaching the
@@ -348,7 +368,7 @@ func skipAuthz(config PluginConfig, id identity, consumer, model, routeName stri
 	// The server never runs on this path, so it can never mint the marker the
 	// fallback pass needs. If the plugin cannot sign either, the redirect has
 	// nothing to authenticate with.
-	applyMarker(config, id, model, consumer, routeName, time.Now())
+	applyMarker(config, id, model, consumer, conn, time.Now())
 	return types.ActionContinue
 }
 
@@ -387,8 +407,8 @@ func applyUpstreamRewrites(config PluginConfig, consumer string) {
 // gateway's copy of the world, not about the credential, and the server is the
 // one that gets to be authoritative. The single exception is a known access key
 // whose secret does not verify, which is a statement about the credential.
-func resolveIdentity(config PluginConfig, requestHeaders [][2]string, routeName string, now time.Time) identity {
-	id := resolveIdentityTiers(config, requestHeaders, routeName, now)
+func resolveIdentity(config PluginConfig, requestHeaders [][2]string, conn string, now time.Time) identity {
+	id := resolveIdentityTiers(config, requestHeaders, conn, now)
 	if id.Source != sourceMarker && config.AuthCache.canSign() &&
 		extractHeader(requestHeaders, config.AuthCache.Header) != "" {
 		id.MarkerRejected = true
@@ -396,11 +416,11 @@ func resolveIdentity(config PluginConfig, requestHeaders [][2]string, routeName 
 	return id
 }
 
-func resolveIdentityTiers(config PluginConfig, requestHeaders [][2]string, routeName string, now time.Time) identity {
+func resolveIdentityTiers(config PluginConfig, requestHeaders [][2]string, conn string, now time.Time) identity {
 	if !config.LocalAuth.Enabled {
 		return identity{State: identityUnresolved}
 	}
-	if id, ok := resolveFromMarker(config, requestHeaders, routeName, now); ok {
+	if id, ok := resolveFromMarker(config, requestHeaders, conn, now); ok {
 		return id
 	}
 	// Tiers 1 and 2 read the API key, and the server would not have. Its
@@ -524,7 +544,7 @@ func resolveAnonymous(config PluginConfig, requestHeaders [][2]string) (identity
 // token. It holds on a fallback pass because a fallback route serves the same
 // `x-higress-llm-model` and only swaps the upstream registry -- that invariant
 // is load-bearing, so a mismatch is treated as no marker at all.
-func resolveFromMarker(config PluginConfig, requestHeaders [][2]string, routeName string, now time.Time) (identity, bool) {
+func resolveFromMarker(config PluginConfig, requestHeaders [][2]string, conn string, now time.Time) (identity, bool) {
 	if !config.AuthCache.canSign() {
 		return identity{}, false
 	}
@@ -539,21 +559,23 @@ func resolveFromMarker(config PluginConfig, requestHeaders [][2]string, routeNam
 	if claims.Model == "" || claims.Model != extractHeader(requestHeaders, headerLLMModel) {
 		return identity{}, false
 	}
-	// A marker is only ever meant to be read on the pass *after* the one that
-	// minted it, and those two passes run under different route names -- the
-	// redirect targets the fallback route. Requiring them to differ is what
-	// makes the marker useless anywhere else.
+	// The marker is only meant to be read on the pass after the one that minted
+	// it, and an internal redirect runs on the very same client connection.
+	// Anyone else presenting the marker is on a connection of their own, so
+	// requiring the two to match is what makes it useless away from the request
+	// it belongs to.
 	//
-	// It has to be, because nothing strips a client-supplied copy of this
-	// header, and the marker travels on the upstream request: whoever receives
-	// those requests -- a worker, an APM, a third-party provider -- gets a fresh
-	// bearer for the caller with every one. Without this check that is a
-	// standing ability to act as them; with it, replaying on the route the
-	// marker names is refused, and the model binding above leaves nowhere else
-	// to replay it.
+	// It has to be checked, because nothing strips a client-supplied copy of
+	// this header and the marker travels on the upstream request: whoever
+	// receives those requests -- a worker, an APM, a third-party provider --
+	// gets a fresh bearer for the caller with every one. Binding it to the
+	// connection is what stops that from being a standing ability to act as
+	// them.
 	//
-	// Absent means an older mint, which cannot be placed and so is not honoured.
-	if claims.Route == "" || claims.Route == routeName {
+	// Either side empty is a refusal rather than a match: a comparison between
+	// two unreadable values would pass, which would turn the check into a
+	// no-op precisely when the property is unavailable.
+	if claims.Conn == "" || claims.Conn != conn {
 		return identity{}, false
 	}
 	// An anonymous marker is only meaningful where anonymity is allowed. Without
@@ -569,7 +591,6 @@ func resolveFromMarker(config PluginConfig, requestHeaders [][2]string, routeNam
 			Source:    sourceMarker,
 			Anonymous: true,
 			Consumer:  claims.Consumer,
-			Route:     claims.Route,
 		}, true
 	}
 
@@ -595,7 +616,6 @@ func resolveFromMarker(config PluginConfig, requestHeaders [][2]string, routeNam
 		AccessKey: accessKey,
 		Ref:       ref,
 		Consumer:  claims.Consumer,
-		Route:     claims.Route,
 	}, true
 }
 
@@ -635,8 +655,8 @@ func (i identity) normalizedID() string {
 	return ""
 }
 
-func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]string, id identity, routeName string) types.Action {
-	authzHeaders := buildAuthzRequestHeaders(config, info, requestHeaders, id)
+func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]string, id identity, conn string) types.Action {
+	authzHeaders := buildAuthzRequestHeaders(config, info, requestHeaders, id, conn)
 	model := extractHeader(requestHeaders, headerLLMModel)
 	credential := extractCredential(requestHeaders)
 
@@ -649,7 +669,7 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 			if statusCode != http.StatusOK {
 				// This callback is the one that paused the request, so it is
 				// the one that owes the resume.
-				if handleAuthzFailure(config, id, model, routeName, statusCode, responseHeaders, responseBody) {
+				if handleAuthzFailure(config, id, model, conn, statusCode, responseHeaders, responseBody) {
 					proxywasm.ResumeHttpRequest()
 				}
 				return
@@ -669,7 +689,7 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 				}
 			}
 
-			applyMarker(config, id, model, consumer, routeName, time.Now())
+			applyMarker(config, id, model, consumer, conn, time.Now())
 			proxywasm.ResumeHttpRequest()
 		},
 		config.Authz.TimeoutMillis,
@@ -681,7 +701,7 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 		// resume: nothing was ever paused on this path, so resuming here would
 		// be a resume against a request that is still iterating. Return an
 		// action instead.
-		if handleAuthzFailure(config, id, model, routeName, http.StatusInternalServerError, nil, nil) {
+		if handleAuthzFailure(config, id, model, conn, http.StatusInternalServerError, nil, nil) {
 			return types.ActionContinue
 		}
 		return types.ActionPause
@@ -704,7 +724,7 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 // that upstream forwards Authorization unconditionally -- outside the
 // allowed_headers matcher entirely -- so leaving it in place is the default
 // behaviour rather than something a config has to ask for.
-func buildAuthzRequestHeaders(config PluginConfig, info requestInfo, requestHeaders [][2]string, id identity) http.Header {
+func buildAuthzRequestHeaders(config PluginConfig, info requestInfo, requestHeaders [][2]string, id identity, conn string) http.Header {
 	authzHeaders := http.Header{}
 
 	// Add, not Set: HTTP/2 lets a client split one logical Cookie across several
@@ -730,6 +750,15 @@ func buildAuthzRequestHeaders(config PluginConfig, info requestInfo, requestHead
 			authzHeaders.Set(config.AuthCache.Header, marker)
 		}
 	}
+
+	// The connection this request is on, for the server to bind its marker to.
+	// Set unconditionally, and with Set so any client-supplied copy is
+	// overwritten: the whole guarantee is that this value names the connection
+	// the client is actually on, not one it asked to be. An empty conn (no
+	// source.address) is sent as empty, which the server treats as unbindable
+	// and refuses to short-circuit on -- the same posture the plugin takes for
+	// its own marker when the address is missing.
+	authzHeaders.Set(headerDownstreamConn, conn)
 
 	// Never relay a client-supplied assertion. The transformer plugin strips
 	// both at priority 810 before this plugin runs at 360, so reaching this
@@ -792,9 +821,24 @@ func applyUpstreamHeaders(config PluginConfig, responseHeaders http.Header) {
 //
 // Overwriting rather than appending is the point: the server's own marker
 // carries a consumer but no identity, which the gateway cannot act on.
-func applyMarker(config PluginConfig, id identity, model, consumer, routeName string, now time.Time) {
-	claims, ok := markerClaimsFor(config, id, model, consumer, routeName)
+// warnedMissingConnection keeps the warning in applyMarker to one line per VM.
+var warnedMissingConnection bool
+
+func applyMarker(config PluginConfig, id identity, model, consumer, conn string, now time.Time) {
+	claims, ok := markerClaimsFor(config, id, model, consumer, conn)
 	if !ok {
+		// One non-mint is worth reporting: an unreadable downstream address
+		// disables markers entirely, and the cost lands on the pass this
+		// plugin exists to serve -- a redirect on a public route has no server
+		// to fall back to. Every other reason here is a deliberate non-mint.
+		//
+		// Once per VM. Per-worker duplication is acceptable; a line per request
+		// is not.
+		if conn == "" && !warnedMissingConnection {
+			warnedMissingConnection = true
+			log.Warnf("%s: no downstream address available, so auth markers are "+
+				"disabled and a fallback pass has to ask the server", pluginName)
+		}
 		return
 	}
 	token, err := signMarker(config.AuthCache.SigningKey, claims, now.Add(markerTTL))
@@ -813,7 +857,7 @@ func applyMarker(config PluginConfig, id identity, model, consumer, routeName st
 // server's marker with one the server cannot read would break the very pass the
 // marker exists for. So when anything is missing, leave the server's marker
 // alone and let the existing path handle it.
-func markerClaimsFor(config PluginConfig, id identity, model, consumer, routeName string) (markerClaims, bool) {
+func markerClaimsFor(config PluginConfig, id identity, model, consumer, conn string) (markerClaims, bool) {
 	if !config.LocalAuth.Enabled || !config.AuthCache.canSign() {
 		return markerClaims{}, false
 	}
@@ -821,16 +865,18 @@ func markerClaimsFor(config PluginConfig, id identity, model, consumer, routeNam
 	if normalized == "" || model == "" || consumer == "" {
 		return markerClaims{}, false
 	}
-	// The route the *first* mint saw, carried forward rather than restated.
-	// Every allowing pass re-mints, the redirect pass included, and stamping
-	// that pass's own route there would produce a marker naming the fallback
-	// route -- which then differs from the main route and would be accepted
-	// when replayed on it, reopening exactly what resolveFromMarker closes.
-	route := routeName
-	if id.Route != "" {
-		route = id.Route
+	// No marker at all rather than one bound to nothing: an empty value would
+	// be refused on the way back in, so minting it would only cost a signature
+	// and leave a bearer lying on the upstream request that no pass can use.
+	// The redirect then falls back to asking the server, which is a degradation
+	// and not a hole.
+	//
+	// The warning for it lives in applyMarker, which keeps this a pure function
+	// the tests can call without a host.
+	if conn == "" {
+		return markerClaims{}, false
 	}
-	return markerClaims{ID: normalized, Consumer: consumer, Model: model, Route: route}, true
+	return markerClaims{ID: normalized, Consumer: consumer, Model: model, Conn: conn}, true
 }
 
 // describeCaller renders an identity for a log line, never including a
@@ -902,7 +948,7 @@ func statusForFailure(config PluginConfig, statusCode int) uint32 {
 // it: only the async callback ever paused the request, so only the async
 // callback may resume, and folding that decision in here would mean resuming a
 // request that is still iterating on the synchronous dispatch-error path.
-func handleAuthzFailure(config PluginConfig, id identity, model, routeName string, statusCode int,
+func handleAuthzFailure(config PluginConfig, id identity, model, conn string, statusCode int,
 	responseHeaders http.Header, responseBody []byte) (allowed bool) {
 	if failureModeAllows(config, id, statusCode) {
 		// Letting a request through means finishing it like any other allowing
@@ -916,7 +962,7 @@ func handleAuthzFailure(config PluginConfig, id identity, model, routeName strin
 		// marker. Without it the redirect pass of this very request would fail
 		// to name the caller and be rejected -- during the outage the marker is
 		// there to survive.
-		applyMarker(config, id, model, consumer, routeName, time.Now())
+		applyMarker(config, id, model, consumer, conn, time.Now())
 
 		// Worth a line: it only fires while the authorization service is down,
 		// and it is the one outcome where a request was served without a

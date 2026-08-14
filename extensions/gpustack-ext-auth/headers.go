@@ -46,6 +46,24 @@ const (
 	// validates. Adding it here without the matching strip rule would let any
 	// client claim any access key.
 	headerAccessKey = "x-gpustack-access-key"
+
+	// headerDownstreamConn carries this request's client connection address to
+	// the authorization call, so the server can bind the marker it mints to it
+	// and refuse that marker on any other connection.
+	//
+	// The plugin is the only party that can read `source.address`, so the
+	// server never derives this -- it embeds whatever value arrives here at
+	// mint time and compares against whatever arrives on the pass that presents
+	// the marker. Both values come from this plugin, set fresh on every call
+	// from `source.address`, which is why a client-supplied copy is worthless:
+	// it is overwritten with the connection the client is actually on. This
+	// closes the gap that the plugin's own marker binding cannot reach -- the
+	// server's marker carries no such claim, the plugin cannot verify it
+	// locally and forwards it, and without this the server accepts it on any
+	// connection. Not declared in allowed_headers for the same reason the
+	// marker is not: it is protocol between this plugin and the server, not a
+	// client header an operator opted into.
+	headerDownstreamConn = "x-gpustack-downstream-conn"
 )
 
 // credentialHeaders are the request headers that carry an end-user credential.

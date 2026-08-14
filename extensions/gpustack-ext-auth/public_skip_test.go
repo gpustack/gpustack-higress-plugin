@@ -103,7 +103,7 @@ func TestPublicSkipSurvivesFallbackPass(t *testing.T) {
 		{"authorization", "Bearer gpustack_sysaksysaksysak_" + vectorSecret},
 	}
 
-	id := resolveIdentity(config, fallbackHeaders, vectorFallbackRoute, markerNow())
+	id := resolveIdentity(config, fallbackHeaders, vectorMarkerConn, markerNow())
 	if id.State != identityResolved {
 		t.Fatalf("tier 0 failed on the fallback pass: %+v", id)
 	}
@@ -141,7 +141,7 @@ func TestPublicRouteDoesNotLocallyRejectABadSecret(t *testing.T) {
 
 	// The route policy is not consulted by resolveIdentity, so the tier-1
 	// verdict itself is unchanged; what differs is what the caller does with it.
-	if id := resolveIdentity(publicSkipConfig(), badSecret, vectorFallbackRoute, markerNow()); id.State != identityRejected {
+	if id := resolveIdentity(publicSkipConfig(), badSecret, vectorMarkerConn, markerNow()); id.State != identityRejected {
 		t.Fatalf("precondition: a known key with a wrong secret is a rejection, got %v", id.State)
 	}
 
@@ -161,7 +161,7 @@ func TestPublicRouteDoesNotLocallyRejectABadSecret(t *testing.T) {
 func TestAnonymousRequestOnPublicRouteIsAllowedLocally(t *testing.T) {
 	anonymous := [][2]string{{"x-higress-llm-model", "my-org/qwen3-8b"}}
 
-	id := resolveIdentity(publicSkipConfig(), anonymous, vectorFallbackRoute, markerNow())
+	id := resolveIdentity(publicSkipConfig(), anonymous, vectorMarkerConn, markerNow())
 	if id.State != identityResolved || !id.Anonymous {
 		t.Fatalf("an uncredentialed request to a public route must resolve as anonymous, got %+v", id)
 	}
@@ -188,7 +188,7 @@ func TestAnyCredentialDisqualifiesTheAnonymousShortcut(t *testing.T) {
 				{"x-higress-llm-model", "my-org/qwen3-8b"},
 				{header, "something"},
 			}
-			id := resolveIdentity(publicSkipConfig(), headers, vectorFallbackRoute, markerNow())
+			id := resolveIdentity(publicSkipConfig(), headers, vectorMarkerConn, markerNow())
 			if id.Anonymous {
 				t.Errorf("%s present, yet the request was treated as anonymous", header)
 			}
@@ -200,7 +200,7 @@ func TestAnonymousIsConfinedToPublicRoutes(t *testing.T) {
 	config := publicSkipConfig()
 	config.AccessPolicy = ""
 
-	id := resolveIdentity(config, [][2]string{{"x-higress-llm-model", "m"}}, vectorFallbackRoute, markerNow())
+	id := resolveIdentity(config, [][2]string{{"x-higress-llm-model", "m"}}, vectorMarkerConn, markerNow())
 	if id.Anonymous || id.State != identityUnresolved {
 		t.Errorf("anonymity must not be inferred off a public route, got %+v", id)
 	}
@@ -211,7 +211,7 @@ func TestAnonymousIsConfinedToPublicRoutes(t *testing.T) {
 func TestAnonymousMarkerIsRejectedOffPublicRoutes(t *testing.T) {
 	token, err := signMarker([]byte(vectorMarkerKey),
 		markerClaims{ID: "anon", Consumer: "none", Model: "my-org/qwen3-8b",
-			Route: vectorMarkerRoute},
+			Conn: vectorMarkerConn},
 		time.Unix(vectorMarkerExp, 0))
 	if err != nil {
 		t.Fatalf("signMarker: %v", err)
@@ -222,13 +222,13 @@ func TestAnonymousMarkerIsRejectedOffPublicRoutes(t *testing.T) {
 		{"authorization", "Bearer gpustack_sysaksysaksysak_" + vectorSecret},
 	}
 
-	if id := resolveIdentity(publicSkipConfig(), headers, vectorFallbackRoute, markerNow()); !id.Anonymous {
+	if id := resolveIdentity(publicSkipConfig(), headers, vectorMarkerConn, markerNow()); !id.Anonymous {
 		t.Error("an anonymous marker must still work on the public route that minted it")
 	}
 
 	nonPublic := publicSkipConfig()
 	nonPublic.AccessPolicy = ""
-	if id := resolveIdentity(nonPublic, headers, vectorFallbackRoute, markerNow()); id.State == identityResolved {
+	if id := resolveIdentity(nonPublic, headers, vectorMarkerConn, markerNow()); id.State == identityResolved {
 		t.Error("an anonymous marker was honoured on a non-public route")
 	}
 }
@@ -240,7 +240,7 @@ func TestAnonymousMarkerCarriesTheFallbackPass(t *testing.T) {
 	config := publicSkipConfig()
 
 	claims, ok := markerClaimsFor(config, identity{State: identityResolved, Anonymous: true},
-		"my-org/qwen3-8b", "none", vectorMarkerRoute)
+		"my-org/qwen3-8b", "none", vectorMarkerConn)
 	if !ok {
 		t.Fatal("an anonymous local allow must still mint a marker")
 	}

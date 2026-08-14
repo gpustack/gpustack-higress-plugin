@@ -169,7 +169,7 @@ func TestFailOpenMintsAMarker(t *testing.T) {
 		AuthCache: AuthCache{Header: "x-gpustack-auth-cache", SigningKey: []byte(vectorMarkerKey)},
 	}
 
-	claims, ok := markerClaimsFor(config, resolvedCaller, "my-org/qwen3-8b", "3192253c1f4a9b7e.gpustack-7", vectorMarkerRoute)
+	claims, ok := markerClaimsFor(config, resolvedCaller, "my-org/qwen3-8b", "3192253c1f4a9b7e.gpustack-7", vectorMarkerConn)
 	if !ok {
 		t.Fatal("a fail-open allow must still be able to mint a marker")
 	}
@@ -178,7 +178,7 @@ func TestFailOpenMintsAMarker(t *testing.T) {
 	}
 
 	// With nothing to name there is nothing to put in a marker either.
-	if _, ok := markerClaimsFor(config, identity{State: identityUnresolved}, "m", "", vectorMarkerRoute); ok {
+	if _, ok := markerClaimsFor(config, identity{State: identityUnresolved}, "m", "", vectorMarkerConn); ok {
 		t.Error("minted a marker for a caller that was never named")
 	}
 }

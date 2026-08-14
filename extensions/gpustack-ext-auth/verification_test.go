@@ -78,7 +78,7 @@ func TestTier2ResolvesACustomKey(t *testing.T) {
 
 	id := resolveIdentity(tier2Config(), [][2]string{
 		{"authorization", "Bearer " + customCredential},
-	}, vectorFallbackRoute, time.Unix(1_790_000_000, 0))
+	}, vectorMarkerConn, time.Unix(1_790_000_000, 0))
 
 	if id.State != identityResolved {
 		t.Fatalf("state = %v, want resolved", id.State)
@@ -100,7 +100,7 @@ func TestTier2SurvivesAnOutage(t *testing.T) {
 
 	id := resolveIdentity(config, [][2]string{
 		{"authorization", "Bearer " + customCredential},
-	}, vectorFallbackRoute, time.Unix(1_790_000_000, 0))
+	}, vectorMarkerConn, time.Unix(1_790_000_000, 0))
 
 	if !failureModeAllows(config, id, 503) {
 		t.Error("a cached custom key was rejected while the server was unreachable")
@@ -117,18 +117,18 @@ func TestTier2HitIsRecheckedAgainstRefs(t *testing.T) {
 	now := time.Unix(1_790_000_000, 0)
 
 	config := tier2Config()
-	if resolveIdentity(config, credential, vectorFallbackRoute, now).State != identityResolved {
+	if resolveIdentity(config, credential, vectorMarkerConn, now).State != identityResolved {
 		t.Fatal("precondition: a live ref must resolve")
 	}
 
 	config.LocalAuth.Refs = map[string]refEntry{}
-	if id := resolveIdentity(config, credential, vectorFallbackRoute, now); id.State != identityUnresolved {
+	if id := resolveIdentity(config, credential, vectorMarkerConn, now); id.State != identityUnresolved {
 		t.Error("a revoked ref still resolved from the cache")
 	}
 
 	expired := now.Unix() - 1
 	config.LocalAuth.Refs = map[string]refEntry{"58": {Exp: &expired}}
-	if id := resolveIdentity(config, credential, vectorFallbackRoute, now); id.State != identityUnresolved {
+	if id := resolveIdentity(config, credential, vectorMarkerConn, now); id.State != identityUnresolved {
 		t.Error("an expired ref still resolved from the cache")
 	}
 }
@@ -145,7 +145,7 @@ func TestTier1TakesPrecedenceOverTheCache(t *testing.T) {
 
 	id := resolveIdentity(tier2Config(), [][2]string{
 		{"authorization", "Bearer gpustack_3192253c1f4a9b7e_" + vectorSecret},
-	}, vectorFallbackRoute, time.Unix(1_790_000_000, 0))
+	}, vectorMarkerConn, time.Unix(1_790_000_000, 0))
 
 	if id.Source != sourceKeys {
 		t.Errorf("source = %v, want the key table", id.Source)
@@ -169,7 +169,7 @@ func TestEmptyRefsSkipsTheLookup(t *testing.T) {
 	config := tier2Config()
 	config.LocalAuth.Refs = map[string]refEntry{}
 	resolveIdentity(config, [][2]string{{"authorization", "Bearer " + customCredential}},
-		vectorFallbackRoute, time.Unix(1_790_000_000, 0))
+		vectorMarkerConn, time.Unix(1_790_000_000, 0))
 
 	if consulted {
 		t.Error("the cache was consulted with no refs to validate against")

@@ -74,9 +74,12 @@ type markerClaims struct {
 	ID       string `json:"id"`
 	Consumer string `json:"consumer"`
 	Model    string `json:"model"`
-	// Route the marker was minted on, which is how a replay is told from the
-	// pass it exists for. See resolveFromMarker.
-	Route string `json:"route"`
+	// Conn identifies the downstream connection the marker was minted on, as
+	// `<ip>:<port>`. It is what tells the pass this marker exists for from a
+	// replay: an internal redirect runs on the very same client connection,
+	// while anyone else presenting the marker necessarily has their own. See
+	// resolveFromMarker.
+	Conn string `json:"conn"`
 }
 
 type markerPayload struct {
