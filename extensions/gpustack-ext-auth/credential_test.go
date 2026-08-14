@@ -175,40 +175,52 @@ func TestVerifySecretKeyDigest(t *testing.T) {
 	}
 }
 
+// Vectors produced by get_key_pair in gpustack/security.py, so a divergence on
+// either side breaks this rather than breaking authentication in production.
+// Both branches matter: the second one is the only way a custom key can be
+// found in the `keys` table, since its access key exists nowhere in the
+// credential and has to be recomputed.
 func TestParseAPIKey(t *testing.T) {
 	cases := []struct {
 		name          string
 		key           string
 		wantAccessKey string
 		wantSecretKey string
-		wantOK        bool
 	}{
 		{
 			name: "standard", key: "gpustack_3192253c1f4a9b7e_" + vectorSecret,
-			wantAccessKey: "3192253c1f4a9b7e", wantSecretKey: vectorSecret, wantOK: true,
+			wantAccessKey: "3192253c1f4a9b7e", wantSecretKey: vectorSecret,
 		},
 		{
 			name: "secret containing underscores", key: "gpustack_3192253c1f4a9b7e_a_b_c",
-			wantAccessKey: "3192253c1f4a9b7e", wantSecretKey: "a_b_c", wantOK: true,
+			wantAccessKey: "3192253c1f4a9b7e", wantSecretKey: "a_b_c",
 		},
-		{name: "no prefix", key: "sk-abcdef", wantOK: false},
-		{name: "prefix only", key: "gpustack_", wantOK: false},
-		{name: "two parts", key: "gpustack_abcdef", wantOK: false},
-		{name: "empty", key: "", wantOK: false},
+		// Everything below is a custom key: the whole credential is the secret,
+		// and the access key is its hash.
+		{
+			name: "no prefix", key: "sk-abcdef",
+			wantAccessKey: "66c0d96dbe52fc861c683c0d043c6261", wantSecretKey: "sk-abcdef",
+		},
+		{
+			name: "prefix only", key: "gpustack_",
+			wantAccessKey: "4eafc4a64dd52fecc3076d403a276c83", wantSecretKey: "gpustack_",
+		},
+		{
+			name: "two parts", key: "gpustack_abcdef",
+			wantAccessKey: "e8b69bc3ed950d41d18c81bb4422ee9c", wantSecretKey: "gpustack_abcdef",
+		},
 		{
 			name: "prefix must be followed by underscore", key: "gpustackfoo_a_b",
-			wantOK: false,
+			wantAccessKey: "d2f88e01df68fc07117d22c4ef488ca3", wantSecretKey: "gpustackfoo_a_b",
+		},
+		{
+			name: "spaces and punctuation", key: "my custom key",
+			wantAccessKey: "3ffeb7466fc100162af8bdeaaceff480", wantSecretKey: "my custom key",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			accessKey, secretKey, ok := parseAPIKey(tc.key)
-			if ok != tc.wantOK {
-				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
-			}
-			if !ok {
-				return
-			}
+			accessKey, secretKey := parseAPIKey(tc.key)
 			if accessKey != tc.wantAccessKey || secretKey != tc.wantSecretKey {
 				t.Errorf("got (%q, %q), want (%q, %q)", accessKey, secretKey, tc.wantAccessKey, tc.wantSecretKey)
 			}
@@ -283,5 +295,47 @@ func TestKeyEntryExpired(t *testing.T) {
 	}
 	if !(keyEntry{Exp: &exact}).expired(now) {
 		t.Error("exp is exclusive: a key is dead at the instant it expires")
+	}
+}
+
+// End to end for a custom key, with every value produced by the server's own
+// stack: get_key_pair derives the access key, new_secret_key_digest the stored
+// digest, gateway_digest the truncated form that reaches this config.
+//
+//	k = "sk-my-custom-key"
+//
+// Tier 1 has to reach it without the server, which is the whole point: a custom
+// key is exactly the kind that used to need a live server on every request.
+func TestTier1ResolvesACustomKey(t *testing.T) {
+	const (
+		credential = "sk-my-custom-key"
+		accessKey  = "19ebf735c62b88929876f0d53b538a0e"
+		digest     = "s128$2dadb85069f4a69c407e5b3f80dfc5d2$868MOsT91N4Xf-XFOjQbkg"
+	)
+	config := PluginConfig{
+		LocalAuth: LocalAuth{
+			Enabled: true,
+			Keys:    map[string]keyEntry{accessKey: {Digest: digest, UserID: 9}},
+		},
+	}
+	headers := [][2]string{{"authorization", "Bearer " + credential}}
+
+	id, decided := resolveFromKeys(config, headers, time.Unix(1700000000, 0))
+
+	if !decided || id.State != identityResolved {
+		t.Fatalf("decided=%v state=%v, want a resolved identity", decided, id.State)
+	}
+	if id.AccessKey != accessKey || id.UserID != 9 {
+		t.Errorf("got (%q, %d), want (%q, 9)", id.AccessKey, id.UserID, accessKey)
+	}
+
+	// And the same credential with one character changed is a fallthrough, not
+	// a rejection. A custom key's access key is the hash of the whole
+	// credential, so a typo names a key the table does not hold and tier 1 never
+	// reaches the digest comparison -- unlike an `<ak>_<sk>` key, where the
+	// access key still resolves and a wrong secret is rejected outright.
+	wrong := [][2]string{{"authorization", "Bearer sk-my-custom-keY"}}
+	if id, decided := resolveFromKeys(config, wrong, time.Unix(1700000000, 0)); decided || id.State == identityResolved {
+		t.Error("a different credential hashes to a different access key, so tier 1 has nothing to say")
 	}
 }

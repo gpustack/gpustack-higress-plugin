@@ -141,8 +141,8 @@ step of its own — removing the entry is the whole of it.
 | Tier | Source | Covers |
 | --- | --- | --- |
 | 0 | Signed marker on the request | Any identity, on a redirect pass where `Authorization` has already been replaced |
-| 1 | `keys` lookup + one `sha256` | Generated keys that have a digest |
-| 2 | Verification cache in shared data | Custom keys, and generated keys awaiting backfill — after the server has named them once |
+| 1 | `keys` lookup + one `sha256` | Any key that has a digest. The access key comes from the credential: read from it for `gpustack_<ak>_<sk>`, recomputed by hashing the whole string for a custom key, exactly as `get_key_pair` does |
+| 2 | Verification cache in shared data | Keys without a digest — after the server has named them once |
 | 3 | No credential at all, public route | Anonymous access |
 
 Anything still unnamed goes to the server with its credential, as before.
@@ -218,14 +218,27 @@ and invalidated by `refs` membership rather than by time. An identity absent
 from `refs` is never cached: a key created moments ago simply keeps going to the
 server until its config push lands, instead of hitting and failing a re-check.
 
-Because a tier-2 hit is a *resolved* identity, a custom key survives a server
-outage under `failure_mode_allow_authenticated` exactly as a tier-1 one does.
+Because a tier-2 hit is a *resolved* identity, a credential that only tier 2 can
+name survives a server outage under `failure_mode_allow_authenticated` exactly as
+a tier-1 one does — but only once the server has named it, and only in the Envoy
+process that heard the answer. A custom key that carries a digest does not need
+any of that: tier 1 recomputes its access key from the credential and resolves it
+cold, which is what makes an outage survivable for a key nobody has used yet.
 
-The cache is append-only. Shared data has no TTL, no delete and no way to
-enumerate keys, so an entry for a revoked key is not reclaimed — it simply stops
-passing the `refs` re-check. The bound is the number of distinct custom-key
-credentials one Envoy process has seen, which is why nothing here needs to be
-evicted; if that ever stops holding, an expiry stamp inside the value is the
+This is the plugin's only use of shared data — markers are stateless JWTs — and
+its whole footprint is conditional. `refs` is non-empty only where
+`GATEWAY_AUTH_ALLOW_CUSTOM_KEYS` is off; in the default configuration custom keys
+carry a digest, resolve at tier 1, and both the read and the write short-circuit
+before touching shared data. The cache is inert there and stores nothing.
+
+Where it is live, shared data has no TTL, no delete and no way to enumerate keys,
+so it cannot be swept. A tier-2 hit whose `refs` re-check fails is evicted on the
+spot — the credential is in hand and the entry is known dead — by clearing its
+value; the platform keeps the key string, so this reclaims a revoked-but-still-
+presented entry, not one that is simply never seen again. That residual is bounded
+by the distinct switch-off custom credentials a pod sees in its lifetime, with the
+live working set inside it bounded by the `refs` byte budget, and is cleared on
+restart. If that bound ever stops holding, an expiry stamp inside the value is the
 mechanism to add, since the platform offers none.
 
 ### Headers the plugin handles itself

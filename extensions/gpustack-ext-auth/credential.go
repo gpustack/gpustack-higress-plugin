@@ -7,7 +7,12 @@ import (
 	"encoding/hex"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/blake2b"
 )
+
+// customKeyHashBytes is the digest size gpustack's custom_key_hash uses.
+const customKeyHashBytes = 16
 
 // apiKeyPrefix is the literal that opens every GPUStack API key:
 // `gpustack_<access_key>_<secret_key>`. Mirrors API_KEY_PREFIX in
@@ -58,28 +63,47 @@ const (
 // must agree, since the name is what tells a reader how the value was built.
 const truncatedDigestBytes = 16
 
-// parseAPIKey splits a credential of the form `gpustack_<ak>_<sk>`.
+// parseAPIKey derives the pair a credential is indexed and verified by.
 //
-// Deliberately identical to is_valid_format in gpustack/security.py, including
-// the split limit: the secret is everything after the second underscore, so a
-// secret containing underscores survives. Anything that does not fit the shape
-// is not ours to classify -- the caller treats it as an unresolved identity and
-// lets the server decide (it may be a custom key, a legacy UUID token, or a
-// credential for some other scheme entirely).
+// Deliberately identical to get_key_pair in gpustack/security.py, both branches
+// of it. A credential shaped `gpustack_<ak>_<sk>` splits on the first two
+// underscores, so a secret containing underscores survives. Anything else is a
+// custom key, whose access key the server derives by hashing the whole string --
+// the credential *is* the secret in that case, and there is no embedded access
+// key to read.
+//
+// The second branch is what lets a custom key be authenticated here at all. Its
+// absence would not be visible as an error: the lookup would simply never find
+// an entry, and every request carrying such a key would go to the server --
+// including while the server is the thing that is down, which is the case this
+// plugin exists for.
 //
 // No length validation, on purpose. A user-supplied custom key can occupy a
 // 16-hex-character access key, so length cannot distinguish generated keys from
 // custom ones; eligibility is the server's call, expressed by whether the key
 // appears in the `keys` table at all.
-func parseAPIKey(key string) (accessKey, secretKey string, ok bool) {
-	if !strings.HasPrefix(key, apiKeyPrefix+"_") {
-		return "", "", false
+func parseAPIKey(key string) (accessKey, secretKey string) {
+	if strings.HasPrefix(key, apiKeyPrefix+"_") {
+		if parts := strings.SplitN(key, "_", 3); len(parts) == 3 {
+			return parts[1], parts[2]
+		}
 	}
-	parts := strings.SplitN(key, "_", 3)
-	if len(parts) != 3 {
-		return "", "", false
+	return customKeyHash(key), key
+}
+
+// customKeyHash mirrors custom_key_hash in gpustack/security.py: blake2b with a
+// 16-byte digest, rendered as hex.
+//
+// Unkeyed and fast, which is the server's choice rather than this plugin's --
+// what matters here is only that the two agree byte for byte, since this value
+// is the key the `keys` table is indexed by.
+func customKeyHash(key string) string {
+	sum, err := blake2b.New(customKeyHashBytes, nil)
+	if err != nil {
+		return ""
 	}
-	return parts[1], parts[2], true
+	sum.Write([]byte(key))
+	return hex.EncodeToString(sum.Sum(nil))
 }
 
 // extractCredential pulls the client credential out of the request headers.

@@ -306,6 +306,17 @@ func matchesRoute(patterns []*regexp.Regexp, routeName string) bool {
 // call is not redundant only while the server is down -- it is redundant
 // always.
 //
+// This is public-only on purpose, and the obvious extension -- skip the call on
+// an authed route too, since the caller is already authenticated locally -- is
+// deliberately not taken. There the server's answer is not a constant: it turns
+// on the key's scope, its allowed_model_names, and the user's RBAC against this
+// model, none of which is published to the edge, and none of which has the
+// single invalidation signal that let *authentication* move here exactly. That
+// is authorization, and it stays on the server by design. The availability the
+// skip would buy for authed routes is already had without moving it:
+// failure_mode_allow_authenticated serves an authenticated caller through an
+// outage, so the server call costs latency, not uptime.
+//
 // `access_policy: public` is the whole control surface. There is deliberately no
 // second toggle: the field means exactly "you may allow here" to this plugin and
 // nothing else, so a config that declared a route public but then declined to
@@ -439,12 +450,8 @@ func resolveIdentityTiers(config PluginConfig, requestHeaders [][2]string, conn 
 	if id, decided := resolveFromKeys(config, requestHeaders, now); decided {
 		return id
 	}
-	if id, ok := resolveFromVerificationCache(config, requestHeaders); ok {
-		// Same re-check a marker gets: the entry names an identity, `refs` says
-		// whether it is still one.
-		if identityStillValid(config, id.AccessKey, id.Ref, now) {
-			return id
-		}
+	if id, ok := resolveFromVerificationCache(config, requestHeaders, now); ok {
+		return id
 	}
 	if id, ok := resolveAnonymous(config, requestHeaders); ok {
 		return id
@@ -493,10 +500,7 @@ func resolveFromKeys(config PluginConfig, requestHeaders [][2]string, now time.T
 	if credential == "" {
 		return identity{}, false
 	}
-	accessKey, secretKey, ok := parseAPIKey(credential)
-	if !ok {
-		return identity{}, false
-	}
+	accessKey, secretKey := parseAPIKey(credential)
 	entry, found := config.LocalAuth.Keys[accessKey]
 	if !found || entry.expired(now) {
 		return identity{}, false
