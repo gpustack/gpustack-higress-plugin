@@ -147,7 +147,7 @@ step of its own — removing the entry is the whole of it.
 
 Anything still unnamed goes to the server with its credential, as before.
 
-### A marker is only honoured on a pass other than the one that minted it
+### A marker is only honoured on the connection it was minted on
 
 Nothing strips a client-supplied `x-gpustack-auth-cache`, and a marker travels
 on the **upstream** request — so whoever receives those requests, whether a
@@ -155,17 +155,35 @@ worker, an APM or a third-party provider, is handed a fresh bearer for the
 caller with every one of them.
 
 What keeps that from being a standing ability to act as that caller is the
-`route` claim. A marker records the route it was minted on, and tier 0 refuses
-one whose route matches the route the request is currently on. The redirect
-pass runs under the fallback route, so it still resolves; a replay on the route
-the marker names does not, and the model binding leaves nowhere else to replay
-it. A marker carrying no route at all is refused for the same reason — it
-cannot be placed.
+`conn` claim: the downstream `<ip>:<port>` the marker was minted on. An internal
+redirect runs on that very connection — the client is still waiting on it — so
+the pass the marker exists for still resolves, while anyone replaying it is on
+a connection of their own and does not.
 
-The claim is set by the **first** mint and carried forward. Every allowing pass
-re-mints, the redirect pass included, and stamping that pass's own route would
-produce a marker naming the fallback route — which differs from the main route
-and would then be accepted when replayed there.
+The value comes from Envoy's `source.address` rather than from a header, so a
+client can neither set it nor choose it. Envoy's connection id would be the more
+obvious choice and is the wrong one: it is a counter that restarts at zero in
+every gateway pod, while a marker signed on one pod verifies on any other, so
+two pods hand out colliding ids by construction.
+
+Either side of the comparison being empty is a refusal, not a match. Comparing
+two unreadable values would pass, which would disable the check exactly when the
+property is unavailable; for the same reason a marker is not minted at all when
+the address cannot be read.
+
+The same binding covers the marker the **server** mints. When the plugin cannot
+name a caller it forwards the request, and the server signs a marker of its own
+with a key this plugin cannot verify — so on the fallback pass the plugin
+forwards that marker rather than resolving it locally, and the server is what
+checks it. The server has no way to read `source.address`, so the plugin sends
+it as `x-gpustack-downstream-conn` on every authorization call: the server binds
+its marker to the value it received at mint time and refuses it unless the same
+value arrives on the pass that presents it. The header is set from
+`source.address` and overwrites any client-supplied copy, so it names the
+connection the client is on, not one it asked for. Without this the server's
+marker — which carries no such claim of its own — would be replayable from any
+connection, the exact gap this plugin's own binding closes for the markers it
+signs.
 
 ### A cookie or basic credential suspends tiers 1 and 2
 
@@ -236,7 +254,11 @@ Beyond `deleted_at IS NULL`, `keys` and `refs` must exclude:
   would make that pass resolve as the system identity.
 - **Inactive owners.** The server rejects a deactivated user's key.
 
-Custom keys never carry a digest, so they land in `refs`, never `keys`.
+Whether a custom key — one whose secret its user supplied — carries a digest is
+the server's decision, not a property of the key: it lands in `keys` when the
+deployment allows custom keys to be authenticated here, and in `refs` otherwise.
+Nothing in this plugin tests for it. An entry with a digest is verified, one
+without is only checked for validity, and that is the whole of the rule.
 
 ### Digest constructions
 
