@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/claude.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/claude.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -21,9 +21,10 @@ import (
 
 // claudeProvider is the provider for Claude service.
 const (
-	claudeDomain           = "api.anthropic.com"
-	claudeDefaultVersion   = "2023-06-01"
-	claudeDefaultMaxTokens = 4096
+	claudeDomain                  = "api.anthropic.com"
+	claudeDefaultVersion          = "2023-06-01"
+	claudeDefaultMaxTokens        = 4096
+	claudeMinThinkingBudgetTokens = 1024
 
 	// Claude Code mode constants
 	claudeCodeUserAgent    = "claude-cli/2.1.2 (external, cli)"
@@ -491,13 +492,17 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 				budgetTokens = 8192 // Default to medium
 			}
 		}
-		// Ensure minimum budget_tokens requirement
-		if budgetTokens < 1024 {
-			budgetTokens = 1024
+		if budgetTokens < claudeMinThinkingBudgetTokens {
+			budgetTokens = claudeMinThinkingBudgetTokens
 		}
-		claudeRequest.Thinking = &claudeThinkingConfig{
-			Type:         "enabled",
-			BudgetTokens: budgetTokens,
+		if budgetTokens >= claudeRequest.MaxTokens {
+			budgetTokens = claudeRequest.MaxTokens - 1
+		}
+		if budgetTokens >= claudeMinThinkingBudgetTokens {
+			claudeRequest.Thinking = &claudeThinkingConfig{
+				Type:         "enabled",
+				BudgetTokens: budgetTokens,
+			}
 		}
 	}
 

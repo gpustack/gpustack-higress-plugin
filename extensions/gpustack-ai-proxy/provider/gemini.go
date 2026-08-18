@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/gemini.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/gemini.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -616,7 +616,6 @@ func (g *geminiProvider) baseStr2InlineData(baseStr string) *geminiInlineData {
 }
 
 func (g *geminiProvider) getImageInlineDataWithCallback(raw string, callback func(*geminiInlineData, error)) {
-
 	responseCallback := func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 		if statusCode != http.StatusOK {
 			callback(nil, fmt.Errorf("get %s failed, status: %v", raw, statusCode))
@@ -844,7 +843,7 @@ func (g *geminiProvider) buildEmbeddingsResponse(ctx wrapper.HttpContext, gemini
 	response := embeddingsResponse{
 		Object: "list",
 		Data:   make([]embedding, 0, len(geminiResp.Embeddings)),
-		Model:  ctx.GetContext(ctxKeyFinalRequestModel).(string),
+		Model:  ctx.GetStringContext(ctxKeyFinalRequestModel, ""),
 		Usage: usage{
 			TotalTokens: 0,
 		},

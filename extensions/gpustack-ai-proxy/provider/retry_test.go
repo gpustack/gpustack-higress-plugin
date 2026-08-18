@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/retry_test.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/retry_test.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -103,8 +103,19 @@ func TestRetryOnFailure_FromJson_defaults(t *testing.T) {
 	c.FromJson(gjson.Parse(`{"type":"openai","apiTokens":["t"],"retryOnFailure":{"enabled":true}}`))
 	require.True(t, c.IsRetryOnFailureEnabled())
 	assert.Equal(t, int64(1), c.retryOnFailure.maxRetries)
-	assert.Equal(t, int64(60*1000), c.retryOnFailure.retryTimeout)
+	assert.Equal(t, int64(defaultRetryFailureTimeout), c.retryOnFailure.retryTimeout)
 	assert.Equal(t, []string{"4.*", "5.*"}, c.retryOnFailure.retryOnStatus)
+}
+
+func TestRetryOnFailure_FromJson_explicitRetryTimeout(t *testing.T) {
+	var c ProviderConfig
+	c.FromJson(gjson.Parse(`{
+		"type":"openai",
+		"apiTokens":["t"],
+		"retryOnFailure":{"enabled":true,"retryTimeout":90000}
+	}`))
+	require.True(t, c.IsRetryOnFailureEnabled())
+	assert.Equal(t, int64(90000), c.retryOnFailure.retryTimeout)
 }
 
 func TestOnRequestFailed_offlineBranches(t *testing.T) {
