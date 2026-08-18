@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/failover.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/failover.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -644,11 +644,11 @@ func removeApiTokenUnavailableSince(key, apiToken string) {
 }
 
 func (c *ProviderConfig) GetGlobalRandomToken() string {
-	apiTokens, _, err := getApiTokens(c.failover.ctxApiTokens)
-	unavailableApiTokens, _, err := getApiTokens(c.failover.ctxUnavailableApiTokens)
+	apiTokens, _, err1 := getApiTokens(c.failover.ctxApiTokens)
+	unavailableApiTokens, _, err2 := getApiTokens(c.failover.ctxUnavailableApiTokens)
 	log.Debugf("apiTokens: %v, unavailableApiTokens: %v", apiTokens, unavailableApiTokens)
 
-	if err != nil {
+	if err1 != nil || err2 != nil {
 		return ""
 	}
 	count := len(apiTokens)

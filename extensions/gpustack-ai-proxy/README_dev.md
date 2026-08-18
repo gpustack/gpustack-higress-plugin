@@ -1,6 +1,6 @@
 > **Fork 说明**
 >
-> 本文件随 fork 自上游 Higress `ai-proxy`（higress commit `c8b82797c51a`），描述的是上游基于
+> 本文件随 fork 自上游 Higress `ai-proxy`（higress commit `aae6fbce36a2`），描述的是上游基于
 > `hgctl` / Docker 的构建方式，本仓库**不使用**它。在本仓库中构建本插件请用：
 >
 > ```shell

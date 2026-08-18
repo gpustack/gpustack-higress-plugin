@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/claude_to_openai.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/claude_to_openai.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -138,6 +138,10 @@ type ClaudeToOpenAIConvertOptions struct {
 	// PreserveMessageReasoningContent enables the non-standard message-level
 	// reasoning_content field for providers that explicitly support it.
 	PreserveMessageReasoningContent bool
+	// DisableStreamUsageStats prevents injecting stream_options.include_usage
+	// into the converted OpenAI request, for compatibility with older
+	// inference engines that reject unknown fields.
+	DisableStreamUsageStats bool
 }
 
 func (r *contentConversionResult) reasoningContent() string {
@@ -182,7 +186,7 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 		Stop:        claudeRequest.StopSequences,
 	}
 
-	if openaiRequest.Stream {
+	if openaiRequest.Stream && !options.DisableStreamUsageStats {
 		openaiRequest.StreamOptions = &streamOptions{
 			IncludeUsage: true,
 		}

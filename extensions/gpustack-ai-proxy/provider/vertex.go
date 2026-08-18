@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/vertex.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/vertex.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -914,7 +914,7 @@ func (v *vertexProvider) buildEmbeddingsResponse(ctx wrapper.HttpContext, vertex
 	response := embeddingsResponse{
 		Object: "list",
 		Data:   make([]embedding, 0, len(vertexResp.Predictions)),
-		Model:  ctx.GetContext(ctxKeyFinalRequestModel).(string),
+		Model:  ctx.GetStringContext(ctxKeyFinalRequestModel, ""),
 	}
 	totalTokens := 0
 	for _, item := range vertexResp.Predictions {

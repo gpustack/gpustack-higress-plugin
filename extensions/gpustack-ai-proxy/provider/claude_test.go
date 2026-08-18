@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/claude_test.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/claude_test.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -229,6 +229,58 @@ func TestClaudeProvider_BuildClaudeTextGenRequest_StandardMode(t *testing.T) {
 		assert.Equal(t, "opaque-base64", blocks[1].Data)
 		assert.Equal(t, "text", blocks[2].Type)
 		assert.Equal(t, "answer", blocks[2].Text)
+	})
+
+	t.Run("drops_generated_thinking_when_max_tokens_cannot_fit_minimum_budget", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:           "claude-sonnet-4-5-20250929",
+			MaxTokens:       400,
+			ReasoningEffort: "low",
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		assert.Equal(t, 400, claudeReq.MaxTokens)
+		assert.Nil(t, claudeReq.Thinking)
+	})
+
+	t.Run("clamps_generated_thinking_budget_below_max_tokens", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:           "claude-sonnet-4-5-20250929",
+			MaxTokens:       1200,
+			ReasoningEffort: "high",
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.Thinking)
+		assert.Equal(t, "enabled", claudeReq.Thinking.Type)
+		assert.Equal(t, 1199, claudeReq.Thinking.BudgetTokens)
+	})
+
+	t.Run("clamps_explicit_reasoning_max_tokens_below_max_tokens", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 2000,
+			NonOpenAIStyleOptions: NonOpenAIStyleOptions{
+				ReasoningMaxTokens: 3000,
+			},
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.Thinking)
+		assert.Equal(t, "enabled", claudeReq.Thinking.Type)
+		assert.Equal(t, 1999, claudeReq.Thinking.BudgetTokens)
 	})
 
 	t.Run("maps_openai_function_tool_choice_to_claude_tool_choice", func(t *testing.T) {

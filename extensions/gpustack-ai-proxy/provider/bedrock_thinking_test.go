@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/c8b82797c51a97faca46e2ae12990453f5026802/plugins/wasm-go/extensions/ai-proxy/provider/bedrock_thinking_test.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit c8b82797c51a.
+// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/bedrock_thinking_test.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -394,7 +394,7 @@ func TestBedrockRequestPreservesClaudeNativeThinkingBudget(t *testing.T) {
 	assert.Equal(t, float64(8192), request.AdditionalModelRequestFields["thinking"].(map[string]interface{})["budget_tokens"])
 }
 
-func TestBedrockRequestMapsAdaptiveOutputEffortIntoThinking(t *testing.T) {
+func TestBedrockRequestMapsAdaptiveEffortIntoOutputConfig(t *testing.T) {
 	provider := &bedrockProvider{}
 	openaiBody, err := (&ClaudeToOpenAIConverter{}).ConvertClaudeRequestToOpenAI([]byte(`{
 		"model":"claude",
@@ -413,8 +413,10 @@ func TestBedrockRequestMapsAdaptiveOutputEffortIntoThinking(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &request))
 	thinking := request.AdditionalModelRequestFields["thinking"].(map[string]interface{})
 	assert.Equal(t, "adaptive", thinking["type"])
-	assert.Equal(t, "high", thinking["effort"])
-	assert.NotContains(t, request.AdditionalModelRequestFields, "output_config")
+	assert.NotContains(t, thinking, "effort")
+	require.Contains(t, request.AdditionalModelRequestFields, "output_config")
+	outputConfig := request.AdditionalModelRequestFields["output_config"].(map[string]interface{})
+	assert.Equal(t, "high", outputConfig["effort"])
 	assert.NotContains(t, request.AdditionalModelRequestFields, "anthropic_beta")
 }
 
