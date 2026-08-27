@@ -32,8 +32,17 @@ func (m *deepseekProviderInitializer) ValidateConfig(config *ProviderConfig) err
 
 func (m *deepseekProviderInitializer) DefaultCapabilities() map[string]string {
 	return map[string]string{
-		string(ApiNameChatCompletion):    PathOpenAIChatCompletions,
-		string(ApiNameModels):            PathOpenAIModels,
+		string(ApiNameChatCompletion): PathOpenAIChatCompletions,
+		string(ApiNameModels):         PathOpenAIModels,
+		// DeepSeek serves the OpenAI Responses API natively, so it is a path
+		// mapping and not a protocol conversion.
+		// https://api-docs.deepseek.com/zh-cn/guides/responses_api
+		//
+		// The docs show base_url "https://api.deepseek.com" (i.e. /responses);
+		// the /v1 prefix is DeepSeek's OpenAI-compatibility alias and serves the
+		// same endpoint, which is already what ApiNameChatCompletion and
+		// ApiNameModels above rely on. Keep both on the same shape.
+		string(ApiNameResponses):         PathOpenAIResponses,
 		string(ApiNameAnthropicMessages): deepseekAnthropicMessagesPath,
 	}
 }
