@@ -750,7 +750,20 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 			string(ApiNameKlingImageToVideo),
 			string(ApiNameKlingRetrieveImageVideo),
 			string(ApiNameRetrieveVideoContent),
-			string(ApiNameVideoRemix):
+			string(ApiNameVideoRemix),
+			// Anthropic surfaces, so that a provider serving them natively can
+			// say so from its configuration instead of having to be a provider
+			// type that hardcodes them in DefaultCapabilities.
+			//
+			// This is what decides protocol conversion, not just path mapping:
+			// onHttpRequestHeaders rewrites an inbound /v1/messages to
+			// /v1/chat/completions exactly when the active provider has no
+			// ApiNameAnthropicMessages capability. Filtered out here, a
+			// declared capability is dropped without a word and the request is
+			// converted anyway -- indistinguishable from never declaring it.
+			string(ApiNameAnthropicMessages),
+			string(ApiNameAnthropicCountTokens),
+			string(ApiNameAnthropicComplete):
 			c.capabilities[capability] = pathJson.String()
 		}
 	}
