@@ -57,6 +57,15 @@ additionalClusterNameRegexps:
 # Default: X-Organization-Id
 organizationIDHeader: X-Organization-Id
 
+# Optional: response header carrying the reported `request_id` back to the
+# caller, so there is something to quote when asking about a request. Envoy
+# does not return `x-request-id` downstream on its own (the HCM's
+# always_set_request_id_in_response defaults to false), and this plugin can
+# add the header without an EnvoyFilter.
+# Set to "" to switch the echo off; the id is still reported either way.
+# Default: X-GPUStack-Request-Id
+requestIDResponseHeader: X-GPUStack-Request-Id
+
 # Optional: byte cap for the non-streaming sniff path. It bounds both the
 # accumulated response buffer and the gzip-decoded size, protecting the WASM VM
 # against an enormous response (OOM) and a zip bomb (a tiny gzip payload that
@@ -192,6 +201,9 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
   "request_content_bytes": 2048,
   "started_at": 1746518400123,
   "completed_at": 1746518402456,
+  "ttft_ms": 123,
+  "request_id": "3f9c1b2e-77a4-4f21-9a0e-1c5d8e2b4a67",
+  "upstream_response_id": "chatcmpl-Bx1kQZ2v",
   "model_id": 3,
   "model_route_id": 1,
   "user_id": 42,
@@ -211,6 +223,9 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
 | `output_chunk_count` | yes (may be `0`) | Number of streaming delta chunks observed with non-empty content. Always populated; useful for output-token estimation when `completed=false` and for calibrating the `chunks → tokens` ratio when `completed=true`. |
 | `request_content_bytes` | yes (may be `0`) | Sum of `messages[].content`, `input[].content`, and top-level `system` text-block byte lengths from the request. Excludes images / audio / file blocks. `0` for unrecognized request shapes (e.g. multipart/form-data). |
 | `started_at` / `completed_at` | yes | UnixMilli wall-clock stamps at request entry (after path/cluster filtering) and at report dispatch. Both are emitted because request-rate accounting attributes events at start (e.g. QPS / `QueryLimits`) while token-rate accounting attributes events at completion (e.g. `TokenLimits` / calendar `TokenQuota`); a stream that crosses a calendar boundary lands in the period it ends in. |
+| `ttft_ms` | streaming only | Milliseconds from request entry to the **first response body chunk**. The same value the client is handed as `usage.time_to_first_token_ms`; see the caveat under [Locating a request](#locating-a-request). Omitted on the non-streaming path, which never sees intermediate chunks. There is deliberately no `duration_ms` beside it — `completed_at - started_at` is the request duration, and a third number would only be one that can disagree with them. |
+| `request_id` | when Envoy generated one | Envoy's `x-request-id`, captured at request entry. Present regardless of endpoint or outcome. **Not unique per report** — see below. |
+| `upstream_response_id` | when the upstream minted one | The model's own id for this response: `id` (Chat Completions and every non-streaming body), `response.id` (Responses API), `message.id` (Anthropic `message_start`), `request_id` (raw DashScope). Whatever the upstream puts there is taken verbatim — vLLM stamps an `id` on embeddings responses too (`embd-…`), and that is a usable id, not a misread. Absent when the upstream mints none (OpenAI's own embeddings shape), when the endpoint returns no JSON at all (TTS / image), and when no response arrived. |
 | `model_id` / `provider_id` | mutually exclusive | Derived from the Envoy cluster name (`outbound\|<port>\|\|model-<id>-<instance>` or `provider-<id>`). |
 | `model_route_id` | when matched | Derived from the Envoy `route_name` property; formats `ai-route-route-<id>.internal` and `ai-route-route-<id>.fallback.internal` (suffix optional). |
 | `user_id` / `access_key` | when present | Parsed from the `x-mse-consumer` header. |
@@ -219,6 +234,28 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
 `input_cached_token` aggregates cached prompt tokens from OpenAI/vLLM (`usage.prompt_tokens_details.cached_tokens`) and Anthropic (`cache_read_input_tokens`); cache-creation tokens are excluded because they are new tokens being written, not a hit.
 
 The HTTP call is fire-and-forget (async via `DispatchHttpCall`); it does not block the response to the client.
+
+### Locating a request
+
+Two ids are reported, because neither alone covers what a caller has in hand.
+
+`request_id` is Envoy's `x-request-id`. It exists for **every** tracked request — embeddings and TTS as much as chat, a stream cut halfway as much as one that finished, a request rejected before it ever reached a model — and it is the same value the Envoy access log already carries, so one quoted id resolves in both places. That is what makes it the id to key an audit lookup on.
+
+**It is not a unique key**, and a consumer storing it must index rather than constrain it. `x-request-id` identifies a *downstream request*, while this report is emitted once per filter-chain run — and a fallback pass is an internal redirect of the same downstream request, so two reports can legitimately carry one value. That is a feature for locating (both attempts surface under the id the caller holds) and a schema error waiting to happen for anyone who reaches for a `UNIQUE` column.
+
+It is not visible to the caller by default: Envoy only returns `x-request-id` downstream when the HCM sets `always_set_request_id_in_response`, which defaults to false. Rather than require an EnvoyFilter, the plugin writes the value onto the response itself under `requestIDResponseHeader` (default `X-GPUStack-Request-Id`). A distinct name rather than plain `x-request-id` because some upstreams put an `x-request-id` of their own on the response, and reusing the name would leave the caller unable to tell whose id they are holding. The header is set with Replace semantics, so the value read by the caller is always the one the report carries.
+
+The echo happens in the response-headers phase, so it also lands on a **local reply** — an `ext-auth` 401 carries the header even though [no usage row is written for it](#local-reply-responses-are-not-reported). Being able to quote an id for a refused request is worth more than keeping header and row in exact correspondence; the id still resolves in the access log.
+
+Which rejections those are follows from the filter order and is narrower than it looks. Envoy runs a local reply through the encoder filters *preceding* the one that raised it, and the encoder chain is the reverse of the request chain — so this phase is reached only for a reply raised by a plugin sitting after token-usage (`400`) in the request chain, i.e. at a lower priority: `gpustack-ext-auth` (`360`), `gpustack-ai-proxy` (`100`). A rejection from higher up — `gpustack-rate-limit` at `600` — preempts this plugin's request phase altogether, so such a request is never tracked and carries no header at all.
+
+`upstream_response_id` is what the caller actually reads off an SDK response (`chatcmpl-…`, `resp_…`, `msg_…`, and `embd-…` from a vLLM embeddings call), and the only id a third-party provider can be asked about. It is captured from the first response payload that carries one and short-circuited afterwards, so a stream pays one JSON probe rather than one per chunk.
+
+The probe is deliberately shape-agnostic: it takes any top-level string `id` rather than gating on the endpoint. An upstream that stamps an id on a response has given that response an id, and suppressing it because the path was `/v1/embeddings` would discard a locating id for exactly the endpoint where no other one exists. The one thing it does check is the JSON type — a numeric `id` is not taken, since gjson would render it as a plausible-looking string that means something else.
+
+The fourth path, DashScope's `request_id`, is a hedge rather than one that runs today. This plugin does **not** see raw provider bodies: Higress sorts wasm plugins by descending priority for the request chain and Envoy runs encoder filters in reverse of it, so on the response path `gpustack-ai-proxy` (priority `100`) runs *before* this plugin (`400`) and has already mapped Qwen's `request_id` onto `id`. What the probe covers is ai-proxy's `protocol: original`, a supported setting that forwards the provider body untouched — if it were ever turned on, the symptom would be this id silently disappearing. It is probed last so a converted body's own `id` always wins.
+
+**Caveat on `ttft_ms`.** It measures the first *response body chunk*, not the first *token*. For OpenAI that chunk is usually a role-only delta and for the Responses API it is `event: response.created`, so the value is a few milliseconds optimistic against a strict time-to-first-token. It is reported with those semantics on purpose: it is the number the client is already handed as `usage.time_to_first_token_ms`, and two figures under one name that disagree would be worse than one that is slightly loose about what it measures.
 
 ### Reliability of usage data
 
