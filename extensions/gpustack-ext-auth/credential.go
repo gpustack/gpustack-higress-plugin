@@ -253,6 +253,17 @@ type keyEntry struct {
 	// UserID backs the locally rebuilt consumer string. Cheaper than storing
 	// the assembled consumer on the largest structure in the config.
 	UserID int64 `json:"user_id"`
+	// Unrestricted says this key adds nothing to what its user may already
+	// reach: its scope admits inference and it names no allowed_model_names.
+	// Both halves of the server's own check, folded into one bit because the
+	// plugin has no use for the difference -- see authedSkipEligible.
+	//
+	// Absent means false, which means "ask the server", so a config written by
+	// a server that predates the field, or by one that has withdrawn it, costs
+	// a round trip rather than a wrong verdict. That direction is not
+	// negotiable: the inverse encoding would be cheaper in CR bytes and would
+	// turn every unrecognised key into an unrestricted one.
+	Unrestricted bool `json:"unrestricted"`
 }
 
 // expired reports whether the entry's lifetime has run out as of now.
@@ -272,6 +283,11 @@ func (e keyEntry) expired(now time.Time) bool {
 // not have.
 type refEntry struct {
 	Exp *int64 `json:"exp"`
+	// Unrestricted carries the same meaning as on keyEntry. A refs identity is
+	// only ever named by a marker or a cache hit, and both of those are
+	// resolved identities that may skip an authed route's authorization call,
+	// so the flag has to be readable from this table too.
+	Unrestricted bool `json:"unrestricted"`
 }
 
 func (e refEntry) expired(now time.Time) bool {

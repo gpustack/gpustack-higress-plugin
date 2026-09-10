@@ -6,8 +6,10 @@
 // credential over a small, slowly-changing table, so it is pushed down here.
 // Authorization spans key scope, user RBAC and route policy with no single
 // invalidation signal, so it stays on the server and is asked afresh per
-// request. Written against the upstream plugin rather than forked from it --
-// the request/response header contract is upstream's, the rest is not.
+// request -- except where the verdict collapses into facts the gateway already
+// holds, which is what localSkipConsumer decides. Written against the upstream
+// plugin rather than forked from it -- the request/response header contract is
+// upstream's, the rest is not.
 
 package main
 
@@ -26,9 +28,19 @@ import (
 
 const pluginName = "gpustack-ext-auth"
 
-// accessPolicyPublic is the one policy value the plugin understands. Every
-// other policy is the server's business and never reaches this config.
-const accessPolicyPublic = "public"
+// The two policy values the plugin understands, both of them route policies
+// whose verdict the gateway can reproduce.
+//
+// Every other policy is the server's business. `allowed_principals` turns on
+// per-principal grants the gateway holds no copy of, and a value from a server
+// newer than this build means nothing here at all -- neither matches, so both
+// fall through to the authorization call. That is the same rollback-safe rule
+// the digest prefixes follow: a value this build cannot name costs a round
+// trip, never a wrong verdict.
+const (
+	accessPolicyPublic = "public"
+	accessPolicyAuthed = "authed"
+)
 
 // anonymousConsumer is what the server records for a request it could not
 // authenticate. Must stay byte-identical to the literal in routes/token.py,
@@ -50,6 +62,11 @@ const (
 // never flushed, and the client sees a bare disconnect (bytes_sent=0,
 // response_flags=DC) instead of the status we chose. Always send something.
 var nonEmptyRejectionBody = []byte(`{"error":{"message":"Invalid authentication credentials","type":"invalid_request_error","code":401}}`)
+
+// warnedGlobalAccessPolicy keeps the report of a dropped global access_policy
+// to one line per VM. Per-worker duplication is acceptable; a line per request
+// is not.
+var warnedGlobalAccessPolicy bool
 
 func main() {}
 
@@ -176,6 +193,18 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// authorization dispatch is async, so pin the route before either happens.
 	ctx.DisableReroute()
 
+	// One line per VM, on the same reasoning as warnedMissingConnection. A
+	// policy in defaultConfig is a reconciler bug, and the symptom it would
+	// otherwise produce -- nothing, because the value is dropped -- gives an
+	// operator who wrote it no way to find out it did not take. Worth saying
+	// once; a line per request is not.
+	if config.AccessPolicyInGlobalBlock && !warnedGlobalAccessPolicy {
+		warnedGlobalAccessPolicy = true
+		log.Warnf("%s: defaultConfig declared an access_policy and it was ignored; "+
+			"a policy names one route, while the global block is inherited by every one of them",
+			pluginName)
+	}
+
 	// Drop any client-supplied caller identity before anything else can read it.
 	// Every path below either replaces this header with an authoritative value
 	// or does not touch it, so without this a client that sends its own
@@ -202,7 +231,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// Read once and threaded: the redirect pass both verifies a marker and
 	// mints a fresh one, so resolving it per use would double the host calls.
 	conn := downstreamConnection()
-	id := resolveIdentity(config, requestHeaders, conn, time.Now())
+	// One clock for the whole synchronous path. Every expiry compared here --
+	// the tiers', the skip decision's re-read of the same entry, the marker's --
+	// has to be answered against a single instant, or an entry can be live for
+	// one of them and dead for the next.
+	now := time.Now()
+	id := resolveIdentity(config, requestHeaders, conn, now)
 	if id.MarkerRejected {
 		log.Debugf("%s: an auth marker was present but did not verify; falling back to the credential",
 			pluginName)
@@ -231,8 +265,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 		}
 	}
 
-	if consumer, ok := publicSkipConsumer(config, id); ok {
-		return skipAuthz(config, id, consumer, extractHeader(requestHeaders, headerLLMModel), conn)
+	model := extractHeader(requestHeaders, headerLLMModel)
+	if consumer, ok := localSkipConsumer(config, id, model, now); ok {
+		return skipAuthz(config, id, consumer, model, conn, now)
 	}
 
 	// Debug rather than Info: this fires on every request that does call the
@@ -296,43 +331,96 @@ func matchesRoute(patterns []*regexp.Regexp, routeName string) bool {
 	return false
 }
 
-// publicSkipConsumer decides whether this request can be allowed without asking
+// localSkipConsumer decides whether this request can be allowed without asking
 // the server, and what consumer to record if so.
 //
-// On a public route the server evaluates no policy at all: scope,
+// Two route policies qualify, and for the same reason: the server's answer is
+// a constant function of things the gateway already holds, so the call is not
+// redundant only while the server is down -- it is redundant always.
+//
+// On a **public** route the server evaluates no policy at all: scope,
 // allowed_model_names and RBAC are skipped entirely, and even an unrecognised
-// credential is let through. The response is therefore a constant function of
-// the identity, and every bit of it is something the gateway already knows. The
-// call is not redundant only while the server is down -- it is redundant
-// always.
+// credential is let through. The answer depends on nothing but the identity.
 //
-// This is public-only on purpose, and the obvious extension -- skip the call on
-// an authed route too, since the caller is already authenticated locally -- is
-// deliberately not taken. There the server's answer is not a constant: it turns
-// on the key's scope, its allowed_model_names, and the user's RBAC against this
-// model, none of which is published to the edge, and none of which has the
-// single invalidation signal that let *authentication* move here exactly. That
-// is authorization, and it stays on the server by design. The availability the
-// skip would buy for authed routes is already had without moving it:
-// failure_mode_allow_authenticated serves an authenticated caller through an
-// outage, so the server call costs latency, not uptime.
+// On an **authed** route it evaluates two things and no more, and both are
+// facts about the key that the server publishes in the key's own entry -- see
+// authedSkipEligible for why the third thing it looks like it evaluates, the
+// user's RBAC against this model, is constant-true under this policy.
 //
-// `access_policy: public` is the whole control surface. There is deliberately no
-// second toggle: the field means exactly "you may allow here" to this plugin and
-// nothing else, so a config that declared a route public but then declined to
-// act on it would only be a way to carry a fact nobody reads. Whether a route
-// gets the field at all is the reconciler's call, per route.
+// What stays on the server is `allowed_principals`, where the verdict turns on
+// per-principal grants the gateway holds no copy of, and any key that is not
+// flagged unrestricted, where it turns on a model list this config does not
+// carry. Those are authorization proper, and they are asked afresh per request
+// as before.
 //
-// The limit is consumer fidelity, not safety. A `ref:` identity cannot be
-// rendered locally because a custom key's consumer embeds its access key, which
-// the `refs` table does not carry; guessing would corrupt the caller attribution
-// in the access log, so those go to the server as usual. Sending them is never
-// less strict -- the server would allow them too.
-func publicSkipConsumer(config PluginConfig, id identity) (string, bool) {
-	if config.AccessPolicy != accessPolicyPublic {
+// The route policy is the whole control surface: there is deliberately no
+// second toggle beside it, since a config that declared a route's policy and
+// then declined to act on it would only be a way to carry a fact nobody reads.
+// Whether a route gets the field at all is the reconciler's call, per route.
+//
+// The remaining limit is consumer fidelity, not safety. A `ref:` identity
+// cannot be rendered locally because a custom key's consumer embeds its access
+// key, which the `refs` table does not carry; guessing would corrupt the caller
+// attribution in the access log, so those go to the server as usual. Sending
+// them is never less strict -- the server would allow them too.
+func localSkipConsumer(config PluginConfig, id identity, model string, now time.Time) (string, bool) {
+	switch config.AccessPolicy {
+	case accessPolicyPublic:
+		// Nothing to establish: a public route asks nothing of the caller, so
+		// naming one is the whole test. The empty body falls through to
+		// localConsumer below -- Go does not fall into the next case.
+	case accessPolicyAuthed:
+		if !authedSkipEligible(config, id, model, now) {
+			return "", false
+		}
+	default:
 		return "", false
 	}
 	return localConsumer(id)
+}
+
+// authedSkipEligible reports whether an authed route's authorization verdict is
+// already settled by what the gateway holds.
+//
+// After authentication, /token-auth evaluates exactly two things on a
+// non-public route (routes/token.py):
+//
+//	inference_scope(request, user)                        -- the key's scope
+//	model_allowed_for_user(model_name, user.id, api_key)  -- model_name in
+//	    accessible_model_names(user) ∩ allowed_model_names(key), the second
+//	    term dropping out entirely when the key names no models
+//
+// `accessible_model_names` is what an authed policy settles. The
+// `non_admin_user_models` view cross-joins every live non-admin principal with
+// every route whose policy is PUBLIC or AUTHED, and an admin is handed every
+// route unconditionally -- so on a route with this policy the set contains it
+// for *every* caller, and the term is constant-true. It stays true for exactly
+// the callers this plugin can name, too: the tables exclude SYSTEM principals
+// and inactive or deleted ones, which is the same predicate the view carries.
+//
+// What is left is the key's own two restrictions, and the server publishes both
+// as one flag in the key's entry -- a key is unrestricted when its scope admits
+// inference and it names no model list. Folded into a single bit because the
+// plugin has no use for the difference: either the key adds nothing to its
+// user's reach, or the server has to be asked. The flag is re-derived on every
+// reconcile pass and rides the same immediate flush as a revocation, so a key
+// that gains a model list or loses inference scope stops qualifying on the same
+// push that would have withdrawn it altogether.
+//
+// The model header is required even though nothing here compares it. The
+// argument above substitutes "this route is authed" for the server's
+// "model_name is accessible", and the two are the same question only because
+// that header is what selected this route. Absent, the server answers 400 for
+// an authenticated caller, and forwarding is how it keeps doing so.
+//
+// Anonymity is excluded rather than merely unreachable: an authed route has no
+// anonymous callers to begin with, but "resolved, naming nobody" must never
+// reach a path that treats it as an authenticated identity.
+func authedSkipEligible(config PluginConfig, id identity, model string, now time.Time) bool {
+	if id.State != identityResolved || id.Anonymous || model == "" {
+		return false
+	}
+	return config.LocalAuth.unrestricted(id, now)
 }
 
 // localConsumer renders the consumer for an identity the gateway named itself,
@@ -367,19 +455,19 @@ func localConsumer(id identity) (string, bool) {
 // happens because /token-auth answers with a dummy value, so a skip that did not
 // reproduce it would silently start forwarding a credential that never used to
 // travel this far.
-func skipAuthz(config PluginConfig, id identity, consumer, model, conn string) types.Action {
-	// A public route makes no server call, so nothing else in the request path
+func skipAuthz(config PluginConfig, id identity, consumer, model, conn string, now time.Time) types.Action {
+	// A skipped route makes no server call, so nothing else in the request path
 	// logs anything: without this the plugin is indistinguishable from not being
 	// in the chain at all. The always-on signal is X-Mse-Consumer reaching the
 	// access log via ai-statistics; this line is for telling *which* tier
-	// resolved the caller when that needs diagnosing.
-	log.Debugf("%s: allowing %s locally on a public route, consumer %q",
-		pluginName, describeCaller(id), consumer)
+	// resolved the caller, and under which policy, when that needs diagnosing.
+	log.Debugf("%s: allowing %s locally on a %s route, consumer %q",
+		pluginName, describeCaller(id), config.AccessPolicy, consumer)
 	applyUpstreamRewrites(config, consumer)
 	// The server never runs on this path, so it can never mint the marker the
 	// fallback pass needs. If the plugin cannot sign either, the redirect has
 	// nothing to authenticate with.
-	applyMarker(config, id, model, consumer, conn, time.Now())
+	applyMarker(config, id, model, consumer, conn, now)
 	return types.ActionContinue
 }
 

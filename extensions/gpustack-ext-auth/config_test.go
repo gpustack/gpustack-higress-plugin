@@ -12,10 +12,10 @@ const globalConfigJSON = `{
   "local_auth": {
     "enabled": true,
     "keys": {
-      "3192253c1f4a9b7e": {"exp": 1790000000, "digest": "sha256$aa$bb", "user_id": 7},
+      "3192253c1f4a9b7e": {"exp": 1790000000, "digest": "sha256$aa$bb", "user_id": 7, "unrestricted": true},
       "b7d2e91045ac6f38": {"exp": null, "digest": "sha256$cc$dd", "user_id": 9}
     },
-    "refs": {"58": {"exp": null}, "77": {"exp": 1790000000}}
+    "refs": {"58": {"exp": null, "unrestricted": true}, "77": {"exp": 1790000000}}
   },
   "authz": {
     "endpoint": {"path": "/token-auth", "request_method": "GET", "service_name": "gpustack.static", "service_port": 80},
@@ -96,6 +96,16 @@ func TestGlobalConfigParsesEveryBlock(t *testing.T) {
 	if got := config.LocalAuth.Keys["b7d2e91045ac6f38"]; got.Exp != nil {
 		t.Error("an explicit null exp must mean never expires, not epoch zero")
 	}
+	// Absent must read as false on both tables: it is what sends a key the
+	// server has said nothing about to the server, which is the direction the
+	// whole flag depends on.
+	if !config.LocalAuth.Keys["3192253c1f4a9b7e"].Unrestricted ||
+		config.LocalAuth.Keys["b7d2e91045ac6f38"].Unrestricted {
+		t.Error("keys[].unrestricted not parsed, or absent did not read as false")
+	}
+	if !config.LocalAuth.Refs["58"].Unrestricted || config.LocalAuth.Refs["77"].Unrestricted {
+		t.Error("refs[].unrestricted not parsed, or absent did not read as false")
+	}
 	if config.Authz.Path != "/token-auth" || config.Authz.RequestMethod != "GET" {
 		t.Errorf("endpoint = %q %q", config.Authz.RequestMethod, config.Authz.Path)
 	}
@@ -147,6 +157,70 @@ func TestOverrideCanDeclarePublic(t *testing.T) {
 
 	if rule.AccessPolicy != "public" {
 		t.Errorf("access_policy = %q, want the case-folded %q", rule.AccessPolicy, "public")
+	}
+}
+
+// The rule-only contract for access_policy has to hold by construction, not by
+// the reconciler remembering: a `public` in defaultConfig is inherited by every
+// rule and would skip authorization on every route the gate claims.
+//
+// Dropped rather than rejected on purpose. An error from parseGlobalConfig is
+// recorded and stepped over by wasm-go's rule matcher as long as any rule
+// parses, and every rule is then laid over a zero-valued global -- which here
+// means an empty route gate, i.e. a plugin that matches nothing and a gateway
+// that authenticates nothing. Parsing must therefore succeed.
+func TestGlobalBlockCannotDeclareAnAccessPolicy(t *testing.T) {
+	for _, policy := range []string{accessPolicyPublic, accessPolicyAuthed} {
+		t.Run(policy, func(t *testing.T) {
+			var global PluginConfig
+			err := parseGlobalConfig(gjson.Parse(
+				`{"route_match_regexes":["^ns/ai-route-route-"],"access_policy":"`+policy+`"}`), &global)
+			if err != nil {
+				t.Fatalf("a global access_policy must not fail the parse: %v", err)
+			}
+			if global.AccessPolicy != "" {
+				t.Errorf("access_policy = %q; the global block must not carry one", global.AccessPolicy)
+			}
+			if !global.AccessPolicyInGlobalBlock {
+				t.Error("the drop went unrecorded, so nothing can report it")
+			}
+			if len(global.RouteMatchRegexes) != 1 {
+				t.Fatal("the rest of the global block must survive the drop")
+			}
+
+			// The inheriting rule is where the widening would actually land.
+			var rule PluginConfig
+			if err := parseOverrideRuleConfig(gjson.Parse(`{}`), global, &rule); err != nil {
+				t.Fatalf("parseOverrideRuleConfig: %v", err)
+			}
+			if rule.AccessPolicy != "" {
+				t.Fatalf("a rule inherited access_policy %q from the global block", rule.AccessPolicy)
+			}
+			if _, ok := localSkipConsumer(rule, identity{
+				State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7,
+			}, "my-org/qwen3-8b", markerNow()); ok {
+				t.Error("a global access_policy widened the skip to a route with no rule of its own")
+			}
+		})
+	}
+}
+
+func TestOverrideCanDeclareAuthed(t *testing.T) {
+	global := mustGlobal(t)
+
+	var rule PluginConfig
+	if err := parseOverrideRuleConfig(
+		gjson.Parse(`{"access_policy": "authed"}`), global, &rule); err != nil {
+		t.Fatalf("parseOverrideRuleConfig: %v", err)
+	}
+
+	if rule.AccessPolicy != accessPolicyAuthed {
+		t.Fatalf("access_policy = %q, want %q", rule.AccessPolicy, accessPolicyAuthed)
+	}
+	// The rule declares the policy; the key table it inherits is what decides
+	// whether any given caller may use it.
+	if len(rule.LocalAuth.Keys) != 2 {
+		t.Error("an authed rule must inherit the global key table")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/tidwall/gjson"
@@ -46,10 +47,21 @@ type PluginConfig struct {
 	// Patterns are not anchored implicitly; write `^` if that is what is meant.
 	RouteMatchRegexes []*regexp.Regexp
 
-	// AccessPolicy is "public" only on routes that carry a dedicated rule for
-	// it. Absent everywhere else, which is what makes a missing rule fail
-	// towards "authorize normally".
+	// AccessPolicy is the route's own policy, present only on routes that carry
+	// a dedicated rule for it. Absent everywhere else, which is what makes a
+	// missing rule fail towards "authorize normally" -- and equally what makes
+	// a policy this build does not recognise do the same.
+	//
+	// A rule is the only place it can be declared; parseGlobalConfig drops it.
 	AccessPolicy string
+
+	// AccessPolicyInGlobalBlock records that defaultConfig declared an
+	// access_policy and it was dropped. Reported rather than logged where it
+	// is found, for the same reason as identity.DigestUnusable: wasm-go's
+	// logger is a host call and panics without a proxy-wasm host, so a log
+	// line in the parser would put it out of reach of every unit test that
+	// parses a config.
+	AccessPolicyInGlobalBlock bool
 
 	LocalAuth       LocalAuth
 	Authz           Authz
@@ -91,6 +103,32 @@ type LocalAuth struct {
 	Enabled bool
 	Keys    map[string]keyEntry
 	Refs    map[string]refEntry
+}
+
+// unrestricted reports whether the key behind this identity is still live and
+// adds no restriction of its own to what its user may reach.
+//
+// A fresh lookup rather than a bit carried on the identity, for two reasons.
+// Tiers 0 and 2 name a caller without ever reading its entry -- a marker and a
+// cache entry both answer from what the server said earlier -- so reading the
+// flag here is the only place it can be read at all. And reading it from the
+// live table on every request is the same property that lets revocation work
+// with no invalidation step: an entry withdrawn or narrowed between two
+// requests stops qualifying on the next one.
+//
+// Expiry is re-checked for the same reason. The tier that named the caller has
+// already done it, but this function is what a reader has to trust on its own,
+// and the cost is a map lookup that already happened.
+func (l LocalAuth) unrestricted(id identity, now time.Time) bool {
+	if id.AccessKey != "" {
+		entry, ok := l.Keys[id.AccessKey]
+		return ok && !entry.expired(now) && entry.Unrestricted
+	}
+	if id.Ref == "" {
+		return false
+	}
+	entry, ok := l.Refs[id.Ref]
+	return ok && !entry.expired(now) && entry.Unrestricted
 }
 
 // Authz is the authorization call: endpoint, and which headers cross it in
@@ -161,7 +199,30 @@ func (a AuthCache) canSign() bool { return a.Header != "" && len(a.SigningKey) >
 // error -- rejecting it would leave the matcher with a zero-value global and
 // silently disable the plugin on every route.
 func parseGlobalConfig(raw gjson.Result, config *PluginConfig) error {
-	return parseInto(raw, config)
+	if err := parseInto(raw, config); err != nil {
+		return err
+	}
+	// A policy names one route, so the global block is the one place it cannot
+	// mean anything: every rule inherits what is here, and `public` would then
+	// skip authorization on every route the gate claims. Dropping it is what
+	// makes the README's rule-only contract hold by construction rather than by
+	// the reconciler remembering.
+	//
+	// Dropped rather than rejected, because rejecting is not available at this
+	// layer. wasm-go's rule matcher records a global parse error and carries on
+	// whenever any rule parses at all, leaving every rule to be parsed against
+	// a *zero-valued* global (matcher/rule_matcher.go, the `len(rules) == 0`
+	// branch is the only one that surfaces the error). For this plugin a zero
+	// global is an empty route gate -- the plugin then matches no route, which
+	// means declining to authenticate anything and letting the gateway serve
+	// every request unauthenticated. An error here would answer a
+	// misconfiguration that widens the skip with one that removes the plugin
+	// altogether.
+	if config.AccessPolicy != "" {
+		config.AccessPolicy = ""
+		config.AccessPolicyInGlobalBlock = true
+	}
+	return nil
 }
 
 // parseOverrideRuleConfig layers one rule's fields onto the global config.
@@ -278,9 +339,10 @@ func parseLocalAuth(raw gjson.Result, local *LocalAuth) error {
 				return false
 			}
 			keys[accessKey] = keyEntry{
-				Exp:    optionalUnixSeconds(entry.Get("exp")),
-				Digest: digest,
-				UserID: entry.Get("user_id").Int(),
+				Exp:          optionalUnixSeconds(entry.Get("exp")),
+				Digest:       digest,
+				UserID:       entry.Get("user_id").Int(),
+				Unrestricted: entry.Get("unrestricted").Bool(),
 			}
 			return true
 		})
@@ -292,7 +354,10 @@ func parseLocalAuth(raw gjson.Result, local *LocalAuth) error {
 	if v := raw.Get("refs"); v.IsObject() {
 		refs := make(map[string]refEntry)
 		v.ForEach(func(k, entry gjson.Result) bool {
-			refs[k.String()] = refEntry{Exp: optionalUnixSeconds(entry.Get("exp"))}
+			refs[k.String()] = refEntry{
+				Exp:          optionalUnixSeconds(entry.Get("exp")),
+				Unrestricted: entry.Get("unrestricted").Bool(),
+			}
 			return true
 		})
 		local.Refs = refs

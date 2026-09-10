@@ -1,8 +1,10 @@
 # gpustack-ext-auth
 
 Authenticates GPUStack API keys at the gateway and defers authorization to the
-GPUStack server. Replaces upstream `ext-auth` on GPUStack inference routes; the
-request/response header contract is upstream's, the configuration shape is not.
+GPUStack server, except where the server's verdict is a constant of what the
+gateway already holds. Replaces upstream `ext-auth` on GPUStack inference
+routes; the request/response header contract is upstream's, the configuration
+shape is not.
 
 Rationale and trade-offs live in the GPUStack design doc
 `designs/API-Key认证简化设计.md`; implementation hazards live in the code
@@ -12,7 +14,7 @@ comments. This file documents configuration.
 
 Implemented: the authorization call, the route gate, marker verification
 and minting, local key authentication, the verification cache, identity
-assertion, local allow on public routes, and a narrow fail-open for
+assertion, local allow on public and authed routes, and a narrow fail-open for
 authenticated callers.
 
 The verification cache needs the server to return `X-GPUStack-Key-Ref` on the
@@ -46,6 +48,7 @@ spec:
           exp: 1790000000 # Unix seconds; null or absent means never
           digest: "s128$<salt>$<hash>"
           user_id: 7
+          unrestricted: true # absent means false, i.e. ask the server
       refs:
         "58": { exp: null } # keyed by api_keys.id
 
@@ -77,14 +80,21 @@ spec:
     status_on_error: 403
     failure_mode_allow_authenticated: false
 
-  # One entry per public route. Non-public routes need none: they fall back to
-  # defaultConfig, which the route gate has already claimed.
+  # One entry per route whose policy the gateway can act on, which is every
+  # public and every authed route. A route with any other policy needs none: it
+  # falls back to defaultConfig, which the route gate has already claimed, and
+  # is authorized per request as before.
   matchRules:
     - ingress:
         - <namespace>/ai-route-route-42.internal
         - <namespace>/ai-route-route-42.fallback.internal
       config:
         access_policy: public
+    - ingress:
+        - <namespace>/ai-route-route-43.internal
+        - <namespace>/ai-route-route-43.fallback.internal
+      config:
+        access_policy: authed
 ```
 
 ## Fields
@@ -92,8 +102,9 @@ spec:
 | Field | Meaning |
 | --- | --- |
 | `local_auth.enabled` | Master switch for local authentication. Off ⇒ every request forwards its credential to the server, as before. |
-| `local_auth.keys` | `access_key` → `{exp, digest, user_id}`. Drives authentication, expiry and revocation. |
-| `local_auth.refs` | `api_keys.id` → `{exp}`. Validity index only; cannot verify a credential, but gates and invalidates the verification cache. |
+| `local_auth.keys` | `access_key` → `{exp, digest, user_id, unrestricted}`. Drives authentication, expiry and revocation. |
+| `local_auth.refs` | `api_keys.id` → `{exp, unrestricted}`. Validity index only; cannot verify a credential, but gates and invalidates the verification cache. |
+| `local_auth.keys.*.unrestricted`, `local_auth.refs.*.unrestricted` | Same field on either table: the key adds nothing to its user's own reach, i.e. its scope admits inference and it names no `allowed_model_names`. Absent means false. Read only on an `authed` route. |
 | `authz.endpoint` | `/token-auth` location. `service_name` and `path` are required. |
 | `authz.endpoint_mode` | Optional; `forward_auth` is the only accepted value. An explicit `envoy` is rejected at parse time. |
 | `authz.timeout` | Milliseconds, default 1000. |
@@ -107,7 +118,7 @@ spec:
 | `failure_mode_allow` | Allow **everything** when the authorization service fails, credentialed or not. Default false. |
 | `failure_mode_allow_authenticated` | Allow only callers the plugin resolved locally when the service fails. Default false. |
 | `route_match_regexes` | Route names this plugin owns. Empty or absent matches nothing. Not anchored implicitly. |
-| `matchRules[].config.access_policy` | `public` on public routes only. |
+| `matchRules[].config.access_policy` | The route's own policy, `public` or `authed`. Any other value, and absence, mean "authorize at the server". |
 
 `local_auth`, `authz`, `auth_cache`, `upstream_request` may all be overridden per
 rule; a rule inherits whatever it does not redeclare. Redeclaring `keys` /
@@ -130,7 +141,16 @@ usual shape; the namespace prefix is present only when the ingresses live
 outside the gateway's own namespace.
 
 `access_policy` must still appear only on a rule, never in `defaultConfig` —
-there it would declare every route public.
+there it would declare every route's policy to be one route's. The plugin
+enforces this rather than trusting it: `parseGlobalConfig` drops the field and
+reports the drop once per VM at `warn`.
+
+It is dropped rather than rejected because rejecting is not available at that
+layer. wasm-go's rule matcher records a global parse error and carries on as
+long as any rule parses, laying every rule over a *zero-valued* global — which
+here means an empty `route_match_regexes`, so the plugin matches no route and
+the gateway authenticates nothing. Answering a config that widens the skip with
+one that removes the plugin outright would be the worse of the two.
 
 ### How a caller is named
 
@@ -146,6 +166,62 @@ step of its own — removing the entry is the whole of it.
 | 3 | No credential at all, public route | Anonymous access |
 
 Anything still unnamed goes to the server with its credential, as before.
+
+### When the authorization call is skipped
+
+Naming the caller is authentication. Whether the call happens at all is a
+separate question, and it has one answer: skip it exactly where the server's
+verdict is a constant of things the gateway already holds. Two route policies
+qualify, and nothing else does.
+
+**`public`** — the server evaluates no policy at all. Scope,
+`allowed_model_names` and RBAC are all skipped, and even an unrecognised
+credential is let through as consumer `none`.
+
+**`authed`**, for a caller whose key is marked `unrestricted`. After
+authentication `/token-auth` evaluates exactly two things on a non-public route:
+
+```python
+inference_scope(request, user)                        # the key's scope
+model_allowed_for_user(model_name, user.id, api_key)  # model_name in
+    # accessible_model_names(user) ∩ allowed_model_names(key)
+```
+
+The second term is what the policy settles. `non_admin_user_models` cross-joins
+every live non-admin principal with every `PUBLIC`/`AUTHED` route, and an admin
+is handed every route unconditionally — so on a route with this policy the
+accessible set contains it for *every* caller, and the term is constant-true.
+It stays true for exactly the callers this plugin can name: the tables exclude
+SYSTEM principals and inactive or deleted ones, which is the same predicate that
+view carries.
+
+What is left is the key's own two restrictions, and `unrestricted` is both of
+them folded into one bit — the plugin has no use for the difference, since
+either the key adds nothing to its user's reach or the server has to be asked.
+
+The flag is re-read from the live table on every request, never carried on a
+marker or a cache entry, so a key that gains an `allowed_model_names` or loses
+inference scope stops qualifying on the config push that records it, exactly as
+a revoked key stops authenticating. That is why a marker minted while the flag
+was set does not outlive it: tier 0 names the caller, and the table decides what
+they may do.
+
+`allowed_principals` routes are what remain on the server. There the verdict
+turns on per-principal grants that are not published to the edge and have no
+single invalidation signal — that is authorization proper, and it stays where it
+was. So does any key without the flag.
+
+The model header is required for an authed skip even though nothing compares
+it. The argument above substitutes "this route is authed" for the server's
+"`model_name` is accessible", and the two are the same question only because
+that header is what selected this route; with none the server answers 400, and
+forwarding is how it keeps doing so. A public skip asks nothing of the model, so
+it does not require the header.
+
+The remaining limit is consumer fidelity, not safety: a `ref:` identity with no
+marker or cache entry behind it cannot be rendered locally, because a custom
+key's consumer embeds an access key `refs` does not carry. Those go to the
+server, which would have allowed them too.
 
 ### A marker is only honoured on the connection it was minted on
 
@@ -273,6 +349,68 @@ deployment allows custom keys to be authenticated here, and in `refs` otherwise.
 Nothing in this plugin tests for it. An entry with a digest is verified, one
 without is only checked for validity, and that is the whole of the rule.
 
+### `unrestricted`
+
+Set it on an entry, in either table, when the key's own two restrictions are
+both absent:
+
+```python
+(PermissionScope.ALL in key.scope or PermissionScope.INFERENCE in key.scope)
+and not key.allowed_model_names
+```
+
+Nothing else belongs in it — not the user's admin status, not the route. It is a
+property of the key alone, which is what makes it re-derivable on every pass
+from the key's own row.
+
+Two directions matter. It is **positive**: absent means "ask the server", so a
+reconciler that predates the field, or a rollback to one, costs a round trip
+rather than a wrong verdict. And withdrawing it is a **tightening**, in the same
+class as a revocation or a route losing `PUBLIC` — it must flush immediately
+rather than ride the next tick, because on a skipped route nothing else asks the
+server whether the key still qualifies.
+
+It costs exactly 20 bytes (`,"unrestricted":true`) on an entry that is otherwise
+105–122, so emit it only when true — but size the budget as though every entry
+carries it, because in a default deployment nearly every one does: a new API key
+has scope `["*"]` and no `allowed_model_names`, which is precisely the predicate.
+`KEY_ENTRY_BYTES` therefore has to move from 115 to 135. Under-sizing does not
+merely publish fewer keys; it lets the CR outgrow the budget that keeps it under
+etcd's object limit, and a refused write freezes the tables — which stops
+revocations propagating.
+
+A key left out of the tables still works; it authenticates at the server on
+every request.
+
+### Route rules
+
+A route gets a `matchRules` entry when its policy is `PUBLIC` or `AUTHED`, and
+the entry carries that policy verbatim.
+
+`AUTHED` is the default policy, so this is close to one entry per model route
+rather than the handful `PUBLIC` produced — **and that invalidates the reason
+`split_cr_budget` serves routes before keys.** Its premise is that routes are
+"orders of magnitude fewer of them (one per public model, against one per API
+key), so in any realistic mix the keys absorb the variation". Once every route
+emits a rule that is no longer true, and because routes are served first the key
+table is what gets squeezed: at ~170 bytes a rule against a 1.1 MB budget,
+2000 routes cut the key table by 41% and ~6500 routes reduce it to nothing.
+
+The two overflows are also no longer equivalent, which is the other half of the
+argument. A route past the budget loses only its authorization skip — its
+callers still authenticate locally and the server evaluates policy as it does
+today. A key past the budget loses local authentication too, so every one of its
+requests carries a credential to the server. Losing a `PUBLIC` rule is the
+expensive one, since a public route with no rule needs a live server even for
+anonymous traffic.
+
+The ordering that follows is `PUBLIC` rules → key entries → `AUTHED` rules,
+rather than all rules → key entries.
+
+Losing either policy is a tightening and flushes immediately, for the same
+reason as a withdrawn `unrestricted`: the route is being skipped, so the server
+has no other chance to say no.
+
 ### Digest constructions
 
 Two are accepted, distinguished by the value's own prefix.
@@ -304,7 +442,9 @@ and keep working, silently, at 2^64.
 Length matters because this table ships inside a WasmPlugin CR, and etcd caps an
 object at ~1.5 MiB: 60 characters instead of 104 is the difference between
 roughly 6000 and 8600 keys authenticating at the gateway rather than at the
-server.
+server. Both figures shrink by about 15% once entries carry `unrestricted`,
+which does not change the comparison — the 44 bytes the truncation saves are
+still more than twice what the flag costs.
 
 A prefix rather than a config field is also what keeps a rollback safe. An older
 gateway reading a value it cannot name falls through to the server; one that
@@ -320,11 +460,13 @@ would. That distinction is the whole point: a wrong length means the writer and
 this build disagree about the construction, and spending a permanent 401 on that
 would take out every key written that way at once.
 
-A public route's `matchRules` entry must list **both** ingress names, primary and
+Every `matchRules` entry must list **both** ingress names, primary and
 `.fallback`; `route_ingress_names_for_plugins` returns both. The route gate must
-cover both too, which the shared `ai-route-route-` prefix already does. A route emitting
-`access_policy: public` must also have `auth_cache.signing_key` configured,
-otherwise its fallback pass goes back to needing a live server.
+cover both too, which the shared `ai-route-route-` prefix already does. A route
+emitting either `access_policy` must also have `auth_cache.signing_key`
+configured, otherwise its fallback pass goes back to needing a live server —
+that pass is the one where `Authorization` has already been replaced, so the
+marker is the only surviving statement of identity.
 
 `auth_cache.signing_key` must be a dedicated derived key —
 `hmac(jwt_secret_key, b"gateway-auth-cache").hexdigest()` — never
@@ -355,19 +497,23 @@ reach another until the server returns. The blanket form additionally admits
 callers carrying no credential at all, which on an internet-facing gateway turns
 an outage into an open inference proxy.
 
-Public routes are unaffected: they never call the server.
+Skipped requests are unaffected: they never call the server. An authed route
+whose callers all hold unrestricted keys therefore rides out an outage with no
+flag set at all, which is the availability `failure_mode_allow_authenticated`
+buys for everyone else.
 
 ## Observability
 
-A public route makes no server call, so nothing in the request path logs
+A skipped request makes no server call, so nothing in the request path logs
 anything by default — the plugin looks the same as if it were not in the chain.
 Two signals exist:
 
 - **Always on:** `X-Mse-Consumer` reaches the access log via ai-statistics. A
-  correct consumer on a public-route request is proof the plugin ran and named
-  the caller.
+  correct consumer on a skipped request is proof the plugin ran and named the
+  caller.
 - **At `debug`:** one line per request naming which tier resolved the caller and
-  whether the call was skipped, asserted or credential-forwarding.
+  whether the call was skipped — and under which policy — asserted, or
+  credential-forwarding.
 
 Fail-open is logged at `warn` whenever it fires, since a request served without
 a verdict is worth seeing without turning the level up. Rejections carry a

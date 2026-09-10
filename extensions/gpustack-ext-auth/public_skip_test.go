@@ -11,6 +11,13 @@ func publicSkipConfig() PluginConfig {
 	return config
 }
 
+// publicSkip is the skip decision under the public policy. The model and the
+// clock are threaded because the authed policy turns on them; on this path
+// neither is read, which TestPublicSkipDoesNotRequireTheModelHeader pins.
+func publicSkip(config PluginConfig, id identity) (string, bool) {
+	return localSkipConsumer(config, id, "my-org/qwen3-8b", markerNow())
+}
+
 // The consumer the plugin builds must equal the server's, byte for byte:
 // ai-statistics writes it into the access log, so a divergence silently
 // splits one caller's traffic across two identities depending on whether the
@@ -18,7 +25,7 @@ func publicSkipConfig() PluginConfig {
 //
 //	'.'.join([access_key, f"gpustack-{user.id}"])   -- routes/token.py
 func TestPublicSkipConsumerMatchesServerFormat(t *testing.T) {
-	got, ok := publicSkipConsumer(publicSkipConfig(), identity{
+	got, ok := publicSkip(publicSkipConfig(), identity{
 		State:     identityResolved,
 		AccessKey: "3192253c1f4a9b7e",
 		UserID:    7,
@@ -34,7 +41,7 @@ func TestPublicSkipConsumerMatchesServerFormat(t *testing.T) {
 func TestPublicSkipConsumerReplaysMarkerClaim(t *testing.T) {
 	// A ref identity cannot be rendered locally, but a marker carries the
 	// consumer the server itself produced, so replaying it is exact.
-	got, ok := publicSkipConsumer(publicSkipConfig(), identity{
+	got, ok := publicSkip(publicSkipConfig(), identity{
 		State:    identityResolved,
 		Ref:      "58",
 		Consumer: "custom-consumer.gpustack-9",
@@ -85,7 +92,7 @@ func TestPublicSkipDeclines(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if consumer, ok := publicSkipConsumer(tc.config(), tc.id); ok {
+			if consumer, ok := publicSkip(tc.config(), tc.id); ok {
 				t.Errorf("skipped with consumer %q, but should have called the server. %s", consumer, tc.why)
 			}
 		})
@@ -107,7 +114,7 @@ func TestPublicSkipSurvivesFallbackPass(t *testing.T) {
 	if id.State != identityResolved {
 		t.Fatalf("tier 0 failed on the fallback pass: %+v", id)
 	}
-	consumer, ok := publicSkipConsumer(config, id)
+	consumer, ok := publicSkip(config, id)
 	if !ok {
 		t.Fatal("a marker-resolved identity on a public route must still skip")
 	}
@@ -116,11 +123,23 @@ func TestPublicSkipSurvivesFallbackPass(t *testing.T) {
 	}
 }
 
+// The authed skip requires the model header, because there the route policy
+// stands in for the server's check that the model is one this caller may reach,
+// and the header is what makes those the same question. Public asks nothing of
+// the model at all, so requiring it there would withdraw a skip that has always
+// been granted.
+func TestPublicSkipDoesNotRequireTheModelHeader(t *testing.T) {
+	tier1 := identity{State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7}
+	if _, ok := localSkipConsumer(publicSkipConfig(), tier1, "", markerNow()); !ok {
+		t.Error("a public route stopped skipping when the model header was absent")
+	}
+}
+
 // Absent access_policy is the state every non-public route is in, so this is
 // the branch that keeps the skip off everywhere it has not been granted.
 func TestGlobalConfigCarriesNoAccessPolicy(t *testing.T) {
 	global := mustGlobal(t)
-	if _, ok := publicSkipConsumer(global, identity{
+	if _, ok := publicSkip(global, identity{
 		State: identityResolved, AccessKey: "3192253c1f4a9b7e", UserID: 7,
 	}); ok {
 		t.Error("the global block must never grant a local allow; only a dedicated rule may")
@@ -150,7 +169,7 @@ func TestPublicRouteDoesNotLocallyRejectABadSecret(t *testing.T) {
 	// request goes to the server, which allows it as anonymous.
 	nonPublic := publicSkipConfig()
 	nonPublic.AccessPolicy = ""
-	if _, ok := publicSkipConsumer(nonPublic, identity{State: identityUnresolved}); ok {
+	if _, ok := publicSkip(nonPublic, identity{State: identityUnresolved}); ok {
 		t.Error("an unresolved identity must never skip the authorization call")
 	}
 }
@@ -166,7 +185,7 @@ func TestAnonymousRequestOnPublicRouteIsAllowedLocally(t *testing.T) {
 		t.Fatalf("an uncredentialed request to a public route must resolve as anonymous, got %+v", id)
 	}
 
-	consumer, ok := publicSkipConsumer(publicSkipConfig(), id)
+	consumer, ok := publicSkip(publicSkipConfig(), id)
 	if !ok {
 		t.Fatal("an anonymous identity on a public route must skip the authorization call")
 	}
