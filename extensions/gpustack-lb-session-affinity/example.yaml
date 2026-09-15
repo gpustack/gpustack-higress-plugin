@@ -1,0 +1,73 @@
+# Deployment example for gpustack-lb-session-affinity.
+#
+# It is just one more CR on the capability band: install it and it joins the
+# weighted sum, remove it and the remaining entries decide on their own.
+# **No change to any gpustack-lb configuration is needed.**
+#
+# Prerequisite: this route already carries the two gpustack-lb CRs, mode:
+# context (795) and mode: finisher (700), and the context one has candidates
+# configured.
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-lb-session-affinity
+  namespace: higress-system
+spec:
+  phase: AUTHN
+  # Must land between 795 (publish the candidates) and 700 (make the decision).
+  # Within that range the exact value carries no meaning: the opinions are
+  # combined by weighted sum, so ordering does not affect the outcome. Use
+  # `weight` to change how much say this plugin has.
+  priority: 780
+  url: oci://<registry>/<org>/gpustack-lb-session-affinity:0.1.0
+
+  # ⚠️ sessionKeys has no safe default (omitting it makes parseConfig fail) and
+  # it is **not inherited**: every matchRule has to carry its own copy, even
+  # when defaultConfig already has one. A chain in defaultConfig only covers
+  # routes that are absent from matchRules -- a matchRule without sessionKeys
+  # fails to parse rather than falling back to the global chain.
+  #
+  # So there are two coherent shapes, and mixing them is the thing to avoid:
+  #
+  #   per-route  defaultConfigDisable: true, every route declares its own chain
+  #   global     a chain in defaultConfig and no matchRules at all
+  #
+  # This example uses the first.
+  defaultConfigDisable: true
+
+  matchRules:
+    - ingress:
+        - ai-route-route-2.internal
+      config:
+        # An ordered chain of candidates; the **first one that yields a value**
+        # wins. One gateway serves several client types and they each mark
+        # sessions with a different field, which is why this is a chain rather
+        # than a single source.
+        sessionKeys:
+          # ── Header sources: free, never buffer the body ──
+          - header: session_id            # Codex's native routing signal
+          - header: x-client-request-id   # its companion
+
+          # ── Body sources: buffer one copy of the body, bounded by
+          #    enableOnPathSuffix ──
+          # OpenAI's cache routing key. Its declared purpose is "route me to the
+          # same cache", which is exactly what this plugin does -- effectively
+          # the client doing prefix affinity for you.
+          - bodyKey: prompt_cache_key
+
+          # ⚠️ Anthropic's is **user-level**, not session-level (the official
+          # semantics are abuse detection; in practice it is used to carry a
+          # session UUID). Using it as the affinity key pins all of one user's
+          # sessions to the same instance: still a net win for cache hits, but
+          # coarser for balancing. If you are not sure how your clients fill it
+          # in, leave this one off for now.
+          # - bodyKey: metadata.user_id
+
+          # previous_response_id is deliberately absent: llama.cpp was measured
+          # returning a hard 400 for it (see the README). vLLM untested.
+
+        # Only applies to body sources. Defaults to ["/responses", "/messages"],
+        # which **deliberately excludes /chat/completions** -- the hottest path,
+        # with no known standard session key on it, so buffering the body there
+        # is a pure loss.
+        # enableOnPathSuffix: ["/responses", "/messages"]

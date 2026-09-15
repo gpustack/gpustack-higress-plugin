@@ -1,0 +1,52 @@
+# Deployment example for gpustack-lb-least-load.
+#
+# Priority within the capability band carries no meaning -- the opinions are
+# combined by weighted sum, so who writes first does not change the result. To
+# change how much say this plugin has, change its `weight`, not its priority.
+# The conventional ordering is simply:
+#
+#   780  session-affinity
+#   760  prefix (enterprise edition)
+#   740  least-load
+#
+# Prerequisite: this route already carries the two gpustack-lb CRs, mode:
+# context (795) and mode: finisher (700), and the context one has candidates
+# configured.
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-lb-least-load
+  namespace: higress-system
+spec:
+  phase: AUTHN
+  priority: 740
+  url: oci://<registry>/<org>/gpustack-lb-least-load:0.1.0
+  defaultConfigDisable: false
+
+  # Shape one (recommended): on globally, off for a few routes.
+  # Installing it takes effect on every route with LB enabled -- routes without
+  # LB find no candidate set, so the plugin passes straight through and needs no
+  # configuration for them at all.
+  defaultConfig:
+    enabled: true
+
+  matchRules:
+    # A route that does not want load awareness (say it has a single instance,
+    # or it needs predictable round-robin).
+    - ingress:
+        - ai-route-route-9.internal
+      config:
+        enabled: false
+
+  # Shape two: off globally, on for a few routes. Replace the above with --
+  #   defaultConfig:
+  #     enabled: false
+  #   matchRules:
+  #     - ingress: [ai-route-route-2.internal]
+  #       config: { enabled: true }
+  #
+  # defaultConfigDisable: true on the CR achieves something similar, but that is
+  # a **deployment-level** switch (the plugin does not run at all on routes not
+  # listed in matchRules) whereas enabled is a **config-level** one -- a single
+  # matchRule can list many ingresses, and flipping one boolean reviews more
+  # easily than adding and removing entries.

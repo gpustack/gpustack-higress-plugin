@@ -1,0 +1,127 @@
+# Deployment example for gpustack-lb: one image, two CRs, plus the EnvoyFilter
+# it depends on.
+#
+# The two CRs are structurally necessary -- the capability plugins
+# (session-affinity / least-load / prefix) have to run between "publish the
+# candidates" and "make the decision", and one filter instance cannot be in two
+# places in the chain at once. The role is chosen by defaultConfig.mode.
+#
+# ⚠️ candidates and the cluster_header patch must be rolled out together and
+#    withdrawn together. With only the former, the plugin rewrites the model
+#    name for the candidate it picked while Envoy still rolls its own dice, and
+#    the two can disagree -- completely silently.
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  # In a real deployment keep the name gpustack-model-mapper: the config
+  # location is unchanged, which makes this an in-place upgrade -- on non-LB
+  # routes this role behaves exactly as model-mapper did.
+  name: gpustack-model-mapper
+  namespace: higress-system
+spec:
+  phase: AUTHN
+  priority: 795
+  url: oci://<registry>/<org>/gpustack-lb:0.1.0
+  defaultConfigDisable: false
+  # mode belongs in defaultConfig: Higress applies defaultConfig to routes not
+  # listed in matchRules as well, so it cannot be turned off by omission.
+  defaultConfig:
+    mode: context
+    modelMapping: {}
+    health:
+      # The global config location. matchRules inherit this when they do not
+      # set it, and override it when they do. Deployment-level knobs (mode /
+      # health.failOpen) are inherited; topology (candidates / modelMappers /
+      # modelMapping) is not -- the latter is per-route by definition.
+      failOpen: true
+
+  matchRules:
+    - ingress:
+        - ai-route-route-2.internal
+      config:
+        mode: context
+        # Whether candidates is present decides whether this route does LB.
+        candidates:
+          # Cluster names must be the verbatim values from /clusters; an
+          # instance rebuild changes the name:
+          #   kubectl -n higress-system exec deploy/higress-gateway -- \
+          #     curl -s 'localhost:15000/clusters?format=json' \
+          #     | jq -r '.cluster_statuses[].name'
+          - cluster: "outbound|80||model-2-12.static"
+            targetId: "2"
+            kind: instance
+            weight: 70            # the presence of the field is the criterion
+            maxRunningRequests: 8 #   switch: weight -> weighted dice roll;
+          - cluster: "outbound|80||model-3-4.static"
+            targetId: "3"
+            kind: instance
+            weight: 30            #   none at all -> capability plugins score,
+                                  #   then round-robin
+        # Kept apart from candidates: adding a model alias should not touch
+        # candidates, and adjusting a weight should not touch the mapping table.
+        # Keys within a group use model-mapper syntax (exact / "prefix*" / "*").
+        modelMappers:
+          "2":
+            "gpt-4o": "qwen3-32b"
+            "gpt-*": "qwen3-8b"
+          "3":
+            "*": "deepseek-v3"
+        # health.failOpen is inherited from defaultConfig; only write it to turn
+        # it off for this route alone. This role also recognises nothing under
+        # health but failOpen -- the windows all live in the finisher.
+        # health:
+        #   failOpen: false
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-lb
+  namespace: higress-system
+spec:
+  phase: AUTHN
+  priority: 700
+  url: oci://<registry>/<org>/gpustack-lb:0.1.0
+  defaultConfigDisable: false
+  # **No matchRules**: the config is entirely deployment-level, and "does this
+  # route do LB" exists in exactly one place, the context role. With no
+  # candidate set to read, the request passes through untouched.
+  defaultConfig:
+    mode: finisher
+    health:
+      unhealthyThreshold: 3
+      cooldownMs: 10000
+      # rampMs defaults to cooldownMs
+    maxInflightAgeMs: 600000
+    reject:
+      status: 503
+      message: "no healthy model instance available"
+---
+# Make this route take its cluster from a request header. route.name must match
+# exactly (Istio's route name matching has no prefix semantics, and there is
+# **no namespace prefix** here):
+#   kubectl exec -n higress-system deploy/higress-gateway -- \
+#     curl -s 'localhost:15000/config_dump?resource=dynamic_route_configs' \
+#     | grep -o '"name": *"ai-route-[^"]*"' | sort -u
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: gpustack-lb-route-2
+  namespace: higress-system
+spec:
+  configPatches:
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: ai-route-route-2.internal
+      patch:
+        # MERGE is additive: istio's own patch and ours were measured coexisting
+        # (route.metadata ends up with istio and gpustack filter_metadata side
+        # by side).
+        operation: MERGE
+        value:
+          route:
+            cluster_header: x-higress-target-cluster

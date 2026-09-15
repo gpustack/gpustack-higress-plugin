@@ -2,6 +2,9 @@ go 1.24.4
 
 use (
 	./extensions/gpustack-ai-proxy
+	./extensions/gpustack-lb
+	./extensions/gpustack-lb-least-load
+	./extensions/gpustack-lb-session-affinity
 	./extensions/gpustack-ext-auth
 	./extensions/gpustack-generic-proxy-router
 	./extensions/gpustack-model-mapper
