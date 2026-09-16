@@ -444,7 +444,9 @@ NVIDIA Triton Interference Server 所对应的 type 为 triton。它特有的配
 1. 每个 `role: "tool"` 消息的 `tool_call_id`，必须能在**之前**某个 `assistant.tool_calls[]` 的 `id` 中找到；
 2. 带 `tool_calls` 的 assistant 消息之后，必须紧接着每个调用各一条 tool 消息；在全部回应完之前不允许出现其它 role；
 3. 同一个请求内 `tool_call_id` 不可重复；
-4. `assistant.tool_calls[].id` 不可重复。
+4. `assistant.tool_calls[].id` 不可重复；
+5. `tool_calls[].id` 与 `tool_call_id` 都必须是**非空 JSON 字符串** —— 缺失、`null`、数字都视为畸形。
+   （否则 gjson 会把「缺失」和 `null` 都读成 `""`、把数字读成它的十进制，两边刚好能配上而蒙混过关。）
 
 规则 4 实际按**整个请求**判重，比字面表述更严格：如果两轮 assistant 复用同一个 `id`，回应它们的
 tool 消息必然让 `tool_call_id` 重复，本来就会被规则 3 拒掉；在**签发** id 的位置报错，错误信息更有指向性。
@@ -475,7 +477,8 @@ tool 消息必然让 `tool_call_id` 重复，本来就会被规则 3 拒掉；�
 
 ### 日志与指标
 
-每次拦截都会打印一条 WARN 日志，包含命中的规则、出错的消息下标与 `tool_call_id`。
+每次拦截都会打印一条 WARN 日志，包含命中的规则、`model`、`consumer`（`x-mse-consumer`）以及出错的
+消息下标与 `tool_call_id`。
 
 同时递增计数器 `gpustack_ai_proxy_tool_call_pairing_rejected_total`，stat 名遵循 Higress AI 插件约定：
 
@@ -483,11 +486,17 @@ tool 消息必然让 `tool_call_id` 重复，本来就会被规则 3 拒掉；�
 route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpustack_ai_proxy_tool_call_pairing_rejected_total.rule.<rule>
 ```
 
-其中 `ai_route`、`ai_cluster` 由 Higress 自带的 stats_tags 自动提取为 Prometheus label；
-`model`、`consumer`（即 `x-mse-consumer`，用于定位到具体 API Key）、`rule` 保留在 stat 名中，
-需要时可在 Prometheus 侧用 `metric_relabel_configs` 拆成 label。
+其中 `ai_route`、`ai_cluster` 由 Higress 自带的 stats_tags 自动提取为 Prometheus label；`rule` 保留在
+stat 名中，需要时可在 Prometheus 侧用 `metric_relabel_configs` 拆成 label。
 
-`rule` 的取值为：`orphan_tool_message`、`unanswered_tool_calls`、`duplicate_tool_call_id`、`duplicate_tool_calls_id`。
+`rule` 的取值为：`orphan_tool_message`、`unanswered_tool_calls`、`duplicate_tool_call_id`、
+`duplicate_tool_calls_id`、`invalid_tool_call_id`、`invalid_tool_calls_id`。
+
+**指标上的 label 全部由配置决定，不含任何请求可控的值** —— stat 名里的 `model.`/`consumer.` 槽位固定填
+`none`（保留槽位是因为 Higress 的 stats_tags 正则靠这两个字面分隔符来提取 `ai_route`/`ai_cluster`）。
+被拒的请求很廉价（400、不回源），如果把 `model`（来自请求体）或 `x-mse-consumer`（前面没有 key-auth 的
+路由上客户端可自行设置）做成 label，调用方就能按请求数无限增长 Envoy 的 stat 注册表和插件内的 counter 缓存。
+定位到具体 API Key 的诉求由上面那条 WARN 日志承担 —— 日志是只追加的，不存在这个问题。
 
 ### 开销
 

@@ -411,6 +411,10 @@ This plugin runs a purely structural check on the request path, positioned as a
    `tool` message per call; no other role may appear until all of them are answered.
 3. `tool_call_id` must not repeat within a request.
 4. `assistant.tool_calls[].id` must not repeat.
+5. Both `tool_calls[].id` and `tool_call_id` must be **non-empty JSON strings** -- a
+   missing field, a `null` or a number is malformed. (Otherwise gjson renders a missing
+   field and a `null` alike as `""`, and a number as its digits, on both sides of the
+   comparison -- so two "empty" ids would pair up and pass.)
 
 Rule 4 is enforced request-wide rather than per-array. That is stricter than the literal
 wording, but it is what rule 3 already implies: if two assistant turns issue the same
@@ -450,8 +454,8 @@ rule 4 maps to `An assistant message with 'tool_calls' must not reuse a 'tool_ca
 
 ### Logging and metrics
 
-Every rejection emits a WARN log line carrying the rule that was tripped and the offending
-message index and `tool_call_id`.
+Every rejection emits a WARN log line carrying the rule that was tripped, the `model`, the
+`x-mse-consumer` value, and the offending message index and `tool_call_id`.
 
 It also increments the counter `gpustack_ai_proxy_tool_call_pairing_rejected_total`, whose
 stat name follows the Higress AI-plugin convention:
@@ -461,12 +465,21 @@ route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpusta
 ```
 
 `ai_route` and `ai_cluster` are auto-extracted as Prometheus labels by the stats_tags
-Higress already ships. `model`, `consumer` (the `x-mse-consumer` header, which is what
-attributes a bad request back to an API key) and `rule` stay in the stat name; flatten
-them into labels with `metric_relabel_configs` at scrape time if needed.
+Higress already ships; `rule` stays in the stat name and can be flattened into a label
+with `metric_relabel_configs` at scrape time.
 
 `rule` is one of: `orphan_tool_message`, `unanswered_tool_calls`,
-`duplicate_tool_call_id`, `duplicate_tool_calls_id`.
+`duplicate_tool_call_id`, `duplicate_tool_calls_id`, `invalid_tool_call_id`,
+`invalid_tool_calls_id`.
+
+**Every label on the metric is bounded by configuration; none of them is
+request-controlled.** The `model.` / `consumer.` slots in the stat name carry the fixed
+`none` sentinel (the slots stay because Higress's stats_tags regexes match on those
+literal separators to extract `ai_route` / `ai_cluster`). A rejected request is cheap to
+send -- 400, no upstream call -- so making `model` (a body field) or `x-mse-consumer` (a
+header a client can set itself on a route with no key-auth in front) a label would let a
+caller grow Envoy's stat registry and the plugin's counter cache once per request. The
+API-key attribution lives on the WARN log line above, which is append-only.
 
 ### Cost
 

@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -42,6 +43,8 @@ const (
 	// Covers rule 4. The upstream providers we compared against do not have a
 	// settled wording for this one, so we state it plainly.
 	toolPairingDuplicateCallIDMessage = "An assistant message with 'tool_calls' must not reuse a 'tool_calls[].id'."
+	// An assistant tool call whose `id` is absent, empty, or not a JSON string.
+	toolPairingInvalidCallIDMessage = "Each entry of 'tool_calls' must carry a non-empty string 'id'."
 )
 
 // toolPairingRule names which structural rule a request tripped. It is emitted
@@ -56,6 +59,8 @@ const (
 	toolPairingRuleUnansweredToolCalls  toolPairingRule = "unanswered_tool_calls"
 	toolPairingRuleDuplicateToolCallID  toolPairingRule = "duplicate_tool_call_id"
 	toolPairingRuleDuplicateToolCallsID toolPairingRule = "duplicate_tool_calls_id"
+	toolPairingRuleInvalidToolCallID    toolPairingRule = "invalid_tool_call_id"
+	toolPairingRuleInvalidToolCallsID   toolPairingRule = "invalid_tool_calls_id"
 )
 
 // toolPairingViolation describes a single structural failure. Message goes to
@@ -100,10 +105,15 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 		return nil
 	}
 
-	// pending holds the ids issued by the most recent assistant tool_calls that
-	// have not been answered yet. Order does not matter: OpenAI clients are free
-	// to return parallel tool results in any order.
-	var pending []string
+	// pending is the set of ids issued by the most recent assistant tool_calls
+	// that have not been answered yet; pendingOrder records them in issue order
+	// purely so the diagnostic below is deterministic. A set rather than a slice
+	// because matching and removal have to stay O(1): a single assistant message
+	// may legitimately carry many parallel calls, and the request body limit is
+	// 100 MiB, so a linear scan-and-shift per tool result would be quadratic in
+	// an attacker-chosen k and could pin an Envoy worker.
+	pending := make(map[string]struct{})
+	var pendingOrder []string
 	// answered / issued are request-wide so rules 3 and 4 survive multi-turn
 	// histories, not just the current tool-call window.
 	answered := make(map[string]struct{})
@@ -113,7 +123,18 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 		role := msg.Get("role").String()
 
 		if role == pairingRoleTool {
-			id := msg.Get("tool_call_id").String()
+			id, ok := nonEmptyJSONString(msg.Get("tool_call_id"))
+			if !ok {
+				// gjson's String() would render a missing field, a null, and a
+				// numeric id all as something matchable ("" or "123"), so an
+				// assistant call with no id followed by a tool message with no
+				// tool_call_id would pair up and pass. Require a real string.
+				return &toolPairingViolation{
+					Rule:    toolPairingRuleInvalidToolCallID,
+					Message: toolPairingOrphanMessage,
+					Detail:  fmt.Sprintf("messages[%d]: tool_call_id is missing or not a non-empty string", i),
+				}
+			}
 			if _, dup := answered[id]; dup {
 				return &toolPairingViolation{
 					Rule:    toolPairingRuleDuplicateToolCallID,
@@ -121,15 +142,14 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 					Detail:  fmt.Sprintf("messages[%d]: tool_call_id %q is answered more than once", i, id),
 				}
 			}
-			pos := indexOfString(pending, id)
-			if pos < 0 {
+			if _, open := pending[id]; !open {
 				return &toolPairingViolation{
 					Rule:    toolPairingRuleOrphanToolMessage,
 					Message: toolPairingOrphanMessage,
 					Detail:  fmt.Sprintf("messages[%d]: tool_call_id %q matches no preceding assistant tool_calls[].id", i, id),
 				}
 			}
-			pending = append(pending[:pos], pending[pos+1:]...)
+			delete(pending, id)
 			answered[id] = struct{}{}
 			continue
 		}
@@ -142,9 +162,10 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 				Rule:    toolPairingRuleUnansweredToolCalls,
 				Message: toolPairingUnansweredMessage,
 				Detail: fmt.Sprintf("messages[%d]: role %q appears before tool_call_id(s) [%s] were answered",
-					i, role, strings.Join(pending, ", ")),
+					i, role, joinPending(pending, pendingOrder)),
 			}
 		}
+		pendingOrder = pendingOrder[:0]
 
 		if role != pairingRoleAssistant {
 			continue
@@ -154,7 +175,14 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 			continue
 		}
 		for _, call := range toolCalls.Array() {
-			id := call.Get("id").String()
+			id, ok := nonEmptyJSONString(call.Get("id"))
+			if !ok {
+				return &toolPairingViolation{
+					Rule:    toolPairingRuleInvalidToolCallsID,
+					Message: toolPairingInvalidCallIDMessage,
+					Detail:  fmt.Sprintf("messages[%d]: a tool_calls[].id is missing or not a non-empty string", i),
+				}
+			}
 			if _, dup := issued[id]; dup {
 				return &toolPairingViolation{
 					Rule:    toolPairingRuleDuplicateToolCallsID,
@@ -163,7 +191,8 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 				}
 			}
 			issued[id] = struct{}{}
-			pending = append(pending, id)
+			pending[id] = struct{}{}
+			pendingOrder = append(pendingOrder, id)
 		}
 	}
 
@@ -172,10 +201,40 @@ func validateToolCallPairing(body []byte) *toolPairingViolation {
 			Rule:    toolPairingRuleUnansweredToolCalls,
 			Message: toolPairingUnansweredMessage,
 			Detail: fmt.Sprintf("request ends with unanswered tool_call_id(s) [%s]",
-				strings.Join(pending, ", ")),
+				joinPending(pending, pendingOrder)),
 		}
 	}
 	return nil
+}
+
+// nonEmptyJSONString accepts a gjson value only when it really is a non-empty
+// JSON string. OpenAI types both `tool_calls[].id` and `tool_call_id` as
+// strings, and Result.String() would otherwise coerce a null, a missing field
+// or a number into something that compares equal across the two sides.
+func nonEmptyJSONString(v gjson.Result) (string, bool) {
+	if v.Type != gjson.String || v.Str == "" {
+		return "", false
+	}
+	return v.Str, true
+}
+
+// joinPending renders the still-unanswered ids in the order they were issued.
+// Only ever called on the rejection path, so the O(k) filter is free.
+//
+// Each id is quoted rather than appended raw. `nonEmptyJSONString` hands back
+// the *unescaped* JSON value, so `{"id": "a\nb"}` arrives as a Go string with a
+// real newline in it; joined raw into Detail and then logged with %s, a caller
+// could inject whole forged WARN lines into a line-oriented log pipeline.
+// strconv.Quote renders control characters as escapes, which is what every
+// other diagnostic in this file already gets from %q.
+func joinPending(pending map[string]struct{}, order []string) string {
+	remaining := make([]string, 0, len(pending))
+	for _, id := range order {
+		if _, ok := pending[id]; ok {
+			remaining = append(remaining, strconv.Quote(id))
+		}
+	}
+	return strings.Join(remaining, ", ")
 }
 
 // parseBodyNoCopy hands the request body to gjson without copying it.
@@ -201,15 +260,6 @@ func parseBodyNoCopy(body []byte) gjson.Result {
 	return gjson.Parse(unsafe.String(&body[0], len(body)))
 }
 
-func indexOfString(haystack []string, needle string) int {
-	for i, s := range haystack {
-		if s == needle {
-			return i
-		}
-	}
-	return -1
-}
-
 // logToolCallValidationWarning surfaces a toolCallValidation value the config
 // package could not recognise. It lives here rather than in the config package
 // because wasm-go's package-level Log is nil until the host installs it, so
@@ -220,6 +270,35 @@ func logToolCallValidationWarning(pluginConfig *config.PluginConfig) {
 	}
 }
 
+// toolCallPairingDecision answers "should this request be rejected, and why"
+// without touching the host, so every gate is unit-testable without a
+// proxy-wasm runtime. enforceToolCallPairing is then the thin I/O shell around
+// it, and the only untested code is the local reply itself.
+//
+// claudeConverted comes from needsClaudeResponseConversion: a Claude request
+// that main.go rewrote onto /v1/chat/completions carries
+// apiName == ApiNameChatCompletion but a Claude-shaped body, which this walk
+// would find no tool messages in. Skip it explicitly rather than relying on
+// that accident.
+func toolCallPairingDecision(mode config.ToolCallValidationMode, apiName provider.ApiName, claudeConverted bool, body []byte) *toolPairingViolation {
+	// Off is the default, so this is the branch almost every deployment takes:
+	// keep it first and ahead of every other check so an unconfigured plugin
+	// pays nothing at all.
+	if mode != config.ToolCallValidationStrict {
+		return nil
+	}
+	// Chat Completions only. The Anthropic Messages surface expresses the same
+	// relationship with tool_use / tool_result content blocks rather than a
+	// tool role, and is out of scope here.
+	if apiName != provider.ApiNameChatCompletion {
+		return nil
+	}
+	if claudeConverted {
+		return nil
+	}
+	return validateToolCallPairing(body)
+}
+
 // enforceToolCallPairing runs the pairing check for the current request and
 // reports whether it already sent a local reply (in which case the caller must
 // stop the filter chain).
@@ -227,35 +306,24 @@ func logToolCallValidationWarning(pluginConfig *config.PluginConfig) {
 // It runs on the *inbound* body, before ReplaceByCustomSettings and before the
 // provider's own TransformRequestBody, so the rejection describes what the
 // client actually sent.
+//
+// Ordering note: everything that can wait runs *after*
+// SendHttpResponseWithDetail, because this repo's local-reply paths want the
+// window before the send kept short (see the rate-limit rejection hazards in
+// CLAUDE.md). The one exception is the consumer header: it is read before the
+// send because attributing a bad request back to an API key is the point of the
+// log line, and a header read is not guaranteed to still resolve once the local
+// reply has been queued. That leaves exactly one hostcall in the window --
+// fewer than ai-proxy's own 413 path, which reads and parses Content-Length
+// before sending.
 func enforceToolCallPairing(ctx wrapper.HttpContext, pluginConfig config.PluginConfig, apiName provider.ApiName, body []byte) bool {
-	// Off is the default, so this is the branch almost every deployment takes:
-	// keep it first and ahead of every other check so an unconfigured plugin
-	// pays nothing at all.
-	if pluginConfig.GetToolCallValidationMode() != config.ToolCallValidationStrict {
-		return false
-	}
-	// Chat Completions only. The Anthropic Messages surface expresses the same
-	// relationship with tool_use / tool_result content blocks rather than a
-	// tool role, and is out of scope here.
-	if apiName != provider.ApiNameChatCompletion {
-		return false
-	}
-	// A Claude request that main.go rewrote onto /v1/chat/completions carries
-	// apiName == ApiNameChatCompletion but a Claude-shaped body, which this
-	// walk would find no tool messages in. Skip it explicitly rather than
-	// relying on that accident.
-	if needsClaudeResponseConversion(ctx) {
-		return false
-	}
-
-	violation := validateToolCallPairing(body)
+	violation := toolCallPairingDecision(
+		pluginConfig.GetToolCallValidationMode(), apiName, needsClaudeResponseConversion(ctx), body)
 	if violation == nil {
 		return false
 	}
 
-	log.Warnf("[%s] rejecting request: tool_calls pairing check failed: rule=%s, %s",
-		pluginName, violation.Rule, violation.Detail)
-	emitToolCallPairingRejected(gjson.GetBytes(body, "model").String(), violation.Rule)
+	consumer, _ := proxywasm.GetHttpRequestHeader(headerConsumer)
 
 	_ = proxywasm.SendHttpResponseWithDetail(
 		http.StatusBadRequest,
@@ -264,6 +332,14 @@ func enforceToolCallPairing(ctx wrapper.HttpContext, pluginConfig config.PluginC
 		toolPairingErrorBody(violation.Message),
 		-1,
 	)
+
+	// The model and consumer live on the log line rather than on the metric:
+	// both are request-controlled, and a label a caller can pick freely would
+	// let cheap rejected requests grow Envoy's stat registry and the
+	// process-global counter cache without bound. See emitToolCallPairingRejected.
+	log.Warnf("[%s] rejected request: tool_calls pairing check failed: rule=%s, model=%q, consumer=%q, %s",
+		pluginName, violation.Rule, gjson.GetBytes(body, "model").String(), consumer, violation.Detail)
+	emitToolCallPairingRejected(violation.Rule)
 	return true
 }
 

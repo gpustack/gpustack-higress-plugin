@@ -83,12 +83,13 @@ func aiStatName(route, cluster, model, consumer, name string, extras ...[2]strin
 
 // incrCounter increments a named counter by 1, lazily defining it on first use.
 func incrCounter(stat string) {
-	var counter proxywasm.MetricCounter
 	if v, ok := metricCounters.Load(stat); ok {
-		counter = v.(proxywasm.MetricCounter)
-	} else {
-		counter = proxywasm.DefineCounterMetric(stat)
-		metricCounters.Store(stat, counter)
+		v.(proxywasm.MetricCounter).Increment(1)
+		return
+	}
+	counter := proxywasm.DefineCounterMetric(stat)
+	if actual, loaded := metricCounters.LoadOrStore(stat, counter); loaded {
+		counter = actual.(proxywasm.MetricCounter)
 	}
 	counter.Increment(1)
 }
@@ -102,17 +103,34 @@ func readEnvoyProperty(name string) string {
 	return string(raw)
 }
 
-// emitToolCallPairingRejected records one rejection. The label values are read
-// here rather than passed down because this runs at most once per request, on
-// an error path -- the hostcall cost is irrelevant and keeping the happy path
-// free of them matters more.
-func emitToolCallPairingRejected(model string, rule toolPairingRule) {
-	consumer, _ := proxywasm.GetHttpRequestHeader(headerConsumer)
+// emitToolCallPairingRejected records one rejection.
+//
+// **Every label here is bounded by configuration, never by the request.**
+// `route_name` and `cluster_name` come from the Envoy route table, and `rule`
+// has six possible values; the resulting stat count is routes x clusters x 6.
+// The request's `model` (a body field) and `x-mse-consumer` (a header, which
+// nothing stops a caller from setting on a route without key-auth in front)
+// are deliberately NOT labels: a rejected request is cheap to send -- 400, no
+// upstream call -- so a caller that could pick a label value would mint a new
+// Envoy stat and a permanent metricCounters entry per request and grow both
+// without bound. They go on the WARN log line instead, which is append-only
+// and still gives an operator the API-key attribution the issue asked for.
+//
+// The model / consumer slots still exist in the stat name because Higress's
+// pre-shipped stats_tags regexes match on the literal `.model.` and
+// `.consumer.` separators to extract ai_route / ai_cluster; dropping the slots
+// would break that extraction. They carry the fixed sentinel.
+//
+// The property reads happen here, on the rejection path, rather than being
+// captured per-request up front: rejections are rare and the check is off by
+// default, so making every request pay for labels it will never emit would be
+// the wrong trade.
+func emitToolCallPairingRejected(rule toolPairingRule) {
 	incrCounter(aiStatName(
 		readEnvoyProperty("route_name"),
 		readEnvoyProperty("cluster_name"),
-		model,
-		consumer,
+		metricNoneLabel,
+		metricNoneLabel,
 		metricNameToolCallPairingRejected,
 		[2]string{"rule", string(rule)},
 	))
