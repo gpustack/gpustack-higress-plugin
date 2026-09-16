@@ -33,12 +33,22 @@ def main() -> int:
         return 1
     whl_path = whl_files[0]
 
-    # Expected: local plugins from extensions/*/VERSION
+    # Expected: local plugins from extensions/*/VERSION.
+    #
+    # A .nopackage marker in the plugin directory means the source is kept but
+    # the wasm is deliberately not shipped, so it must not be expected here --
+    # extensions/Makefile's build-all skips the same marker. Keep the two in
+    # step; the marker file is the single representation of that fact.
     expected: dict[str, str] = {}
+    excluded: list[str] = []
     for ver_file in sorted((ROOT / "extensions").glob("*/VERSION")):
-        if ver_file.parent.name.startswith("."):
+        plugin_dir = ver_file.parent
+        if plugin_dir.name.startswith("."):
             continue
-        expected[ver_file.parent.name] = ver_file.read_text().strip()
+        if (plugin_dir / ".nopackage").exists():
+            excluded.append(plugin_dir.name)
+            continue
+        expected[plugin_dir.name] = ver_file.read_text().strip()
 
     # Expected: remote plugins from remote_plugins.yaml (skipped with --local-only)
     if not args.local_only:
@@ -65,7 +75,7 @@ def main() -> int:
     print(f"manifest.json: {'✓' if has_manifest else '✗ MISSING'}")
     print()
 
-    ok, missing, mismatch, extra = [], [], [], []
+    ok, missing, mismatch, extra, leaked = [], [], [], [], []
     for name, ver in sorted(expected.items()):
         if name not in actual:
             missing.append(f"  ✗ {name}  v{ver}  (missing)")
@@ -74,20 +84,33 @@ def main() -> int:
         else:
             ok.append(f"  ✓ {name}  v{ver}")
     for name, ver in sorted(actual.items()):
-        if name not in expected:
+        if name in excluded:
+            # A .nopackage plugin that shipped anyway. The usual cause is a
+            # stale gpustack_higress_plugins/plugins/ from an earlier build
+            # (force-include packages whatever is in that directory), so this
+            # has to fail rather than warn -- the whole point of the marker is
+            # to keep these bytes out of the wheel.
+            leaked.append(f"  ✗ {name}  v{ver}  (marked .nopackage; run make clean)")
+        elif name not in expected:
             extra.append(f"  ? {name}  v{ver}  (not in config)")
 
-    for line in ok + extra + mismatch + missing:
+    for line in ok + extra + mismatch + missing + leaked:
         print(line)
+
+    if excluded:
+        print()
+        print(f"Excluded by .nopackage: {', '.join(sorted(excluded))}")
 
     print()
     total = len(expected)
     print(f"Result: {len(ok)}/{total} expected plugins present", end="")
     if extra:
         print(f", {len(extra)} extra", end="")
+    if leaked:
+        print(f", {len(leaked)} excluded-but-present", end="")
     print()
 
-    return 0 if (not missing and not mismatch and has_manifest) else 1
+    return 0 if (not missing and not mismatch and not leaked and has_manifest) else 1
 
 
 if __name__ == "__main__":

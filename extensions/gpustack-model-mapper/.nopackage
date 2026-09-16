@@ -1,0 +1,26 @@
+Excluded from the Python distribution. The source stays, the wasm does not ship.
+
+gpustack-lb in `mode: context` is a drop-in replacement for this plugin: on a
+route with no `candidates` it degrades to exactly this behaviour, and it keeps
+the `gpustack-model-mapper` CR name so an existing deployment upgrades in place.
+Shipping both would put 6.0 MB of wasm (1.7 MB deflated) in every wheel for a
+plugin nothing new should be pointed at.
+
+The code is kept, and `make -C extensions test-all` keeps testing it, because
+gpustack-lb's legacy path is meant to follow it verbatim -- it is the reference
+for what "degrades to model-mapper" means, and a reference that no longer
+compiles is worthless.
+
+Effect of this file:
+
+    make -C extensions build-all    skips this directory
+    scripts/verify_whl.py           does not expect it in the wheel
+    make -C extensions test-all     still runs its tests
+    make -C extensions list         shows it, tagged [not packaged]
+
+To build it anyway, name it explicitly -- that path ignores this marker:
+
+    make -C extensions build PLUGIN_NAME=gpustack-model-mapper
+
+To start shipping it again, delete this file. Nothing else references it by
+name.

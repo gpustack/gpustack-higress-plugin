@@ -72,7 +72,11 @@ list:
 		if [ -f "$$dir/go.mod" ]; then \
 			name=$$(basename "$$dir"); \
 			version=$$(cat "$$dir/VERSION" 2>/dev/null || echo "unknown"); \
-			echo "  - $$name (version: $$version)"; \
+			if [ -f "$$dir/.nopackage" ]; then \
+				echo "  - $$name (version: $$version) $(COLOR_YELLOW)[not packaged]$(COLOR_RESET)"; \
+			else \
+				echo "  - $$name (version: $$version)"; \
+			fi; \
 		fi; \
 	done
 
@@ -116,11 +120,36 @@ build:
 		echo "$(COLOR_GREEN)✓ Built: $$output_dir/plugin.wasm$(COLOR_RESET)"
 
 # Build all local plugins
+#
+# A plugin directory containing a .nopackage marker is skipped: its source is
+# kept and tested, but its wasm is not built and therefore never reaches the
+# wheel. The marker is a file rather than a list in this Makefile because
+# verify_whl.py has to agree about it, and the go-builder stage in the
+# Dockerfile has no Python to parse a shared config with (that is the whole
+# point of the PYTHON=true trick) -- a plain file is the only representation
+# both sides can read without duplicating the fact.
+#
+# Skipping also **deletes any existing output** for that plugin. Leaving it
+# would be worse than never building it: the wheel force-includes whatever sits
+# in OUTPUT_DIR, and the root `make build` neither cleans nor runs
+# verify_whl.py, so a checkout that built the plugin before the marker existed
+# would keep shipping that stale wasm indefinitely.
+#
+# `make build PLUGIN_NAME=<name>` ignores the marker on purpose: naming a plugin
+# explicitly is the escape hatch.
 build-all:
 	@echo "$(COLOR_BOLD)Building all local plugins...$(COLOR_RESET)"
 	@for dir in */; do \
 		if [ -f "$$dir/go.mod" ]; then \
 			name=$$(basename "$$dir"); \
+			if [ -f "$$dir/.nopackage" ]; then \
+				echo "$(COLOR_YELLOW)Skipping $$name (.nopackage)$(COLOR_RESET)"; \
+				if [ -d "$(OUTPUT_DIR)/$$name" ]; then \
+					echo "$(COLOR_YELLOW)  removing stale output $(OUTPUT_DIR)/$$name$(COLOR_RESET)"; \
+					rm -rf "$(OUTPUT_DIR)/$$name"; \
+				fi; \
+				continue; \
+			fi; \
 			echo "$(COLOR_GREEN)Building $$name...$(COLOR_RESET)"; \
 			cd "$$dir" && \
 				version=$$(cat VERSION) && \

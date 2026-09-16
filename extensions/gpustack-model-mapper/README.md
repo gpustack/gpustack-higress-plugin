@@ -1,5 +1,13 @@
 # gpustack-model-mapper Plugin
 
+> ⚠️ **Not shipped in the Python package.** A [.nopackage](.nopackage) marker
+> keeps this plugin's wasm out of the wheel: `gpustack-lb` in `mode: context` is
+> a drop-in replacement (on a route with no `candidates` it degrades to exactly
+> this behaviour, and it keeps the `gpustack-model-mapper` CR name). The source
+> and its tests are kept as the reference for what "degrades to model-mapper"
+> means. Build it anyway with
+> `make -C extensions build PLUGIN_NAME=gpustack-model-mapper`.
+
 ## Introduction
 
 A **fork of Higress's wasm-go `model-mapper`** with two enhancements:

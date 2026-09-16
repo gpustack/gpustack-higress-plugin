@@ -255,6 +255,35 @@ remote_plugins:
 2. Add to `go.work` under the `use ()` directive
 3. `make build`
 
+## Excluding a Plugin from the Wheel (`.nopackage`)
+
+Dropping a `.nopackage` file into a plugin directory keeps the source in the
+repo but keeps its wasm out of the distribution. Currently used by
+`gpustack-model-mapper` (6.0 MB raw / 1.7 MB deflated), which `gpustack-lb` in
+`mode: context` replaces in place.
+
+| Consumer | Behaviour |
+| --- | --- |
+| `extensions/Makefile` `build-all` | skips the directory |
+| `extensions/Makefile` `list` | shows it tagged `[not packaged]` |
+| `extensions/Makefile` `build PLUGIN_NAME=<name>` | **ignores the marker** — naming a plugin explicitly is the escape hatch |
+| `extensions/Makefile` `test-all` | still runs its tests — the code is kept, so it must keep compiling |
+| `scripts/verify_whl.py` | drops it from the expected set, and **fails** if it appears in the wheel anyway |
+
+**Why a marker file rather than a list in the Makefile or a shared YAML**: the
+Dockerfile's go-builder stage runs `make build-all PYTHON=true` with no Python
+available (that is the point of the `PYTHON=true` trick), so it cannot parse a
+YAML config; and `verify_whl.py` is invoked directly by the Dockerfile
+(bypassing the Makefile), so it cannot receive a Makefile variable either. A
+plain file next to the code is the only representation both sides read without
+duplicating the fact. It survives go-builder's `rm -rf */*.go */go.mod */go.sum`.
+
+The `verify_whl.py` failure on a present-but-excluded plugin is not defensive
+padding: the wheel's `force-include` packages whatever sits in
+`gpustack_higress_plugins/plugins/`, so a local `make build` over a stale
+directory (from before the exclusion, or from a deleted plugin) silently ships
+it again. `make clean` is the fix.
+
 ## CI
 
 - **ci.yaml**: runs on push to main/develop and PRs — Go 1.24 + Python 3.11, `make test` → `make lint` → `make check-dirty` → Docker `whl-output` build (same Dockerfile as push/release: compiles Go, fetches remote plugins via oras, runs full `verify_whl.py`)
