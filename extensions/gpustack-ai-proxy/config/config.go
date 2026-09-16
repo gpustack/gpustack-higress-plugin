@@ -31,11 +31,25 @@ type PluginConfig struct {
 	// @Description zh-CN AI服务提供商配置，包含API接口、模型和知识库文件等信息
 	providerConfigs []provider.ProviderConfig `required:"true" yaml:"providers"`
 
+	// @Title zh-CN tool/tool_calls 配对校验
+	// @Description zh-CN 对 Chat Completions 请求做结构化的 tool/tool_calls 配对校验：off（默认，关闭）、strict（校验失败返回 400）
+	toolCallValidation ToolCallValidationMode `yaml:"toolCallValidation"`
+	// Set when toolCallValidation fell back to its default because the
+	// configured value was unrecognised; logged by the caller of FromJson.
+	toolCallValidationWarning string `yaml:"-"`
+
 	activeProviderConfig *provider.ProviderConfig `yaml:"-"`
 	activeProvider       provider.Provider        `yaml:"-"`
 }
 
 func (c *PluginConfig) FromJson(json gjson.Result) {
+	// Parsed before the legacy `provider` branch below, which returns early.
+	// Only assigned when the key is present, so a matchRule override that does
+	// not mention it inherits the global value copied by parseOverrideRuleConfig.
+	if modeJson := json.Get("toolCallValidation"); modeJson.Exists() {
+		c.toolCallValidation, c.toolCallValidationWarning = normalizeToolCallValidationMode(modeJson.String())
+	}
+
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
 		c.providerConfigs = make([]provider.ProviderConfig, 0)
 		for _, providerJson := range providersJson.Array() {
@@ -98,6 +112,22 @@ func (c *PluginConfig) Complete() error {
 
 func (c *PluginConfig) GetProvider() provider.Provider {
 	return c.activeProvider
+}
+
+// ToolCallValidationWarning returns a non-empty message when the configured
+// toolCallValidation value was unrecognised and the default was substituted.
+// It is deliberately not an error: see normalizeToolCallValidationMode.
+func (c *PluginConfig) ToolCallValidationWarning() string {
+	return c.toolCallValidationWarning
+}
+
+// GetToolCallValidationMode returns the effective tool/tool_calls pairing mode.
+// See ToolCallValidationDefault for why an unset field means off.
+func (c *PluginConfig) GetToolCallValidationMode() ToolCallValidationMode {
+	if c.toolCallValidation == "" {
+		return ToolCallValidationDefault
+	}
+	return c.toolCallValidation
 }
 
 func (c *PluginConfig) GetProviderConfig() *provider.ProviderConfig {

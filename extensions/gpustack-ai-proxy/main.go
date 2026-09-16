@@ -128,6 +128,7 @@ func parseGlobalConfig(json gjson.Result, pluginConfig *config.PluginConfig) err
 	log.Debugf("loading global config: %s", json.String())
 
 	pluginConfig.FromJson(json)
+	logToolCallValidationWarning(pluginConfig)
 	if err := pluginConfig.Validate(); err != nil {
 		log.Errorf("global rule config is invalid: %v", err)
 		return err
@@ -146,6 +147,7 @@ func parseOverrideRuleConfig(json gjson.Result, global config.PluginConfig, plug
 	*pluginConfig = global
 
 	pluginConfig.FromJson(json)
+	logToolCallValidationWarning(pluginConfig)
 	if err := pluginConfig.Validate(); err != nil {
 		log.Errorf("overridden rule config is invalid: %v", err)
 		return err
@@ -377,8 +379,14 @@ func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig
 		saveContextsToHeaders(ctx)
 	}()
 
+	apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
+	// GPUStack-local: structural tool/tool_calls pairing check on the inbound
+	// body, before any transformation. See gpustack/gpustack#6210.
+	if enforceToolCallPairing(ctx, pluginConfig, apiName, body) {
+		return types.ActionPause
+	}
+
 	if handler, ok := activeProvider.(provider.RequestBodyHandler); ok {
-		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
 		providerConfig := pluginConfig.GetProviderConfig()
 		// If retryOnFailure is enabled, save the transformed body to the context in case of retry
 		if providerConfig.IsRetryOnFailureEnabled() {

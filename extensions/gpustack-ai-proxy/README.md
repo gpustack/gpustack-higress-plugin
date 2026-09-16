@@ -12,8 +12,16 @@ description: AI 代理插件配置参考
 > 基于 higress commit `aae6fbce36a2` 复制，并在 gpustack/gpustack-higress-plugins 中独立维护。
 > 每个 `.go` 文件头部保留了对应的上游来源标注；本地改动可能与上游产生差异。
 >
-> **本地改动**：修复 Claude→OpenAI 协议转换时多个 `system` 消息未合并、导致严格 OpenAI 后端（如 vLLM）
-> 报 `System message must be at the beginning.` 的问题（见 gpustack/gpustack#5934）。
+> **本地改动**：
+>
+> - 修复 Claude→OpenAI 协议转换时多个 `system` 消息未合并、导致严格 OpenAI 后端（如 vLLM）
+>   报 `System message must be at the beginning.` 的问题（见 gpustack/gpustack#5934）。
+> - 为 deepseek provider 的默认能力补充 `ApiNameResponses`，DeepSeek 原生提供 OpenAI Responses API。
+> - 在 `capabilities` 白名单中放行三个 Anthropic 能力（`anthropic/v1/messages`、
+>   `anthropic/v1/messages/count_tokens`、`anthropic/v1/complete`），使原生支持 Claude 协议的
+>   provider 可以通过配置声明，而不必依赖 provider 类型硬编码。
+> - 新增 `toolCallValidation`：在 Chat Completions 请求路径上做 tool/tool_calls 结构化配对校验，
+>   默认关闭（见 gpustack/gpustack#6210）。
 >
 > **已删除的上游文件**：本仓库的构建/发布流程不使用 Higress 官方 CLI `hgctl`，而是走
 > `extensions/Makefile`（直接 `go build` 生成 wasm）+ `scripts/generate_metadata.py`。因此以下随
@@ -62,6 +70,7 @@ description: AI 代理插件配置参考
 | 名称       | 数据类型 | 填写要求 | 默认值 | 描述                         |
 | ---------- | -------- | -------- | ------ | ---------------------------- |
 | `provider` | object   | 必填     | -      | 配置目标 AI 服务提供商的信息 |
+| `toolCallValidation` | string | 非必填 | `off` | Chat Completions 请求路径上的 `tool`/`tool_calls` 结构化配对校验。`off`（默认）：完全关闭；`strict`：校验失败返回 400。详见[tool/tool_calls 配对校验](#tooltool_calls-配对校验)。 |
 
 `provider`的配置字段说明如下：
 
@@ -418,6 +427,111 @@ NVIDIA Triton Interference Server 所对应的 type 为 triton。它特有的配
 |----------------------|--------|--------|-------|------------------------------------------|
 | `tritonModelVersion` | string | 非必填   | -     | 用于指定 Triton Server 中 model version     |
 | `tritonDomain`       | string | 非必填   | -     | Triton Server 部署的指定请求 Domain          |
+
+## tool/tool_calls 配对校验
+
+> GPUStack 本地特性，上游 `ai-proxy` 没有此能力。见 gpustack/gpustack#6210。
+
+当 Chat Completions 请求中的 `tool` 消息与 `assistant.tool_calls` 没有正确配对时，行为完全取决于
+后端：严格的后端（如 vLLM）会直接返回 400，宽松的 OpenAI 兼容后端则会照常返回 200。其中最危险的是
+**tool_calls 悬空**（assistant 发起了工具调用，但没有任何 tool 消息返回结果）：宽松后端会返回 200
+并**凭空编造工具结果**，`finish_reason` 仍为 `stop`，调用方无从分辨。
+
+本插件在请求路径上做一层纯结构化校验，定位是**拦截并告警**，不做任何修复。
+
+### 校验规则
+
+1. 每个 `role: "tool"` 消息的 `tool_call_id`，必须能在**之前**某个 `assistant.tool_calls[]` 的 `id` 中找到；
+2. 带 `tool_calls` 的 assistant 消息之后，必须紧接着每个调用各一条 tool 消息；在全部回应完之前不允许出现其它 role；
+3. 同一个请求内 `tool_call_id` 不可重复；
+4. `assistant.tool_calls[].id` 不可重复。
+
+规则 4 实际按**整个请求**判重，比字面表述更严格：如果两轮 assistant 复用同一个 `id`，回应它们的
+tool 消息必然让 `tool_call_id` 重复，本来就会被规则 3 拒掉；在**签发** id 的位置报错，错误信息更有指向性。
+
+插件**不会修复**消息列表（不补造 tool 结果、不去重 id）。网关不了解业务语义，错误的修复比不修复更糟。
+
+### 失败时的行为
+
+**这是一个 opt-in 能力,默认 `off`。** 不配置时插件完全不做这项校验,连扫描都不跑,行为与不带这个特性的
+版本一模一样。本插件是上游 `ai-proxy` 的 fork、会随版本下发到所有部署,默认拦截等于让 fork 单方面把
+今天能跑的请求变成 400,所以由需要的部署显式配 `toolCallValidation: strict` 打开。
+
+`strict` 下校验失败返回 400，响应体为 OpenAI 风格的错误信封，`message` 与上游后端的措辞对齐，便于调用方复用已有的错误处理：
+
+```json
+{
+  "error": {
+    "message": "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+    "type": "invalid_request_error",
+    "code": "invalid_request_error"
+  }
+}
+```
+
+规则 1、3 对应上面这条消息；规则 2 对应
+`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.`；
+规则 4 对应 `An assistant message with 'tool_calls' must not reuse a 'tool_calls[].id'.`。
+
+### 日志与指标
+
+每次拦截都会打印一条 WARN 日志，包含命中的规则、出错的消息下标与 `tool_call_id`。
+
+同时递增计数器 `gpustack_ai_proxy_tool_call_pairing_rejected_total`，stat 名遵循 Higress AI 插件约定：
+
+```text
+route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpustack_ai_proxy_tool_call_pairing_rejected_total.rule.<rule>
+```
+
+其中 `ai_route`、`ai_cluster` 由 Higress 自带的 stats_tags 自动提取为 Prometheus label；
+`model`、`consumer`（即 `x-mse-consumer`，用于定位到具体 API Key）、`rule` 保留在 stat 名中，
+需要时可在 Prometheus 侧用 `metric_relabel_configs` 拆成 label。
+
+`rule` 的取值为：`orphan_tool_message`、`unanswered_tool_calls`、`duplicate_tool_call_id`、`duplicate_tool_calls_id`。
+
+### 开销
+
+`off`（默认）下开销为零 —— 连请求体都不看。
+
+打开 `strict` 后，校验是一次 gjson 扫描,**不做 `encoding/json` 反射解码,也不重新序列化**,并且用
+`unsafe.String` 把请求体交给 gjson,避免 `gjson.GetBytes` 对整个 `messages` 数组做一次拷贝。
+分配量只与消息条数有关,与请求体大小无关。
+
+基准(原生 Apple M4 Pro,非 wasm,仅供比例参考;见 `tool_call_pairing_bench_test.go`):
+
+| 请求体 | 本校验 | 同一请求体做一次 `json.Unmarshal` |
+| --- | --- | --- |
+| 200 轮 / 1.2 MB | 0.62 ms,233 allocs,222 KB | 3.94 ms,3422 allocs,1.47 MB |
+| 400 轮 / 1.2 MB | 0.82 ms,439 allocs,560 KB | 5.01 ms,6823 allocs,1.50 MB |
+| 200 轮 / 2.4 MB | 1.17 ms,233 allocs,222 KB | 7.65 ms,3422 allocs,2.70 MB |
+
+作为对照,Anthropic→OpenAI 协议转换的反射式解码 + 重新序列化是完全不同量级的开销
+(见 gpustack/gpustack#6217);本校验不在那条路径上。
+
+### 适用范围
+
+- 仅作用于 Chat Completions（`/v1/chat/completions`）请求，且在任何请求体改写之前执行，因此报错描述的是客户端**实际发出**的内容；
+- Anthropic Messages（`/v1/messages`）用 `tool_use`/`tool_result` content block 表达同一关系，不在本校验范围内，包括被自动转换到 chat completions 路径的 Claude 请求；
+- 请求体不是 JSON、或没有 `messages` 数组时，直接放行（fail-open）。
+
+### 配置示例
+
+```yaml
+toolCallValidation: strict      # 不写 = off，即完全关闭
+provider:
+  type: openai
+  apiTokens:
+    - "YOUR_API_TOKEN"
+```
+
+在 GPUStack 部署中，该字段写在 WasmPlugin `gpustack-ai-proxy` 的 `spec.defaultConfig` 顶层即可；
+GPUStack 的调谐器只会重写 `defaultConfig.providers` 和 `matchRules`，不会清掉其它 key。
+由于 matchRule 未显式声明时会继承全局值，写在 `defaultConfig` 上即对所有路由生效；需要只对某条路由拦截时，
+把它写进那条 `matchRules[].config` 即可。
+
+配置了无法识别的取值时**不会**报配置错误，而是回退到默认的 `off` 并打一条 ERROR 日志 —— wasm-go 会吞掉
+全局配置的解析错误并把全局配置清零，而 GPUStack 只在 `defaultConfig` 里放 `providers`，一旦清零整个
+ai-proxy 会静默空转。因一个字段拼错拖垮整个代理，代价远大于按默认模式继续跑。
 
 ## 用法示例
 
