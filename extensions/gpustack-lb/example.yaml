@@ -29,6 +29,31 @@ spec:
   defaultConfig:
     mode: context
     modelMapping: {}
+    # Optional. Without it the in-flight counts and health verdicts live in
+    # proxy-wasm shared data, whose scope is **one Envoy process** -- and since
+    # Envoy runs one wasm VM per worker thread, even a single replica already
+    # keeps several independent counts. With it they become deployment-wide.
+    #
+    # ⚠️ It must be configured on **both** CRs, and rolled out and withdrawn
+    #    together. The two roles are two WasmPlugin resources and each needs its
+    #    own client; configuring it on one side only makes context read a store
+    #    nobody writes, so every candidate looks idle and healthy forever --
+    #    silently, with the request path still working.
+    redis:
+      # service_port is deliberately omitted. A `.static` name is a Higress
+      # static-DNS registration whose **listener port is 80** whatever the
+      # backend speaks, and that is what the default resolves to for these
+      # names -- writing 6379 here would connect to the wrong port. Spell the
+      # port out only for a `.dns` / `.svc` style service, where the default
+      # is 6379.
+      service_name: redis.static
+      # username: ""
+      # password: ""
+      # timeout: 1000
+      # database: 0
+      # key_prefix isolates deployments sharing one Redis. It is also the Redis
+      # Cluster hash tag, so it must not contain braces.
+      # key_prefix: gpustack_lb
     health:
       # The global config location. matchRules inherit this when they do not
       # set it, and override it when they do. Deployment-level knobs (mode /
@@ -88,6 +113,12 @@ spec:
   # candidate set to read, the request passes through untouched.
   defaultConfig:
     mode: finisher
+    # The same block as on the context CR -- see the note there. This is the one
+    # setting that appears in both roles, and it is structural: the finisher is
+    # the writer, context is the reader, and a separate CR needs a separate
+    # client.
+    redis:
+      service_name: redis.static
     health:
       unhealthyThreshold: 3
       cooldownMs: 10000

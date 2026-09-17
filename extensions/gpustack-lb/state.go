@@ -3,12 +3,16 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 )
 
+// sharedDataStore is the default stateStore: proxy-wasm shared data, no
+// external dependency.
+//
 // The finisher role is the **only writer** of these two pieces of shared
 // state; the context role only reads them.
 //
@@ -16,6 +20,54 @@ import (
 // are **two filter instances** of the same binary, each with its own linear
 // memory, and merging the binaries does not let them share variables. The cost
 // is two CAS operations per request (+1 on selection, -1 on onStreamDone).
+//
+// ⚠️ Its scope is **one Envoy process**. Several gateway replicas each keep
+// their own in-flight count and their own health verdict, so a fleet-wide view
+// needs the redis backend (see redis_store.go).
+type sharedDataStore struct{}
+
+// LoadStates reads every cluster's state synchronously -- shared data is a
+// host-local lookup, so there is nothing to wait for and the request is never
+// paused.
+func (sharedDataStore) LoadStates(clusters []string, nowMs, maxAgeMs int64, done func(map[string]clusterState)) types.Action {
+	states := make(map[string]clusterState, len(clusters))
+	for _, cluster := range clusters {
+		states[cluster] = clusterState{
+			Inflight: readInflight(cluster, nowMs, maxAgeMs),
+			Health:   readHealth(cluster),
+		}
+	}
+	done(states)
+	return types.ActionContinue
+}
+
+// AddInflight returns the start timestamp as the token, because that is what
+// this backend stores as the entry's identity.
+//
+// Two requests selecting the same cluster within the same millisecond produce
+// the same token, and the removal below then takes one of the two entries
+// rather than "the right one". Harmless: the entries are indistinguishable --
+// same cluster, same start instant -- so removing either leaves the same count
+// behind.
+func (sharedDataStore) AddInflight(cluster string, nowMs, maxAgeMs int64) string {
+	startMs := addInflight(cluster, nowMs, maxAgeMs)
+	if startMs == 0 {
+		return ""
+	}
+	return strconv.FormatInt(startMs, 10)
+}
+
+func (sharedDataStore) Done(rec doneRecord) {
+	if startMs, err := strconv.ParseInt(rec.Token, 10, 64); err == nil {
+		removeInflight(rec.Cluster, startMs, rec.NowMs, rec.MaxAgeMs)
+	}
+	switch rec.Outcome {
+	case outcomeSuccess:
+		recordSuccess(rec.Cluster)
+	case outcomeFailure:
+		recordFailure(rec.Cluster, rec.Threshold, rec.CooldownMs, rec.RampMs, rec.NowMs)
+	}
+}
 
 const casMaxRetries = 10
 
@@ -31,6 +83,61 @@ const casMaxRetries = 10
 // correctly. Hence there is deliberately no reset function here.
 
 func nowMillis() int64 { return time.Now().UnixMilli() }
+
+// readInflight counts the in-flight entries that have not aged out.
+//
+// **The age filter has to be applied on the read side too**, even though the
+// finisher already prunes on every +1 and -1. Those prunes only run when this
+// candidate is *selected*, and that is exactly what stops happening once it is
+// filtered out:
+//
+//	maxRunningRequests entries leak (hung stream, client disconnect)
+//	  -> readInflight >= maxRun, so buildCandidateSet marks it overCap
+//	  -> it is never published, so the finisher never selects it
+//	  -> addInflight/removeInflight never run on its key
+//	  -> nothing ever prunes it, and it stays over cap forever
+//
+// failOpen does not rescue this either: the re-admission there deliberately
+// excludes overCap. So a purely read-side condition would hold the candidate
+// out permanently -- the exact starvation that storing timestamps instead of a
+// counter was meant to make impossible. (The redis backend has the same rule
+// for the same reason: its reader counts with a ZCOUNT lower bound rather than
+// relying on the writer's pruning.)
+//
+// This does not duplicate the knob. maxAgeMs is the same config.maxInflightAgeMs
+// the finisher prunes with, inherited through the same deployment-level path,
+// so the two cannot disagree. The read stays non-destructive: counting here is
+// free, whereas writing the pruned array back would mean a CAS on every
+// candidate of every request.
+func readInflight(cluster string, nowMs, maxAgeMs int64) int64 {
+	data, _, err := proxywasm.GetSharedData(SharedInflightPrefix + cluster)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	var st inflightState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return 0
+	}
+	var n int64
+	for _, ts := range st.Starts {
+		if nowMs-ts < maxAgeMs {
+			n++
+		}
+	}
+	return n
+}
+
+func readHealth(cluster string) healthState {
+	var st healthState
+	data, _, err := proxywasm.GetSharedData(SharedHealthPrefix + cluster)
+	if err != nil || len(data) == 0 {
+		return st
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		return healthState{}
+	}
+	return st
+}
 
 // addInflight records one in-flight request and returns the timestamp it
 // wrote, so onHttpStreamDone can remove exactly that entry.
@@ -147,27 +254,25 @@ func recordSuccess(cluster string) {
 // recordFailure records one "never reached the application" failure, ejecting
 // the cluster into a cooldown once the threshold is hit.
 //
-// The threshold is asymmetric: normally unhealthyThreshold (3 by default, so
-// transient blips do not cause collateral damage), but 1 during recovery -- a
-// just-released instance has zero in-flight requests and therefore looks
-// optimal, so another failure should send it straight back rather than letting
-// it repeatedly soak up traffic.
+// The threshold arrives **already resolved** by the caller: normally
+// unhealthyThreshold (3 by default, so transient blips do not cause collateral
+// damage), but 1 during recovery -- a just-released instance has zero in-flight
+// requests and therefore looks optimal, so another failure should send it
+// straight back rather than letting it repeatedly soak up traffic. Resolving it
+// in the finisher rather than here keeps both backends from deciding the
+// question separately, and differently.
 //
-// probation is published by the context role along with the candidate set
-// rather than recomputed here from rampMs: that window is configured in one
+// Probation itself is published by the context role along with the candidate
+// set rather than recomputed from rampMs: that window is configured in one
 // place only, which removes a knob that would otherwise have to agree on both
 // sides. It is also the more accurate semantic -- it means "this request was
 // admitted during the recovery window", not "we are still in it right now".
-func recordFailure(cluster string, probation bool, config Config, nowMs int64) {
+func recordFailure(cluster string, threshold, cooldownMs, rampMs, nowMs int64) {
 	key := SharedHealthPrefix + cluster
 	for attempt := 0; attempt < casMaxRetries; attempt++ {
 		st, cas, ok := loadHealth(key)
 		if !ok {
 			return
-		}
-		threshold := config.unhealthyThreshold
-		if probation {
-			threshold = 1
 		}
 		st.Fails++
 		if st.Fails >= threshold {
@@ -177,8 +282,8 @@ func recordFailure(cluster string, probation bool, config Config, nowMs int64) {
 			// cooldownMs / rampMs. That fixes the window per occurrence, so
 			// editing the config later cannot reinterpret an in-progress
 			// cooldown as a different length.
-			st.EjectedUntil = nowMs + config.cooldownMs
-			st.RampUntil = st.EjectedUntil + config.rampMs
+			st.EjectedUntil = nowMs + cooldownMs
+			st.RampUntil = st.EjectedUntil + rampMs
 			proxywasm.LogWarnf("%s: ejecting %s until %d (ramp until %d)",
 				pluginName, cluster, st.EjectedUntil, st.RampUntil)
 		}

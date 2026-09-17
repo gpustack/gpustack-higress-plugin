@@ -41,17 +41,25 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// header exists before 795, otherwise the route would not match at all.)
 	clientModel, _ := proxywasm.GetHttpRequestHeader("x-higress-llm-model")
 
-	set := buildCandidateSet(config, nowMillis(), clientModel)
-	publishCandidates(set)
-	proxywasm.LogDebugf("%s: published %d/%d candidates (weighted=%t)",
-		pluginName, len(set.Candidates), len(config.candidates), isWeighted(set.Candidates))
-
 	// **Do not call ctx.DisableReroute()**: it stops the route from being
 	// re-evaluated after the headers change, which is exactly what the
 	// finisher's x-higress-target-cluster write depends on. Calling it makes
 	// the override silently ineffective -- the request keeps using
 	// weighted_clusters with no error anywhere.
-	return types.ActionContinue
+	//
+	// The action comes from the store, because whether this request has to wait
+	// decides it: shared data answers in-process and returns ActionContinue,
+	// redis pauses under watermark and resumes from the callback. Everything
+	// below the load is identical either way, which is what keeps the two
+	// backends from drifting apart.
+	nowMs := nowMillis()
+	return config.stateBackend().LoadStates(candidateClusters(config.candidates), nowMs, config.maxInflightAgeMs,
+		func(states map[string]clusterState) {
+			set := buildCandidateSet(config, nowMs, clientModel, states)
+			publishCandidates(set)
+			proxywasm.LogDebugf("%s: published %d/%d candidates (weighted=%t)",
+				pluginName, len(set.Candidates), len(config.candidates), isWeighted(set.Candidates))
+		})
 }
 
 // handleLegacyMode is higress model-mapper's existing path, preserving its
@@ -110,13 +118,23 @@ func contextOnBody(ctx wrapper.HttpContext, config Config, body []byte) types.Ac
 	})
 }
 
-// buildCandidateSet reads the shared state, applies every filter, and produces
-// the candidate set to publish.
+// buildCandidateSet applies every filter to the state the store just loaded and
+// produces the candidate set to publish.
 //
 // All the filters (health, concurrency, kind) are applied here, so capability
 // plugins never need to know anything about health -- that is the direct
 // benefit of putting filtering in the publisher (design §7.1).
-func buildCandidateSet(config Config, nowMs int64, clientModel string) CandidateSet {
+//
+// It takes the state as an argument rather than reading it, which makes it a
+// **pure function**: the whole filter -- ejection, the concurrency cap, the
+// penalty curve, fail-open re-admission -- is unit-testable without a wasm
+// host, and it is the same code on both backends.
+//
+// A cluster missing from states has no state yet, which reads as zero in-flight
+// requests and a clean health record. That is also exactly what a failed redis
+// load produces, which is the fail-open posture: no state means nothing is
+// filtered out.
+func buildCandidateSet(config Config, nowMs int64, clientModel string, states map[string]clusterState) CandidateSet {
 	var out CandidateSet
 
 	type scratch struct {
@@ -139,15 +157,17 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string) Candidate
 		// finisher receives a settled value and needs no mapping logic.
 		s.c.ModelName = resolveCandidateModel(config, c.TargetID, clientModel)
 
+		state := states[c.Cluster]
+
 		s.maxRun = c.maxRunningRequests
-		s.inflight = readInflight(c.Cluster, nowMs, config.maxInflightAgeMs)
+		s.inflight = state.Inflight
 		s.c.Inflight = s.inflight
 
 		// provider candidates take no part in passive health marking: their
 		// single DNS cluster has many endpoints, so ejecting the whole cluster
 		// is an over-reaction.
 		if c.Kind != KindProvider {
-			h := readHealth(c.Cluster)
+			h := state.Health
 			// Both instants were stamped by the finisher at the moment of
 			// ejection; this side only reads them and never computes a window
 			// -- which is why cooldownMs / rampMs live in one place only.
@@ -238,57 +258,4 @@ func publishCandidates(set CandidateSet) {
 	if err := proxywasm.SetProperty([]string{FilterStateCandidates}, data); err != nil {
 		proxywasm.LogErrorf("%s: publish candidates failed: %v", pluginName, err)
 	}
-}
-
-// readInflight counts the in-flight entries that have not aged out.
-//
-// **The age filter has to be applied on the read side too**, even though the
-// finisher already prunes on every +1 and -1. Those prunes only run when this
-// candidate is *selected*, and that is exactly what stops happening once it is
-// filtered out:
-//
-//	maxRunningRequests entries leak (hung stream, client disconnect)
-//	  -> readInflight >= maxRun, so buildCandidateSet marks it overCap
-//	  -> it is never published, so the finisher never selects it
-//	  -> addInflight/removeInflight never run on its key
-//	  -> nothing ever prunes it, and it stays over cap forever
-//
-// failOpen does not rescue this either: the re-admission below deliberately
-// excludes overCap. So a purely read-side condition would hold the candidate
-// out permanently -- the exact starvation that storing timestamps instead of a
-// counter was meant to make impossible.
-//
-// This does not duplicate the knob. maxAgeMs is the same config.maxInflightAgeMs
-// the finisher prunes with, inherited through the same deployment-level path,
-// so the two cannot disagree. The read stays non-destructive: counting here is
-// free, whereas writing the pruned array back would mean a CAS on every
-// candidate of every request.
-func readInflight(cluster string, nowMs, maxAgeMs int64) int64 {
-	data, _, err := proxywasm.GetSharedData(SharedInflightPrefix + cluster)
-	if err != nil || len(data) == 0 {
-		return 0
-	}
-	var st inflightState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return 0
-	}
-	var n int64
-	for _, ts := range st.Starts {
-		if nowMs-ts < maxAgeMs {
-			n++
-		}
-	}
-	return n
-}
-
-func readHealth(cluster string) healthState {
-	var st healthState
-	data, _, err := proxywasm.GetSharedData(SharedHealthPrefix + cluster)
-	if err != nil || len(data) == 0 {
-		return st
-	}
-	if err := json.Unmarshal(data, &st); err != nil {
-		return healthState{}
-	}
-	return st
 }

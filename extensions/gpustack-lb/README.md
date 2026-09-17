@@ -75,7 +75,8 @@ strip the header unconditionally instead.
 
 The two roles share one schema and each reads only its own part. **Every knob
 appears in exactly one role**, so there is no setting that has to be kept in
-sync across both.
+sync across both — with exactly one exception, the optional `redis` block, for
+a structural reason spelled out under [The state backend](#the-state-backend).
 
 ### mode: context
 
@@ -186,6 +187,151 @@ The finisher **needs no matchRules**: its config is entirely deployment-level,
 and "does this route do LB" exists in exactly one place, on context. With no
 candidate set to read it passes the request through untouched -- so there is no
 way for the two CRs' matchRules to fall out of sync.
+
+## The state backend
+
+Two pieces of state outlive a single request: the **in-flight count** and the
+**passive health verdict**, both per cluster. The finisher writes them, context
+reads them and publishes the result with the candidate set, and capability
+plugins never touch them at all.
+
+Where they live is configurable:
+
+| Backend | When | Scope |
+| --- | --- | --- |
+| proxy-wasm shared data | default, no `redis` block | **One Envoy process** |
+| Redis | a `redis` block is present | The whole deployment |
+
+Shared data is the zero-dependency default and is enough for a single-replica
+gateway that does not mind per-thread accounting. Note what its scope really
+is: Envoy runs **one wasm VM per worker thread** and their linear memories are
+disjoint, so even one replica already keeps several independent in-flight
+counts and health verdicts. A candidate's published `inflight` is the count on
+*this* thread, not the instance's real load.
+
+Redis makes both facts deployment-wide. Least-load sees the true aggregate,
+`maxRunningRequests` becomes a fleet-wide soft cap rather than a per-process
+one, and one replica ejecting a dead instance ejects it for every replica.
+
+```yaml
+redis:
+  service_name: redis.static
+  # service_port omitted on purpose -- see the note under the table
+  username: ""
+  password: ""
+  timeout: 1000
+  database: 0
+  key_prefix: gpustack_lb
+```
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `service_name` | string | Yes | - | Redis service FQDN. For static DNS services the name ends with `.static` |
+| `service_port` | int | No | `6379`, or `80` for names ending `.static` | Redis service port. Must be in `[0, 65535]` |
+| `username` | string | No | - | Redis username (Redis 6.0+ with ACL enabled) |
+| `password` | string | No | - | Redis password |
+| `timeout` | int | No | `1000` | Per-command timeout in milliseconds |
+| `database` | int | No | `0` | Redis database index |
+| `key_prefix` | string | No | `gpustack_lb` | Isolates deployments sharing one Redis. Must not contain braces — it *is* the hash tag, see below |
+
+Field names are snake_case, matching `gpustack-rate-limit` and every other
+Higress redis block, rather than this plugin's own camelCase: an operator
+configuring redis is copying a block they already have.
+
+⚠️ **Leave `service_port` out for a `.static` name.** That suffix is a Higress
+static-DNS registration whose listener port is **80** whatever the backend
+speaks, which is what the default resolves to for those names — writing the
+familiar `6379` there connects to the wrong port. Spell the port out only for a
+`.dns` / `.svc` style service, where the default is 6379.
+
+A `redis` value that is neither an object nor `null` — `redis: []`,
+`redis: "yes"`, `redis: 1` — is a **config error**, not "no redis". Reading it
+as absent would silently drop the deployment back to per-process shared data
+while the operator believed fleet-wide state was on, which is the same rule
+`candidates` and `modelMappers` already follow.
+
+### It has to be configured on both CRs
+
+This is the one knob that appears twice, and it is structural rather than an
+oversight: the two roles are two separate WasmPlugin resources, so each one
+needs its own client. There is no channel through which the context CR could
+hand the finisher CR a redis connection.
+
+⚠️ **Configuring it on one side only fails silently.** Context would read a
+store nobody writes and the finisher would write one nobody reads, so every
+candidate looks idle and healthy forever: selection degrades to the weighted
+dice roll / round-robin, and nothing is ever ejected. No error, no log —
+the request path works, it just stops being load-aware. Roll the block out to
+both CRs together, and take it away from both together.
+
+Within one CR, `redis` is inherited by matchRules exactly like the other
+deployment-level knobs — put it in `defaultConfig` and the rules pick it up,
+**including the already-initialised client**, so there is no per-rule `Init`.
+
+### Redis key layout
+
+```text
+{<key_prefix>}:inflight:<cluster>   ZSET   member=<token>  score=<start ms>
+{<key_prefix>}:health:<cluster>     HASH   f=<consecutive fails>
+                                           e=<ejected-until ms>
+                                           r=<ramp-until ms>
+```
+
+The prefix is wrapped in a **Redis Cluster hash tag** on purpose. The read
+batches every candidate of a route into one multi-key script — that batching is
+the whole reason the read costs one round-trip instead of 2N — and a cross-slot
+script is rejected outright under Redis Cluster. Braces pin every key this
+plugin writes to a single slot. The sharding given up is worth nothing here:
+the key count is bounded by the number of model instances and the values are
+tiny.
+
+The in-flight sorted set replaces the shared-data backend's timestamp array
+wholesale. `ZADD` / `ZREM` / `ZREMRANGEBYSCORE` need no read-modify-write, so
+there is no CAS loop, no retry budget, and none of the "the very first write to
+a new key bypasses CAS" window that `state.go` has to document. The health
+update is one atomic `HINCRBY`, which is strictly better than the CAS loop it
+replaces: a lost reset there let *non-consecutive* failures accumulate into an
+ejection.
+
+Inspecting a bucket by hand:
+
+```bash
+redis-cli ZRANGE '{gpustack_lb}:inflight:outbound|80||model-2-12.static' 0 -1 WITHSCORES
+redis-cli HGETALL '{gpustack_lb}:health:outbound|80||model-2-12.static'
+```
+
+### What it costs
+
+The context role has to **wait** for the read, so an LB request carries one
+blocking round-trip: it returns `HeaderStopAllIterationAndWatermark` at 795 and
+resumes from the redis callback. That is the same shape Higress's own
+`prefix_cache` uses and the one `gpustack-rate-limit` already runs in
+production; against an LLM request measured in seconds, an in-cluster
+round-trip well under a millisecond is noise.
+
+The two writes are **fire-and-forget** (`+1` at selection, and one script at
+`onHttpStreamDone` that releases the entry and records the health outcome
+together) and never block anything.
+
+Only the read is batched across candidates. The writes concern exactly one
+cluster each, so they are single-key by nature.
+
+### Failure is fail-open
+
+A dispatch error, a redis error reply, a timeout and a malformed reply all
+resolve to the same thing: **no state**. Every candidate is published with zero
+in-flight and a clean health record, so selection degrades to what it would
+have done before any of this existed.
+
+Decoding is all-or-nothing rather than best-effort on purpose. A partial map
+would be worse than an empty one — the candidates that did decode would carry
+real in-flight counts while the rest carried zero, and least-load would steer
+everything at whichever half failed.
+
+⚠️ The honest cost: **for the duration of a Redis outage nothing is ejected
+either**, so the black-hole effect passive health exists to prevent can come
+back. Taking every LB route out of service because a cache is down is the worse
+of the two.
 
 ## Why the model name rewrite lives in the finisher
 
@@ -337,13 +483,23 @@ overwhelm a backend.
 
 ## Book-keeping
 
-`onHttpStreamDone` does two things at once (they already share the same hook):
+`onHttpStreamDone` does two things at once (they already share the same hook,
+and on the redis backend they share a single round-trip):
 
-**The in-flight count** is stored as an array of per-request start timestamps
-rather than a counter. A counter cannot be lazily pruned, and the decrement path
-is the main failure source for this kind of feature (a stream ending early, a
-client disconnecting, an upstream timing out) -- miss one decrement and the
-counter only ever grows, eventually **starving that instance for good**.
+**The in-flight count** is stored per request rather than as a counter — an
+array of start timestamps on shared data, a sorted set scored by start time on
+redis. A counter cannot be lazily pruned, and the decrement path is the main
+failure source for this kind of feature (a stream ending early, a client
+disconnecting, an upstream timing out) -- miss one decrement and the counter
+only ever grows, eventually **starving that instance for good**. Entries older
+than `maxInflightAgeMs` are treated as leaked; the reader applies that horizon
+as well as the writer, because a candidate that gets filtered out stops being
+selected and therefore stops being pruned.
+
+Selection hands back a **token** identifying the entry, which `onHttpStreamDone`
+gives back to release exactly that one. An empty token means nothing was
+written, and the release is skipped rather than spending a write on a record
+that never existed.
 
 **Passive health** reads `response.flags`, and only failures that did not reach
 the application count:
@@ -412,7 +568,20 @@ Three hard requirements (learned the hard way in `gpustack-rate-limit`):
   that changed. Copying ai-proxy's `resetSharedData()` would wipe health and
   in-flight state on every scale-out (a dead instance that was just ejected
   returns to the candidate set immediately, plus a thundering herd), and
-  scaling is precisely when load most needs to be sensed correctly.
+  scaling is precisely when load most needs to be sensed correctly. The same
+  applies to the redis keys, which is why nothing ever deletes them wholesale --
+  they carry TTLs and expire on their own.
+- **The redis read must stay read-only.** It counts live in-flight members with
+  a `ZCOUNT` lower bound instead of pruning the expired ones first. Pruning
+  there would be a write on the read path, on every request, for every
+  candidate, from the role that is supposed to be a reader. The finisher prunes
+  on both of its writes instead, so expired members are cleaned up by the very
+  traffic that could create them.
+- **The redis callback owns the resume.** It is the only path that resumes the
+  request, and the wrapper invokes it exactly once per successful dispatch --
+  including when redis errored or timed out, which arrive as a resp error value
+  rather than as a missing callback. A failed *dispatch* never pauses in the
+  first place. There is no branch on which the request stays parked.
 
 ## Tests
 
@@ -426,8 +595,22 @@ candidate ordering and weight presence, `modelMappers` resolution precedence,
 config defaults, the rejection body, in-flight pruning, and the flags mask
 (which failures count toward health is easy to change wrongly on intuition).
 
-`normalizeMode` is split out of `parseConfig` as a pure function: `parseConfig`
-calls `LogWarnf` for an unrecognised mode, and host ABI calls panic outside a
-wasm host, so the decision logic could not be unit-tested while buried in there.
-For the same reason `selectScored` reads filter state and is out of unit-test
-scope.
+`buildCandidateSet` **became a pure function** when the state moved behind the
+store — it takes the loaded state instead of reading it — so the whole filter
+is now covered directly: ejection, the concurrency cap, the adaptive penalty
+curve (including that P₀ ignores an ejected instance's pile of leaked
+entries), fail-open re-admission, and that candidates sharing a cluster share
+its state while resolving their own rewrite target. It is the same code on both
+backends, so those tests pin redis behaviour too.
+
+On the redis side the pure surface is the config parse, the key layout, the
+TTL floors, the leak cutoff shared by reader and writer, and `decodeLoadReply`
+— the one place the lua script's wire contract is interpreted, tested against a
+hand-built RESP reply so the contract holds without a redis or a wasm host.
+
+`normalizeMode` and `decodeLoadReply` are both split out of their I/O shells as
+pure functions for the same reason: host ABI calls (including `LogWarnf`) panic
+outside a wasm host, so decision logic buried next to one cannot be unit-tested.
+`decodeLoadReply` therefore returns an error for its caller to log rather than
+logging itself. For the same reason `selectScored` reads filter state and is out
+of unit-test scope.

@@ -99,6 +99,20 @@ type Config struct {
 	prefixModelMapping []ModelMapping
 	defaultModel       string
 
+	// store is where the in-flight counts and health verdicts live: proxy-wasm
+	// shared data by default, redis when a `redis` block is configured.
+	//
+	// It is deployment-level, like the health windows -- but unlike them it has
+	// to be configured on **both** CRs, because the two roles are two separate
+	// WasmPlugin resources and each needs its own client. See the README: a
+	// deployment that configures it on one side only splits the state silently
+	// (context reads a store nobody writes, the finisher writes one nobody
+	// reads), and the symptom is merely that load awareness and ejection stop
+	// working.
+	//
+	// Never nil after a successful parse.
+	store stateStore
+
 	// -- Body-handling parameters, shared by both modes (§2.1).
 	modelKey           string
 	enableOnPathSuffix []string
@@ -196,6 +210,12 @@ func parseConfig(j gjson.Result, config *Config) error {
 	if config.maxInflightAgeMs <= 0 {
 		config.maxInflightAgeMs = defaultMaxInflightAgeMs
 	}
+
+	store, err := buildStateStore(j)
+	if err != nil {
+		return err
+	}
+	config.store = store
 
 	status, ok := normalizeRejectStatus(j.Get("reject.status").Int())
 	if !ok {
@@ -300,6 +320,22 @@ func intField(r gjson.Result, what string) (int64, error) {
 	return r.Int(), nil
 }
 
+// stateBackend is the only read path for store.
+//
+// A zero-valued Config -- what rule_matcher leaves behind when the global
+// config failed to parse -- carries a nil store, and every caller is on the
+// request path. Today no zero config can actually reach one (its mode is "",
+// which routes to the non-LB legacy path that never touches the store), but
+// that is a two-step argument about someone else's error handling, and if it
+// ever stops holding the failure is a panic in the wasm VM rather than a wrong
+// answer. Shared data is the right fallback: it is the zero-dependency default.
+func (c Config) stateBackend() stateStore {
+	if c.store == nil {
+		return sharedDataStore{}
+	}
+	return c.store
+}
+
 // shouldFailOpen is the only read path. nil (unset) is treated as on.
 func (c Config) shouldFailOpen() bool {
 	if c.failOpen == nil {
@@ -366,6 +402,20 @@ func parseOverrideConfig(j gjson.Result, global Config, config *Config) error {
 		}
 	}
 	inheritInt64(j, "maxInflightAgeMs", &config.maxInflightAgeMs, global.maxInflightAgeMs)
+
+	// -- The state backend. Deployment-level, so a rule that says nothing
+	// inherits the global one **including its already-initialised redis
+	// client**: re-creating a client per matchRule would mean one Init host
+	// call per rule at config time for no gain, and nothing distinguishes the
+	// resulting clients.
+	//
+	// A zero-valued global (rule_matcher swallowed a global parse error) leaves
+	// store nil, and then the rule keeps the shared-data backend parseConfig
+	// already gave it. That is the fail-safe direction: LB stays local rather
+	// than losing its state channel entirely.
+	if !redisConfigured(j) && global.store != nil {
+		config.store = global.store
+	}
 
 	// -- The reject body. **The rendered body embeds the status code**, so it
 	// is only safe to reuse the global body when status and message are *both*

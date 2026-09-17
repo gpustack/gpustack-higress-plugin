@@ -15,9 +15,9 @@ const (
 	targetClusterHeader = "x-higress-target-cluster"
 	fallbackFromHeader  = "x-higress-fallback-from"
 
-	ctxKeyChosen      = "gpustack_lb_chosen"
-	ctxKeyStartMs     = "gpustack_lb_start_ms"
-	ctxKeyContentType = "gpustack_lb_content_type"
+	ctxKeyChosen        = "gpustack_lb_chosen"
+	ctxKeyInflightToken = "gpustack_lb_inflight_token"
+	ctxKeyContentType   = "gpustack_lb_content_type"
 )
 
 type chosen struct {
@@ -71,9 +71,12 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		proxywasm.LogErrorf("%s: write %s failed: %v", pluginName, targetClusterHeader, err)
 	}
 
-	startMs := addInflight(pick.Cluster, nowMillis(), config.maxInflightAgeMs)
+	// The token identifies this request's in-flight entry; the store hands it
+	// back at onHttpStreamDone so exactly this entry is released. An empty
+	// token means nothing was written, and the release is skipped.
+	token := config.stateBackend().AddInflight(pick.Cluster, nowMillis(), config.maxInflightAgeMs)
 	ctx.SetContext(ctxKeyChosen, chosen{cluster: pick.Cluster, modelName: pick.ModelName, kind: pick.Kind, probation: pick.Probation})
-	ctx.SetContext(ctxKeyStartMs, startMs)
+	ctx.SetContext(ctxKeyInflightToken, token)
 	proxywasm.LogDebugf("%s: selected %s (model=%s, weighted=%t)",
 		pluginName, pick.Cluster, pick.ModelName, isWeighted(set.Candidates))
 
@@ -136,31 +139,48 @@ func finisherOnBody(ctx wrapper.HttpContext, config Config, body []byte) types.A
 }
 
 // finisherOnStreamDone does two things at once because they already share the
-// same hook: decrement the in-flight count, and read the response properties
-// for passive health marking.
+// same hook: release the in-flight entry, and read the response properties for
+// passive health marking. They go to the store as one record, which lets the
+// redis backend settle both in a single round-trip.
 func finisherOnStreamDone(ctx wrapper.HttpContext, config Config) {
 	pick, ok := ctx.GetContext(ctxKeyChosen).(chosen)
 	if !ok {
 		return
 	}
 	now := nowMillis()
-
-	if startMs, ok := ctx.GetContext(ctxKeyStartMs).(int64); ok {
-		removeInflight(pick.cluster, startMs, now, config.maxInflightAgeMs)
-	}
+	token, _ := ctx.GetContext(ctxKeyInflightToken).(string)
 
 	// provider candidates take no part in passive health marking: their single
 	// DNS cluster has many endpoints, so ejecting the whole cluster is an
-	// over-reaction -- leave the choice within the cluster to Envoy.
-	if pick.kind == KindProvider {
-		return
+	// over-reaction -- leave the choice within the cluster to Envoy. The
+	// in-flight entry is still released; only the health verdict is skipped.
+	oc := outcomeIgnored
+	if pick.kind != KindProvider {
+		oc = outcomeSuccess
+		if isConnectivityFailure() {
+			oc = outcomeFailure
+		}
 	}
 
-	if isConnectivityFailure() {
-		recordFailure(pick.cluster, pick.probation, config, now)
-		return
+	// The threshold is resolved **here**, not in the store: normally
+	// unhealthyThreshold, tightened to 1 when this request was admitted during
+	// a recovery window. Deciding it once, on this side, is what keeps the two
+	// backends from being able to answer the question differently.
+	threshold := config.unhealthyThreshold
+	if pick.probation {
+		threshold = 1
 	}
-	recordSuccess(pick.cluster)
+
+	config.stateBackend().Done(doneRecord{
+		Cluster:    pick.cluster,
+		Token:      token,
+		Outcome:    oc,
+		NowMs:      now,
+		MaxAgeMs:   config.maxInflightAgeMs,
+		Threshold:  threshold,
+		CooldownMs: config.cooldownMs,
+		RampMs:     config.rampMs,
+	})
 }
 
 func readCandidateSet() (CandidateSet, bool) {
