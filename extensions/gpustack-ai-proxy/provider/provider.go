@@ -1337,20 +1337,12 @@ func (c *ProviderConfig) handleRequestBody(
 	return types.ActionContinue, replaceRequestBody(body)
 }
 
-func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningContent ...bool) []byte {
-	result := body
-	for _, field := range []string{"claude_thinking", "claude_output_config", "claude_anthropic_beta"} {
-		if updated, err := sjson.DeleteBytes(result, field); err == nil {
-			result = updated
-		}
-	}
-
-	messages := gjson.GetBytes(body, "messages")
-	if !messages.IsArray() {
-		return result
-	}
-
-	fields := []string{
+// claudeRootInternalFields and claudeMessageInternalFields are the GPUStack-internal
+// field names stripped from Claude request bodies. They are package-level to avoid
+// allocating the slices on every call of stripClaudeInternalMessageFields.
+var (
+	claudeRootInternalFields    = []string{"claude_thinking", "claude_output_config", "claude_anthropic_beta"}
+	claudeMessageInternalFields = []string{
 		"reasoning",
 		"reasoning_signature",
 		"reasoning_redacted_content",
@@ -1358,17 +1350,77 @@ func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningConte
 		"claude_content_block_index",
 		"claude_content_block_stop",
 	}
-	if len(preserveMessageReasoningContent) == 0 || !preserveMessageReasoningContent[0] {
-		fields = append(fields, "reasoning_content")
+)
+
+// stripClaudeInternalMessageFields removes GPUStack-internal Claude fields from
+// the request body using a single unmarshal/marshal pass so that the cost is
+// O(K) for a K-message body instead of O(K^2) full-document rewrites, which
+// previously blocked the Envoy worker event loop on large multi-round bodies.
+// Only root-level fields and the direct fields of each message are removed;
+// fields with the same name nested deeper in the document are untouched.
+func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningContent ...bool) []byte {
+	preserveReasoningContent := len(preserveMessageReasoningContent) > 0 && preserveMessageReasoningContent[0]
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
 	}
 
-	for _, field := range fields {
-		messages.ForEach(func(key, _ gjson.Result) bool {
-			if updated, err := sjson.DeleteBytes(result, fmt.Sprintf("messages.%d.%s", key.Int(), field)); err == nil {
-				result = updated
+	docChanged := false
+	for _, field := range claudeRootInternalFields {
+		if _, exists := doc[field]; exists {
+			delete(doc, field)
+			docChanged = true
+		}
+	}
+
+	if rootMessages, ok := doc["messages"]; ok {
+		var messages []json.RawMessage
+		if err := json.Unmarshal(rootMessages, &messages); err == nil {
+			messagesChanged := false
+			for i, rawMessage := range messages {
+				var message map[string]json.RawMessage
+				if err := json.Unmarshal(rawMessage, &message); err != nil {
+					continue
+				}
+				changed := false
+				for _, field := range claudeMessageInternalFields {
+					if _, exists := message[field]; exists {
+						delete(message, field)
+						changed = true
+					}
+				}
+				if !preserveReasoningContent {
+					if _, exists := message["reasoning_content"]; exists {
+						delete(message, "reasoning_content")
+						changed = true
+					}
+				}
+				if changed {
+					if updated, err := json.Marshal(message); err == nil {
+						messages[i] = updated
+						messagesChanged = true
+					}
+				}
 			}
-			return true
-		})
+			if messagesChanged {
+				if updated, err := json.Marshal(messages); err == nil {
+					doc["messages"] = updated
+					docChanged = true
+				}
+			}
+		}
+	}
+
+	// Nothing was stripped; skip the marshalling and return the original body
+	// unchanged to avoid unnecessary allocations.
+	if !docChanged {
+		return body
+	}
+
+	result, err := json.Marshal(doc)
+	if err != nil {
+		return body
 	}
 	return result
 }

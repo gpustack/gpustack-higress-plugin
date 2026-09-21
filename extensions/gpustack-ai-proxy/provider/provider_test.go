@@ -6,8 +6,11 @@
 package provider
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/tidwall/gjson"
@@ -825,4 +828,89 @@ func TestStripClaudeInternalMessageFields(t *testing.T) {
 	assert.Equal(t, "reasoning", gjson.GetBytes(preserved, "messages.0.reasoning_content").String())
 	assert.False(t, gjson.GetBytes(preserved, "messages.0.reasoning_signature").Exists())
 	assert.False(t, gjson.GetBytes(preserved, "messages.0.claude_content_blocks").Exists())
+}
+
+func TestStripClaudeInternalMessageFieldsNestedUntouched(t *testing.T) {
+	// Fields with the internal names nested deeper than the direct message
+	// fields must NOT be removed.
+	body := []byte(`{
+		"model":"claude",
+		"messages":[{
+			"role":"assistant",
+			"content":[
+				{"type":"text","text":"hi","reasoning":"keep-me","claude_content_block_index":7}
+			],
+			"metadata":{"claude_thinking":{"type":"adaptive"},"reasoning_signature":"keep-signature"}
+		}]
+	}`)
+
+	result := stripClaudeInternalMessageFields(body)
+
+	assert.Equal(t, "keep-me", gjson.GetBytes(result, "messages.0.content.0.reasoning").String())
+	assert.Equal(t, float64(7), gjson.GetBytes(result, "messages.0.content.0.claude_content_block_index").Float())
+	assert.Equal(t, "adaptive", gjson.GetBytes(result, "messages.0.metadata.claude_thinking.type").String())
+	assert.Equal(t, "keep-signature", gjson.GetBytes(result, "messages.0.metadata.reasoning_signature").String())
+}
+
+func TestStripClaudeInternalMessageFieldsNoOpReturnsOriginalBody(t *testing.T) {
+	// When no internal fields are present the original body must be returned
+	// as-is (same byte slice / byte-identical), skipping re-marshalling.
+	body := []byte(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`)
+
+	result := stripClaudeInternalMessageFields(body)
+	assert.Equal(t, string(body), string(result))
+	assert.Same(t, &body[0], &result[0], "original body should be returned without re-marshalling")
+}
+
+func TestStripClaudeInternalMessageFieldsScalesLinearly(t *testing.T) {
+	// Regression test for the O(K^2) full-document rewrite issue (gpustack/gpustack#6217).
+	// The transformation must complete in near-linear time; a generous absolute
+	// bound keeps the test deterministic while still failing the old quadratic
+	// implementation by orders of magnitude on a 301-round style body.
+	buildBody := func(rounds int) []byte {
+		// Each message carries a ~2 KB payload so the body resembles the real
+		// failing case from the issue (~1 MB / hundreds of rounds). With tiny
+		// messages the old quadratic implementation also finishes under the
+		// bound below, which would make the test useless as a regression guard.
+		content := strings.Repeat("round text ", 200)
+		message := fmt.Sprintf(`{"role":"user","content":"%s","reasoning_content":"r","reasoning_signature":"s","reasoning_redacted_content":"x","claude_content_blocks":[{"type":"thinking"}],"claude_content_block_index":1,"claude_content_block_stop":1}`, content)
+		buf := bytes.NewBufferString(`{"model":"claude","claude_thinking":{"type":"adaptive"},"messages":[`)
+		for i := 0; i < rounds; i++ {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			buf.WriteString(message)
+		}
+		buf.WriteString(`]}`)
+		return buf.Bytes()
+	}
+
+	body := buildBody(500)
+	start := time.Now()
+	result := stripClaudeInternalMessageFields(body)
+	elapsed := time.Since(start)
+
+	assert.True(t, gjson.GetBytes(result, "messages.499.content").Exists())
+	assert.False(t, gjson.GetBytes(result, "messages.499.reasoning_content").Exists())
+	// ~500 messages must be processed well under 1s; the old implementation
+	// took seconds and grew quadratically with the number of messages.
+	assert.Less(t, elapsed, time.Second, "stripClaudeInternalMessageFields took %v for 500 messages", elapsed)
+}
+
+func BenchmarkStripClaudeInternalMessageFields(b *testing.B) {
+	message := fmt.Sprintf(`{"role":"user","content":"%s","reasoning_content":"r","reasoning_signature":"s","reasoning_redacted_content":"x","claude_content_blocks":[{"type":"thinking"}],"claude_content_block_index":1,"claude_content_block_stop":1}`, strings.Repeat("round text ", 200))
+	buf := bytes.NewBufferString(`{"model":"claude","claude_thinking":{"type":"adaptive"},"messages":[`)
+	for i := 0; i < 300; i++ {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(message)
+	}
+	buf.WriteString(`]}`)
+	body := buf.Bytes()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stripClaudeInternalMessageFields(body)
+	}
 }
