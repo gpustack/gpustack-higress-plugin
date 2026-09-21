@@ -10,5 +10,6 @@ use (
 	./extensions/gpustack-model-mapper
 	./extensions/gpustack-rate-limit
 	./extensions/gpustack-set-header-pre-route
+	./extensions/gpustack-ip-acl
 	./extensions/gpustack-token-usage
 )

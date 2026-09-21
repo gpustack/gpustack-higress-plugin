@@ -1,0 +1,100 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-ip-acl
+  namespace: higress-system
+spec:
+  # ext-auth is deployed at AUTHN/360 (gpustack core gateway/ext_auth.py) and
+  # is what injects the trusted `x-mse-consumer` header — NOT Higress key-auth.
+  # Same phase, priority just below it: AUTHN/350. This must run after 360 or
+  # the header is absent and every request falls into "no consumer →
+  # unrestricted" — the ACL silently no-ops.
+  #
+  # Note phase buckets, not raw priority numbers, decide cross-plugin order
+  # (evidence: ext_auth.py:364 — ai-proxy UNSPECIFIED/100 runs *after*
+  # AUTHN/360). AUTHN runs before UNSPECIFIED, so rate-limit (UNSPECIFIED/600)
+  # and token-usage (UNSPECIFIED/400) execute AFTER this plugin: rejected
+  # requests are not rate-limited-counted and not metered.
+  #
+  # Chain: AUTHN 900 model-router → 810 transformer → 360 ext-auth →
+  #        350 ip-acl (this plugin) → 340-325 LB band (context →
+  #        capabilities → finisher) → UNSPECIFIED 600 rate-limit →
+  #        400 token-usage → 100 ai-proxy
+  phase: AUTHN
+  priority: 350
+  url: oci://<your-registry>/<your-org>/gpustack-ip-acl:0.1.0
+  sha256: "<sha256-digest>"
+  defaultConfigDisable: false
+
+  defaultConfig:
+    # The consumer identity is read from the hard-coded Higress convention
+    # header `x-mse-consumer`. In the GPUStack deployment it is injected by
+    # gpustack-ext-auth (AUTHN/360) — NOT by Higress's built-in key-auth —
+    # and each GPUStack API key maps to a consumer, so per-consumer rules
+    # equal the enterprise per-API-key IP ACL granularity.
+
+    # ⚠️ Leave realIPHeader UNSET unless a trusted proxy in front of the
+    # gateway OVERWRITES (not appends to) the header. The first value of a
+    # comma-separated list is used; with X-Forwarded-For and no trusted
+    # overwriting proxy, a client reaching the gateway directly can spoof
+    # its source IP and bypass the ACL. When unset, the plugin uses Envoy's
+    # downstream source address, which cannot be spoofed.
+    # realIPHeader: "x-forwarded-for"
+
+    # Per-consumer rule sets:
+    #   - deniedCidrs: blacklist, evaluated first, always takes precedence.
+    #   - allowedCidrs: whitelist; when non-empty the caller IP MUST match
+    #     one of its ranges.
+    #   - A consumer with no matching entry (or empty lists) is unrestricted.
+    # Entries accept CIDR (v4/v6) or a single host.
+    #
+    # Consumer keys support a single `*` wildcard — `gpustack-*` (prefix),
+    # `*-ci` (suffix), `*` (catch-all default). Exact names always win;
+    # wildcards apply in declaration order, so put narrower patterns first.
+    consumers:
+      # Exact name: wins over any wildcard.
+      platform-team:
+        allowedCidrs:
+          - "10.8.0.0/16"
+        deniedCidrs:
+          - "10.8.0.66/32" # carve one compromised host out of the VPN range
+
+      # Prefix wildcard: every gpustack-* consumer is whitelisted to /8.
+      "gpustack-*":
+        allowedCidrs:
+          - "10.0.0.0/8"
+
+      # Suffix wildcard: every *-ci consumer is blacklisted from one subnet.
+      "*-ci":
+        deniedCidrs:
+          - "203.0.113.0/24"
+
+      # Catch-all default for every other consumer. Declare it last.
+      "*":
+        deniedCidrs:
+          - "198.51.100.0/24"
+          - "198.51.100.7"
+
+      # IPv6 ranges are supported too.
+      internal-services:
+        allowedCidrs:
+          - "2001:db8::/32"
+
+  # matchRule-level overrides (route/ingress): the matched rule's config
+  # inherits defaultConfig and then applies per-key overrides — a consumer
+  # redeclared here replaces its global rule entirely on that route;
+  # consumers not mentioned keep their global rules.
+  matchRules:
+    - ingress:
+        - ai-route-admin.internal
+      configDisable: false
+      config:
+        consumers:
+          # Tighten platform-team on the admin route only.
+          platform-team:
+            allowedCidrs:
+              - "10.8.1.0/24"
+          # Unrestrict ci consumers on this route by redeclaring with
+          # empty lists (overrides cannot remove a global entry, but an
+          # empty redeclaration effectively unrestricts it here).
+          "*-ci": {}
