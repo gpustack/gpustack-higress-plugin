@@ -4,11 +4,11 @@ A **capability plugin** of the LB framework: it sends the requests of one
 session consistently to the same instance.
 
 ```text
-795  gpustack-lb (mode: context)   publishes the candidate set into filter state
-780  this plugin                   reads the set -> rendezvous ranking ->
+340  gpustack-lb (mode: context)   publishes the candidate set into filter state
+335  this plugin                   reads the set -> rendezvous ranking ->
                                    appends one opinion
-740  gpustack-lb-least-load        least load (when deployed)
-700  gpustack-lb (mode: finisher)  L1-normalises + weighted sum -> picks a
+330  gpustack-lb-least-load        least load (when deployed)
+325  gpustack-lb (mode: finisher)  L1-normalises + weighted sum -> picks a
                                    candidate -> writes the cluster header
 ```
 
@@ -232,8 +232,8 @@ fail outright, and silently.
 ## The cost of body sources
 
 ⚠️ **`maxBodyBytes` has to be raised here, not left to the finisher.** This
-plugin stops iteration at 780 and `gpustack-lb` only raises the decoder buffer
-limit at 700, so by then Envoy has already buffered under the route default —
+plugin stops iteration at 335 and `gpustack-lb` only raises the decoder buffer
+limit at 325, so by then Envoy has already buffered under the route default —
 1 MiB in stock Envoy, and Higress deployments run values as low as 32 KiB. A
 `/v1/messages` body carrying images would take a 413, which would mean
 *installing this plugin changes which requests succeed*. The default therefore

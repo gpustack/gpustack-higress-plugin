@@ -5,12 +5,12 @@
 # change how much say this plugin has, change its `weight`, not its priority.
 # The conventional ordering is simply:
 #
-#   780  session-affinity
-#   760  prefix (enterprise edition)
-#   740  least-load
+#   335  session-affinity
+#   333  prefix (enterprise edition)
+#   330  least-load
 #
 # Prerequisite: this route already carries the two gpustack-lb CRs, mode:
-# context (795) and mode: finisher (700), and the context one has candidates
+# context (340) and mode: finisher (325), and the context one has candidates
 # configured.
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
@@ -19,7 +19,7 @@ metadata:
   namespace: higress-system
 spec:
   phase: AUTHN
-  priority: 740
+  priority: 330
   url: oci://<registry>/<org>/gpustack-lb-least-load:0.1.0
   defaultConfigDisable: false
 

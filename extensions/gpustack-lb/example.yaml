@@ -20,8 +20,27 @@ metadata:
   name: gpustack-model-mapper
   namespace: higress-system
 spec:
+  # AUTHN/340: the band now runs AFTER ext-auth (AUTHN/360) and gpustack-ip-acl
+  # (AUTHN/350), so unauthenticated or IP-rejected requests never touch LB
+  # state (inflight counters, redis round-trips, session-affinity writes,
+  # health windows). The band keeps its internal order: 340 context ->
+  # 335 session-affinity / 333 prefix / 330 least-load -> 325 finisher.
+  # It must still run after model-router (AUTHN/900, writes
+  # x-higress-llm-model) and before ai-proxy (UNSPECIFIED/100) -- both hold
+  # with any AUTHN priority below 360, since the whole AUTHN bucket precedes
+  # UNSPECIFIED.
+  #
+  # ⚠️ Migrating an existing deployment from the old 795-700 band: this is an
+  # ATOMIC move — disable/withdraw the old CRs (or apply the new priorities to
+  # all of them) in one change. Transitional coexistence of the old and new
+  # band is NOT safe: two finisher instances would both run their
+  # selection/bookkeeping against the same request (double inflight
+  # accounting, overwritten chosen-cluster state). After the move, verify
+  # once via config_dump that x-higress-target-cluster routing still hits
+  # (header-change-triggered reroute works from any pre-router position, but
+  # deserves one live check after the move).
   phase: AUTHN
-  priority: 795
+  priority: 340
   url: oci://<registry>/<org>/gpustack-lb:0.1.0
   defaultConfigDisable: false
   # mode belongs in defaultConfig: Higress applies defaultConfig to routes not
@@ -105,7 +124,7 @@ metadata:
   namespace: higress-system
 spec:
   phase: AUTHN
-  priority: 700
+  priority: 325
   url: oci://<registry>/<org>/gpustack-lb:0.1.0
   defaultConfigDisable: false
   # **No matchRules**: the config is entirely deployment-level, and "does this

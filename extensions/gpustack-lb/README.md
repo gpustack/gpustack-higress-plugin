@@ -4,16 +4,24 @@ The **single binary** of the LB plugin framework; `mode` in its config decides
 which role it plays:
 
 ```text
-mode: context   AUTHN/795  read config -> filter -> publish the candidate set
+mode: context   AUTHN/340  read config -> filter -> publish the candidate set
                            into filter state; on non-LB routes it degrades to
                            model-mapper's existing behaviour
-  ↓ the capability band (session-affinity 780 / prefix 760 / least-load 740)
+  ↓ the capability band (session-affinity 335 / prefix 333 / least-load 330)
     each append a ranking opinion
-mode: finisher  AUTHN/700  read the rankings -> pick a candidate -> write
+mode: finisher  AUTHN/325  read the rankings -> pick a candidate -> write
                            x-higress-target-cluster -> buffer the body to
                            rewrite the model name -> book-keeping in
                            onStreamDone
 ```
+
+The band sits immediately **after** ext-auth (`AUTHN/360`) and gpustack-ip-acl
+(`AUTHN/350`): unauthenticated or IP-rejected requests are cut off before
+they can touch LB state (inflight counters, redis round-trips, session
+writes, health windows). It remains after model-router (`AUTHN/900`, writes
+`x-higress-llm-model`) and before ai-proxy (`UNSPECIFIED/100`); both hold
+for any AUTHN priority below 360 because the whole AUTHN bucket precedes
+UNSPECIFIED.
 
 **Two CRs are structurally necessary**, two binaries are not: the capability
 plugins have to run between "publish the candidates" and "make the decision",
@@ -124,8 +132,8 @@ and context only reads them, so it never needs to know the window lengths.
 
 #### `maxRunningRequests` is a soft cap
 
-The check reads a snapshot in `context` (795) while the increment happens in the
-finisher (700), so requests on different worker threads can all see
+The check reads a snapshot in `context` (340) while the increment happens in the
+finisher (325), so requests on different worker threads can all see
 `inflight < maxRunningRequests`, all be published, and all be routed — the cap
 can be overshot by up to the number of admissions in that window.
 
@@ -303,7 +311,7 @@ redis-cli HGETALL '{gpustack_lb}:health:outbound|80||model-2-12.static'
 ### What it costs
 
 The context role has to **wait** for the read, so an LB request carries one
-blocking round-trip: it returns `HeaderStopAllIterationAndWatermark` at 795 and
+blocking round-trip: it returns `HeaderStopAllIterationAndWatermark` at 340 and
 resumes from the redis callback. That is the same shape Higress's own
 `prefix_cache` uses and the one `gpustack-rate-limit` already runs in
 production; against an LLM request measured in seconds, an in-cluster

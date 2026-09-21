@@ -4,13 +4,13 @@ A **capability plugin** of the LB framework: it sends each request to the
 instance with the lowest current load.
 
 ```text
-795  gpustack-lb (mode: context)        publishes the candidate set (inflight /
+340  gpustack-lb (mode: context)        publishes the candidate set (inflight /
                                         penalty already included)
-780  gpustack-lb-session-affinity       session stickiness (when deployed)
-760  gpustack-lb-prefix                 prefix affinity (enterprise edition)
-740  this plugin                        reads the set -> scores load -> appends
+335  gpustack-lb-session-affinity       session stickiness (when deployed)
+333  gpustack-lb-prefix                 prefix affinity (enterprise edition)
+330  this plugin                        reads the set -> scores load -> appends
                                         one opinion
-700  gpustack-lb (mode: finisher)       L1-normalises + weighted sum -> picks a
+325  gpustack-lb (mode: finisher)       L1-normalises + weighted sum -> picks a
                                         candidate -> writes the cluster header
 ```
 
