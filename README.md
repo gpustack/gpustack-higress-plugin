@@ -20,6 +20,31 @@ pip install gpustack-higress-plugins
 
 - **gpustack-set-header-pre-route** - Automatically injects the route name and model name into HTTP request headers before routing, based on configurable path suffixes or prefixes.
 
+- **gpustack-ip-acl** - Per-consumer source-IP blacklist/whitelist, mirroring the GPUStack Enterprise API key IP ACL semantics at the gateway. Rules are keyed by the Higress consumer identity (`x-mse-consumer`, injected by `gpustack-ext-auth`); `deniedCidrs` always take precedence over `allowedCidrs`, consumer keys support `*` wildcards, and invalid client IPs fail closed. Supports per-route overrides via Higress `matchRules`. Deploy at `AUTHN/350`, immediately after ext-auth.
+
+- **gpustack-lb** - The single binary of the LB plugin framework (`mode: context` / `mode: finisher`), replacing model-mapper: publishes candidate instances, then picks one by weighted-sum ranking and steers the route via `x-higress-target-cluster`.
+
+- **gpustack-lb-session-affinity** - LB capability plugin: keeps one session's requests on the same instance.
+
+- **gpustack-lb-least-load** - LB capability plugin: sends each request to the least-loaded instance.
+
+See each plugin's `README.md` and `example.yaml` under `extensions/` for full configuration and deployment details.
+
+## Filter-Chain Ordering
+
+Plugins are positioned by `phase` (bucket order: AUTHN → … → UNSPECIFIED; buckets beat raw priority numbers) and `priority` (descending within a phase). The intended chain — all rejection points ahead of any scheduling-state work:
+
+```text
+AUTHN       900 model-router → 810 transformer (strips spoofed identity headers)
+            → 360 gpustack-ext-auth (injects trusted x-mse-consumer; 401)
+            → 350 gpustack-ip-acl (403)
+            → 340-325 LB band (context → session-affinity / prefix / least-load → finisher)
+UNSPECIFIED 600 gpustack-rate-limit (429) → 400 gpustack-token-usage
+            → 100 ai-proxy → router
+```
+
+When changing any plugin's position, re-check its ordering constraints (documented in each plugin's README) and verify the live filter chain via Envoy `config_dump` after rollout.
+
 ## Usage
 
 ### Start Plugin Server
@@ -170,6 +195,8 @@ gpustack-higress-plugins/
 │   │   ├── go.mod
 │   │   └── VERSION
 │   ├── gpustack-set-header-pre-route/
+│   ├── gpustack-ip-acl/             # Per-consumer IP blacklist/whitelist
+│   ├── gpustack-lb/                 # LB framework (context/finisher roles)
 │   ├── remote_plugins.yaml        # Remote OCI plugin config
 │   └── Makefile
 ├── gpustack_higress_plugins/      # Python package
