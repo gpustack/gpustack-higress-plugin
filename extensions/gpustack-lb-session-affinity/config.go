@@ -151,13 +151,15 @@ func parseSessionKeys(j gjson.Result) ([]keySource, error) {
 	if parseErr != nil {
 		return nil, parseErr
 	}
-	if len(out) == 0 {
-		// An empty array is the same as not installing the plugin. Error out
-		// rather than silently doing nothing: Higress's defaultConfig also
-		// applies to routes absent from matchRules, and a config that does
-		// nothing is very hard to tell apart from one that is simply wrong.
-		return nil, errors.New("sessionKeys must not be empty")
-	}
+	// An explicit empty array is the GPUStack core INERT_DEFAULT contract
+	// (gpustack/routes/plugins/session_affinity/plugin.py): the defaultConfig
+	// published for routes without a session-affinity policy parses but does
+	// nothing — no header source, no body source, no opinion. Rejecting it
+	// here made Envoy fail to load the plugin and, worse, reject the whole
+	// listener delta, blocking every other plugin's config push.
+	//
+	// A MISSING sessionKeys stays an error: a matchRule without a chain is a
+	// config mistake, not the documented inert form.
 	return out, nil
 }
 

@@ -27,6 +27,11 @@ spec:
   # routes that are absent from matchRules -- a matchRule without sessionKeys
   # fails to parse rather than falling back to the global chain.
   #
+  # The one exception: `sessionKeys: []` (an explicit empty array) is the
+  # GPUStack core INERT_DEFAULT and parses fine -- the plugin just never
+  # yields a key and publishes no opinion. That is the expected shape of the
+  # managed CR on deployments where no route uses session affinity.
+  #
   # So there are two coherent shapes, and mixing them is the thing to avoid:
   #
   #   per-route  defaultConfigDisable: true, every route declares its own chain

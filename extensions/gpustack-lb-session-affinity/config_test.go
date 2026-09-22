@@ -15,15 +15,14 @@ func parse(t *testing.T, raw string) Config {
 	return c
 }
 
-// An empty, missing or malformed sessionKeys must error out rather than
-// silently do nothing: Higress's defaultConfig also applies to routes absent
-// from matchRules, and a config that does nothing is very hard to tell apart
-// from one that is simply wrong.
+// A missing or malformed sessionKeys must error out rather than silently do
+// nothing. An explicit empty array is the ONE tolerated shape: it is the
+// GPUStack core INERT_DEFAULT (routes without a session-affinity policy) and
+// must parse to a config that yields no key anywhere.
 func TestSessionKeysValidation(t *testing.T) {
 	bad := []struct{ name, raw string }{
 		{"missing field", `{}`},
 		{"not an array", `{"sessionKeys":{"header":"x"}}`},
-		{"empty array", `{"sessionKeys":[]}`},
 		{"empty object entry", `{"sessionKeys":[{}]}`},
 		{"whitespace only", `{"sessionKeys":[{"header":"  "}]}`},
 		// Setting both in one link is ambiguous: each link is an independent
@@ -39,6 +38,25 @@ func TestSessionKeysValidation(t *testing.T) {
 				t.Errorf("expected an error for %s", tt.raw)
 			}
 		})
+	}
+}
+
+// The GPUStack core INERT_DEFAULT (`sessionKeys: []`) must parse and be a
+// no-op everywhere: no body source, no header source. This is what the
+// defaultConfig carries on routes without a session-affinity policy — if it
+// failed to parse, Envoy would refuse to load the plugin and reject the
+// whole listener update (seen in the wild: every other plugin's config push
+// blocked by this one).
+func TestEmptySessionKeysIsInert(t *testing.T) {
+	c := parse(t, `{"sessionKeys":[]}`)
+	if len(c.sessionKeys) != 0 {
+		t.Fatalf("got %d keys, want 0", len(c.sessionKeys))
+	}
+	if c.hasBodySource() {
+		t.Error("empty chain must not report a body source")
+	}
+	if _, key := firstHeaderKey(c); key != "" {
+		t.Errorf("empty chain must not yield a header key, got %q", key)
 	}
 }
 
