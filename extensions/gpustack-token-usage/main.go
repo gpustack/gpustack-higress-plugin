@@ -159,8 +159,8 @@ const (
 	//   - onStreamingResponseBody observed endOfStream=true (covers both
 	//     SSE streams and non-streaming JSON, which reaches the same
 	//     callback as a single chunk with endOfStream=true);
-	//   - onHttpResponseHeaders skipped body reading (TTS/image path) and
-	//     the upstream responded 2xx.
+	//   - onHttpResponseHeaders skipped body reading (TTS/image path, or a
+	//     header-only response) and the upstream responded 2xx.
 	// A mid-stream client disconnect / upstream reset never produces
 	// endOfStream=true, so this stays false. Decouples the completed flag
 	// from token counts so non-LLM endpoints (token fields legitimately 0)
@@ -811,6 +811,24 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 		// be set here based on the upstream status: 2xx is taken as
 		// "normally completed" since these endpoints typically have no
 		// token usage and request-count is the billable unit.
+		if status, err := proxywasm.GetHttpResponseHeader(":status"); err == nil &&
+			len(status) > 0 && status[0] == '2' {
+			ctx.SetContext(ResponseCompletedKey, true)
+		}
+		ctx.DontReadResponseBody()
+		return types.ActionContinue
+	}
+	// A header-only response (e.g. a 404 with content-length: 0) already
+	// carries end_of_stream=true, so Envoy never invokes the response body
+	// callback and nothing would resume a HeaderStopIteration — the response
+	// would hang at the gateway until the client times out. Guard both
+	// body-buffering returns below, mirroring the request-direction guard in
+	// gpustack-lb-session-affinity. Reporting still happens in
+	// onHttpStreamDone, so usage/request-count records are unaffected.
+	if !ctx.HasResponseBody() {
+		// The body callback is never invoked for a header-only response,
+		// so the completed signal has to be set here from the upstream
+		// status, mirroring the !processBody path above.
 		if status, err := proxywasm.GetHttpResponseHeader(":status"); err == nil &&
 			len(status) > 0 && status[0] == '2' {
 			ctx.SetContext(ResponseCompletedKey, true)
