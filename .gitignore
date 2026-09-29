@@ -12,6 +12,7 @@
 /extensions/gpustack-lb/gpustack-lb
 /extensions/gpustack-lb-least-load/gpustack-lb-least-load
 /extensions/gpustack-lb-session-affinity/gpustack-lb-session-affinity
+/extensions/gpustack-lb-decision-service/gpustack-lb-decision-service
 /extensions/gpustack-model-mapper/gpustack-model-mapper
 /extensions/gpustack-rate-limit/gpustack-rate-limit
 /extensions/gpustack-set-header-pre-route/gpustack-set-header-pre-route

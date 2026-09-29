@@ -28,6 +28,8 @@ pip install gpustack-higress-plugins
 
 - **gpustack-lb-least-load** - LB capability plugin: sends each request to the least-loaded instance.
 
+- **gpustack-lb-decision-service** - LB capability plugin: for task requests, asks a Jev-compatible system-1 decision service which candidate model should serve the task, and contributes a confidence-weighted rank entry (per-model probability scores) to the LB finisher.
+
 See each plugin's `README.md` and `example.yaml` under `extensions/` for full configuration and deployment details.
 
 ## Filter-Chain Ordering
@@ -38,7 +40,7 @@ Plugins are positioned by `phase` (bucket order: AUTHN → … → UNSPECIFIED; 
 AUTHN       900 model-router → 810 transformer (strips spoofed identity headers)
             → 360 gpustack-ext-auth (injects trusted x-mse-consumer; 401)
             → 350 gpustack-ip-acl (403)
-            → 340-325 LB band (context → session-affinity / prefix / least-load → finisher)
+            → 340-325 LB band (context → session-affinity / prefix / least-load → decision-service (328) → finisher)
 UNSPECIFIED 600 gpustack-rate-limit (429) → 400 gpustack-token-usage
             → 100 ai-proxy → router
 ```
