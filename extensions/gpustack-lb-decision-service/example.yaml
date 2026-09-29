@@ -1,0 +1,139 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-lb-decision-service
+  namespace: higress-system
+spec:
+  # AUTHN band, per the gpustack-lb ordering discipline: the band runs AFTER
+  # ext-auth (AUTHN/360) and gpustack-ip-acl (AUTHN/350) so unauthenticated
+  # or IP-rejected requests never trigger a jev decision callout, and after
+  # model-router (AUTHN/900). Within the band gpustack-lb keeps
+  # 340 context -> 335 session-affinity / 333 prefix / 330 least-load ->
+  # 328 this plugin -> 325 finisher. It reads the candidate set the context
+  # role published and appends a confidence-weighted rank entry to the
+  # shared gpustack_lb_ranks filter state; the gpustack-lb finisher (325)
+  # combines all rank entries by weighted sum and writes
+  # x-higress-target-cluster — the finisher MUST also run on this route.
+  phase: AUTHN
+  priority: 328
+  url: oci://<your-registry>/<your-org>/gpustack-lb-decision-service:0.1.0
+  sha256: "<sha256-digest>"
+  defaultConfigDisable: false
+
+  defaultConfig:
+    # Multi-tenant decision services (jev): each tenant's route picks its
+    # own entry via activeProviderId, so every tenant uses its own API key.
+    # There is NO hosted default — the callout ships task bodies to this
+    # service, so the target must be explicit; without a provider the
+    # feature stays inert (WARN log, pass-through).
+    #
+    # The decision callout targets an Envoy cluster — clusters for external
+    # services come from the `default` McpBridge in higress-system. Each
+    # registry entry generates `outbound|<port>||<name>.<static|dns>`; set
+    # `cluster` to that generated name (the endpoint-derived default only
+    # matches when the registry name equals the endpoint host):
+    #
+    #   McpBridge registries:
+    #     - {type: dns,    name: typesafe-jev, domain: api.typesafe.ai,
+    #        port: 443, protocol: HTTPS}
+    #     - {type: static, name: jev-tenant-a, domain: "10.0.0.1:8010", port: 8010}
+    #     - {type: dns,    name: jev-tenant-b, domain: jev.tenant-b.internal, port: 8010}
+    providers:
+      - id: default
+        # type: typesafe = the TypeSafe-hosted flavour (inherits the
+        # generic systemone wire behaviour).
+        type: typesafe
+        endpoint: https://api.typesafe.ai
+        cluster: "outbound|443||typesafe-jev.dns"
+      - id: tenant-a
+        # type: systemone = the generic Jev-compatible provider for any
+        # self-deployed / third-party jev service (also the default when
+        # `type` is omitted).
+        type: systemone
+        endpoint: http://jev.tenant-a.internal:8010
+        cluster: "outbound|8010||jev-tenant-a.static"
+        apiToken: "tenant-a-key"
+      - id: tenant-b
+        type: systemone
+        endpoint: http://jev.tenant-b.internal:8010
+        cluster: "outbound|8010||jev-tenant-b.dns"
+        apiToken: "tenant-b-key"
+        # Optional: the decision request's `model` field — pins which
+        # decision engine the jev service uses (spec request.model-alias;
+        # e.g. a larger engine profile for harder routing calls). Empty
+        # omits the field and the server default answers.
+        # model: jev-larger
+    activeProviderId: default
+
+    # Decision knobs.
+    decisionTimeoutMs: 3000   # bound on the jev callout
+    maxStateBytes: 65536      # cap on the task body shipped as `state`
+    rankWeight: 10            # vote multiplier in the finisher's weighted sum
+    maxBodyBytes: 104857600   # Envoy buffer cap for the task body
+
+  # Per-route overrides. modelSelection requires an explicit criteria map
+  # (model name -> capability description): the descriptions are what jev
+  # reasons over, so name-only selection is deliberately not supported.
+  # The OPTION list still comes from the candidates the gpustack-lb context
+  # role publishes (filter state gpustack_lb_candidates, sourced from GPUStack
+  # ModelRouteTargets):
+  #
+  #   - criteria keys must equal the candidates' ModelName; keys matching no
+  #     candidate are inert (never appear in the question)
+  #   - candidates without a description fall back to name-only options
+  #     (better than disabling the route)
+  #   - instructions may be omitted: a sensible default applies
+  #
+  # To discover the model names to describe, list the route's
+  # ModelRouteTargets (gpustack CLI / control-plane API) — the same source
+  # gpustack-lb builds its candidates from.
+  matchRules:
+    - ingress:
+        - ai-route-tenant-a.internal
+      configDisable: false
+      config:
+        activeProviderId: tenant-a
+        # Route-level decision engine: overrides the provider's `model`
+        # for this route only (e.g. a larger engine for a high-value
+        # internal route).
+        decisionModel: jev-larger
+        # Level 3: full question with per-model capability descriptions.
+        modelSelection:
+          instructions: "Based on the difficulty and type of this task, choose the most suitable model to execute it. Consider the reasoning depth required, code/math complexity, and the tolerance for errors."
+          criteria:
+            gpt-6-luna: "Strongest reasoner; best for formal proofs and complex algorithm design; highest cost."
+            claude-opus-5.5: "Strong reasoner; best for complex code generation and architecture design; higher cost."
+            deepseek-v4-flash: "Fast and cheap; suited to simple queries, formatting, and short-text summarization; lowest cost."
+    - ingress:
+        - ai-route-tenant-b.internal
+      configDisable: false
+      config:
+        activeProviderId: tenant-b
+        # Criteria is required (name-only selection is deliberately not
+        # supported — the descriptions are what jev reasons over).
+        # Instructions may be omitted: a default applies.
+        modelSelection:
+          criteria:
+            qwen3-235b: "strongest reasoner in this fleet"
+            qwen3-32b: "balanced quality and cost"
+            qwen3-4b: "cheap and fast for simple tasks"
+
+
+
+  # PREREQUISITES (same as gpustack-lb):
+  # 1. This route must run behind the gpustack-lb context role (AUTHN/340)
+  #    publishing its candidate set — without it this plugin sees no
+  #    candidates and degrades to a pass-through.
+  # 2. The route needs an EnvoyFilter enabling cluster_header routing:
+  #    patch:
+  #      operation: MERGE
+  #      value:
+  #        route: { cluster_header: x-higress-target-cluster }
+  # 3. Strip x-higress-fallback-from at the listener (internal_only_headers)
+  #    so clients cannot forge internal-redirect semantics to bypass routing.
+  #
+  # Failure semantics: when the jev callout fails, times out, returns a
+  # non-2xx status, or returns a model that matches no published candidate,
+  # this plugin publishes no rank entry and lets the rest of the band
+  # (including the gpustack-lb finisher) route the request as usual.
+

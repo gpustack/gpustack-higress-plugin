@@ -12,4 +12,5 @@ use (
 	./extensions/gpustack-set-header-pre-route
 	./extensions/gpustack-ip-acl
 	./extensions/gpustack-token-usage
+	./extensions/gpustack-lb-decision-service
 )
