@@ -16,7 +16,7 @@ spec:
   # x-higress-target-cluster — the finisher MUST also run on this route.
   phase: AUTHN
   priority: 328
-  url: oci://<your-registry>/<your-org>/gpustack-lb-decision-service:0.1.0
+  url: oci://<your-registry>/<your-org>/gpustack-lb-decision-service:0.1.1
   sha256: "<sha256-digest>"
   defaultConfigDisable: false
 
@@ -52,12 +52,18 @@ spec:
         type: systemone
         endpoint: http://jev.tenant-a.internal:8010
         cluster: "outbound|8010||jev-tenant-a.static"
-        apiToken: "tenant-a-key"
+        # Canonical form is the apiTokens list (even for a single key);
+        # the legacy singular `apiToken` still works but is deprecated.
+        apiTokens: ["tenant-a-key"]
       - id: tenant-b
         type: systemone
         endpoint: http://jev.tenant-b.internal:8010
         cluster: "outbound|8010||jev-tenant-b.dns"
-        apiToken: "tenant-b-key"
+        # Failover: the first key serves the traffic; on 401/403/429
+        # (invalid/quota-exhausted key) the decision callout is retried
+        # with the next key, and a failed key is skipped for
+        # tokenCooldownMs before being tried again.
+        apiTokens: ["tenant-b-key", "tenant-b-fallback-key"]
         # Optional: the decision request's `model` field — pins which
         # decision engine the jev service uses (spec request.model-alias;
         # e.g. a larger engine profile for harder routing calls). Empty
@@ -70,6 +76,10 @@ spec:
     maxStateBytes: 65536      # cap on the task body shipped as `state`
     rankWeight: 10            # vote multiplier in the finisher's weighted sum
     maxBodyBytes: 104857600   # Envoy buffer cap for the task body
+    # A key that failed with 401/403/429 is skipped this long before being
+    # retried (shared across VMs, per provider entry); 0 disables. When all
+    # keys are cooling, the full list is still tried (fail-open).
+    tokenCooldownMs: 30000
 
   # Per-route overrides. modelSelection requires an explicit criteria map
   # (model name -> capability description): the descriptions are what jev
