@@ -67,10 +67,12 @@ func splitHostPort(hostport, defaultPort string) (string, string) {
 	return hostport, defaultPort
 }
 
-// AuthHeaders injects the optional bearer token (spec auth.bearer).
-func (s *Systemone) AuthHeaders(hs http.Header) {
-	if s.cfg.APIToken != "" {
-		hs.Set("Authorization", "Bearer "+s.cfg.APIToken)
+// AuthHeaders injects the bearer credential of THIS attempt (spec
+// auth.bearer). apiToken is one entry of EffectiveAPITokens(); empty means
+// an anonymous decision service (no Authorization header).
+func (s *Systemone) AuthHeaders(hs http.Header, apiToken string) {
+	if apiToken != "" {
+		hs.Set("Authorization", "Bearer "+apiToken)
 	}
 }
 

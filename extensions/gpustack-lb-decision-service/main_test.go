@@ -99,6 +99,147 @@ func TestParseGlobalConfigZeroConfig(t *testing.T) {
 	}
 }
 
+func TestAPITokensParseAndFailoverList(t *testing.T) {
+	// apiTokens list is parsed and resolved onto the plugin config as the
+	// ordered failover credential list.
+	cfg := parseTestConfig(t, `{
+		"provider": {
+			"type": "typesafe",
+			"endpoint": "https://api.typesafe.ai",
+			"apiTokens": ["primary-key", "", "fallback-key"]
+		}
+	}`)
+	want := []string{"primary-key", "fallback-key"}
+	if len(cfg.decisionTokens) != len(want) {
+		t.Fatalf("decisionTokens = %v, want %v (empty entries dropped)", cfg.decisionTokens, want)
+	}
+	for i := range want {
+		if cfg.decisionTokens[i] != want[i] {
+			t.Errorf("decisionTokens[%d] = %q, want %q", i, cfg.decisionTokens[i], want[i])
+		}
+	}
+}
+
+func TestAPITokensPrecedenceOverLegacyAPIToken(t *testing.T) {
+	// apiTokens wins over the legacy single apiToken; apiToken alone still
+	// works (single-entry failover list, no retry ever triggered).
+	cfg := parseTestConfig(t, `{
+		"provider": {
+			"endpoint": "https://api.typesafe.ai",
+			"apiToken": "legacy-key",
+			"apiTokens": ["new-key"]
+		}
+	}`)
+	if len(cfg.decisionTokens) != 1 || cfg.decisionTokens[0] != "new-key" {
+		t.Errorf("decisionTokens = %v, want [new-key]", cfg.decisionTokens)
+	}
+	legacy := parseTestConfig(t, `{
+		"provider": {"endpoint": "https://api.typesafe.ai", "apiToken": "legacy-key"}
+	}`)
+	if len(legacy.decisionTokens) != 1 || legacy.decisionTokens[0] != "legacy-key" {
+		t.Errorf("decisionTokens = %v, want [legacy-key]", legacy.decisionTokens)
+	}
+	anon := parseTestConfig(t, `{"provider": {"endpoint": "https://api.typesafe.ai"}}`)
+	if len(anon.decisionTokens) != 0 {
+		t.Errorf("decisionTokens = %v, want none for anonymous provider", anon.decisionTokens)
+	}
+	// An explicitly empty apiTokens list is anonymous — it must NOT fall
+	// back to the deprecated apiToken.
+	emptyList := parseTestConfig(t, `{
+		"provider": {"endpoint": "https://api.typesafe.ai", "apiToken": "legacy-key", "apiTokens": []}
+	}`)
+	if len(emptyList.decisionTokens) != 0 {
+		t.Errorf("decisionTokens = %v, want none for explicit empty apiTokens (apiToken must be ignored)", emptyList.decisionTokens)
+	}
+}
+
+func TestRuleProviderOverrideClearsInheritedTokens(t *testing.T) {
+	global := parseTestConfig(t, `{
+		"provider": {"endpoint": "https://api.typesafe.ai", "apiTokens": ["a", "b"]}
+	}`)
+	var rule PluginConfig
+	if err := parseOverrideRuleConfig(gjson.Parse(`{"provider": {"endpoint": "http://jev.internal:8010"}}`), global, &rule); err != nil {
+		t.Fatalf("parseOverrideRuleConfig: %v", err)
+	}
+	if rule.decision == nil || len(rule.decisionTokens) != 0 {
+		t.Errorf("rule override must drop the global provider's tokens, got %v", rule.decisionTokens)
+	}
+}
+
+func TestTokenFailureStatuses(t *testing.T) {
+	// Only credential-level failures (invalid key 401/403, exhausted
+	// quota 429) are retried with the fallback token; service-side
+	// failures (5xx, timeouts) are not — another key would hit the same.
+	for _, s := range []string{"401", "403", "429"} {
+		if !tokenFailureStatuses[s] {
+			t.Errorf("status %s should be a token failure", s)
+		}
+	}
+	for _, s := range []string{"200", "400", "500", "503", ""} {
+		if tokenFailureStatuses[s] {
+			t.Errorf("status %q should not be a token failure", s)
+		}
+	}
+}
+
+func TestTokenCooldownFilter(t *testing.T) {
+	now := int64(1_000_000)
+	tokens := []string{"primary", "fallback", "third"}
+	state := map[string]int64{
+		"primary": now - 10_000, // failed 10s ago
+	}
+	// Cooldown 30s: primary still cooling, order of the rest preserved.
+	live := filterCooledTokens(tokens, state, now, 30_000)
+	if len(live) != 2 || live[0] != "fallback" || live[1] != "third" {
+		t.Errorf("live = %v, want [fallback third]", live)
+	}
+	// Cooldown 5s: primary has already cooled down and is eligible again.
+	live = filterCooledTokens(tokens, state, now, 5_000)
+	if len(live) != 3 || live[0] != "primary" {
+		t.Errorf("live = %v, want full list with primary first", live)
+	}
+	// Everything cooling: empty result — the caller fails open to the full
+	// list (asserted by activeTokens, which needs the wasm host).
+	all := map[string]int64{"primary": now, "fallback": now, "third": now}
+	if live := filterCooledTokens(tokens, all, now, 30_000); len(live) != 0 {
+		t.Errorf("live = %v, want empty when all cooling", live)
+	}
+}
+
+func TestTokenCooldownKnobAndStateKey(t *testing.T) {
+	// Default cooldown applies (30s) and the shared-data key is namespaced
+	// per provider entry (type + id), so tenants never share cooldowns.
+	cfg := parseTestConfig(t, `{
+		"provider": {"id": "p1", "type": "typesafe", "endpoint": "https://api.typesafe.ai", "apiTokens": ["a", "b"]}
+	}`)
+	if cfg.tokenCooldownMs != defaultTokenCooldownMs {
+		t.Errorf("tokenCooldownMs = %d, want default %d", cfg.tokenCooldownMs, defaultTokenCooldownMs)
+	}
+	if want := tokenUnavailableSinceKeyPrefix + "typesafe-p1-https://api.typesafe.ai-"; cfg.tokenStateKey != want {
+		t.Errorf("tokenStateKey = %q, want %q", cfg.tokenStateKey, want)
+	}
+	// Explicit 0 disables the cooldown.
+	cfg = parseTestConfig(t, `{
+		"provider": {"endpoint": "https://api.typesafe.ai", "apiTokens": ["a", "b"]},
+		"tokenCooldownMs": 0
+	}`)
+	if cfg.tokenCooldownMs != 0 {
+		t.Errorf("tokenCooldownMs = %d, want 0 (disabled)", cfg.tokenCooldownMs)
+	}
+	// Rule override inherits the knob unless it sets its own.
+	global := parseTestConfig(t, `{
+		"provider": {"endpoint": "https://api.typesafe.ai", "apiTokens": ["a", "b"]},
+		"tokenCooldownMs": 60000
+	}`)
+	var rule PluginConfig
+	if err := parseOverrideRuleConfig(gjson.Parse(`{}`), global, &rule); err != nil {
+		t.Fatalf("parseOverrideRuleConfig: %v", err)
+	}
+	if rule.tokenCooldownMs != 60000 {
+		t.Errorf("rule tokenCooldownMs = %d, want inherited 60000", rule.tokenCooldownMs)
+	}
+}
+
 func TestParseOverrideRuleConfig(t *testing.T) {
 	global := parseTestConfig(t, routeConfig)
 	if global.modelSelection == nil || len(global.modelSelection.Criteria) != 3 {

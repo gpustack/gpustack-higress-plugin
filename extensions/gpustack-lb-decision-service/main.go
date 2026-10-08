@@ -19,8 +19,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb-decision-service/provider"
@@ -45,6 +47,18 @@ const (
 	defaultDecisionTimeoutMs = 3000
 	defaultMaxStateBytes     = 64 * 1024
 	defaultMaxBodyBytes      = 100 * 1024 * 1024
+
+	// defaultTokenCooldownMs is how long a token that failed with
+	// 401/403/429 is skipped before being tried again (ai-proxy's
+	// cooldownDuration recovery path, minus its health checks): without
+	// it, a long-dead primary key would cost every request one wasted
+	// callout round-trip on the data-plane critical path.
+	defaultTokenCooldownMs = 30000
+
+	// tokenUnavailableSinceKeyPrefix namespaces the cooldown shared-data
+	// key per decision provider, so tenants with different providers
+	// never trip each other's cooldowns.
+	tokenUnavailableSinceKeyPrefix = pluginName + "-token-unavailable-since-"
 
 	// defaultRankWeight makes the model-selection verdict dominant in the
 	// finisher's weighted sum while leaving instance-level tie-breaking to
@@ -84,6 +98,16 @@ type PluginConfig struct {
 	activeProviderId string
 	// decision is the resolved decision service.
 	decision provider.DecisionProvider
+	// decisionTokens is the resolved credential list of the active
+	// decision provider: tried in order, with the callout retried on
+	// 401/403/429 (invalid/quota-exhausted key). Empty = anonymous.
+	decisionTokens []string
+	// tokenStateKey is the shared-data key recording when each token last
+	// failed (cooldown state), namespaced per provider.
+	tokenStateKey string
+	// tokenCooldownMs: a token that failed with 401/403/429 is skipped
+	// for this long before being tried again; 0 disables cooldown.
+	tokenCooldownMs int64
 	// decisionModel overrides the provider's decision-engine model for
 	// this config scope (set globally or per route in matchRules); empty
 	// falls back to the provider's `model`, then to omitting the field.
@@ -168,6 +192,11 @@ func parseConfigInto(json gjson.Result, config *PluginConfig, fromGlobal bool) e
 	}
 	if !fromGlobal && (providers.IsArray() || pj.IsObject()) {
 		config.decision = nil
+		// The inherited credential list (and its cooldown state key)
+		// belongs to the dropped global provider; keep it consistent
+		// with decision == nil.
+		config.decisionTokens = nil
+		config.tokenStateKey = ""
 	}
 	var provCfg *provider.ProviderConfig
 	for _, pc := range config.providerConfigs {
@@ -195,6 +224,21 @@ func parseConfigInto(json gjson.Result, config *PluginConfig, fromGlobal bool) e
 			return err
 		}
 		config.decision = dec
+		config.decisionTokens = provCfg.EffectiveAPITokens()
+		// Cooldown state is namespaced per provider ENTRY. id alone is not
+		// a collision-free identity (it is optional — two id-less
+		// systemone providers with different endpoints would share a map,
+		// so a failure on one route could suppress a shared token on the
+		// other), so the key folds in every identity-bearing field:
+		// type, id, endpoint and cluster.
+		config.tokenStateKey = tokenUnavailableSinceKeyPrefix + provCfg.Type + "-" + provCfg.Id + "-" + provCfg.Endpoint + "-" + provCfg.Cluster
+		if fromGlobal {
+			// A global config (re)load means the token list may have
+			// changed: reset stale cooldown state, matching ai-proxy's
+			// resetSharedData on config update. Rule overrides inherit
+			// the global key and must NOT reset it mid-flight.
+			resetSharedDataSafe(config.tokenStateKey)
+		}
 	}
 
 	// ---- modelSelection (per route) ----
@@ -270,6 +314,15 @@ func parseConfigInto(json gjson.Result, config *PluginConfig, fromGlobal bool) e
 	} else if fromGlobal {
 		config.maxBodyBytes = defaultMaxBodyBytes
 	}
+	// tokenCooldownMs (ai-proxy cooldownDuration semantics): a 401/403/429
+	// token is skipped this long before being retried. 0 disables the
+	// cooldown; the default keeps a long-dead key from costing every
+	// request one wasted callout.
+	if json.Get("tokenCooldownMs").Exists() {
+		config.tokenCooldownMs = json.Get("tokenCooldownMs").Int()
+	} else if fromGlobal {
+		config.tokenCooldownMs = defaultTokenCooldownMs
+	}
 	return nil
 }
 
@@ -281,6 +334,17 @@ func parseProviderConfig(pj gjson.Result) *provider.ProviderConfig {
 		APIToken: pj.Get("apiToken").String(),
 		Cluster:  pj.Get("cluster").String(),
 		Model:    pj.Get("model").String(),
+	}
+	if ts := pj.Get("apiTokens"); ts.IsArray() {
+		// Always materialise the slice when the field is present —
+		// even empty — so EffectiveAPITokens can distinguish "explicit
+		// empty list = anonymous" from "field absent = legacy apiToken".
+		pc.APITokens = []string{}
+		for _, t := range ts.Array() {
+			if s := t.String(); s != "" {
+				pc.APITokens = append(pc.APITokens, s)
+			}
+		}
 	}
 	if pc.Type == "" {
 		pc.Type = provider.TypeSystemone
@@ -416,14 +480,53 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		{":authority", config.decision.DecisionHost()},
 		{"content-type", "application/json"},
 	}
-	hs := http.Header{}
-	config.decision.AuthHeaders(hs)
-	for k, vals := range hs {
-		for _, v := range vals {
-			calloutHeaders = append(calloutHeaders, [2]string{k, v})
+
+	// Token failover: the provider's credential list is tried in order.
+	// The first token serves the traffic; on an auth/quota failure
+	// (401/403/429) the callout is retried with the next token (the
+	// request stays paused throughout), and only after the last token
+	// fails does the plugin degrade as usual (no rank entry published).
+	// Tokens still in cooldown (recent 401/403/429) are skipped up front
+	// so a long-dead key costs no wasted callout.
+	tokens := activeTokens(config)
+	if err := dispatchDecisionCallout(config, calloutHeaders, decisionReq, cands, tokens, 0); err != nil {
+		// Degrade: no header written, the rest of the band routes normally.
+		proxywasm.LogWarnf("%s: dispatch decision call failed: %v", pluginName, err)
+		return types.ActionContinue
+	}
+	return types.ActionPause
+}
+
+// tokenFailureStatuses are the HTTP statuses treated as "this credential
+// is unusable" for the decision callout: 401/403 (invalid or forbidden
+// key) and 429 (quota/rate exhausted — the classic fallback-key case).
+// Everything else (5xx, timeouts) is a service-side problem another key
+// would hit too, so no token retry is spent on it.
+var tokenFailureStatuses = map[string]bool{"401": true, "403": true, "429": true}
+
+// dispatchDecisionCallout sends the decision request with tokens[idx] and,
+// when that attempt fails on an auth/quota status and tokens remain,
+// recurses with the next one. It returns the DispatchHttpCall error of the
+// FIRST attempt only (the caller maps it to ActionContinue); a retry-level
+// dispatch failure resumes the request here, since the stream is already
+// paused by then.
+func dispatchDecisionCallout(config PluginConfig, baseHeaders [][2]string, decisionReq []byte, cands []wire.Candidate, tokens []string, idx int) error {
+	token := ""
+	if idx < len(tokens) {
+		token = tokens[idx]
+	}
+	// Copy the base headers: appending auth headers must not leak into the
+	// shared slice later retries also build on.
+	calloutHeaders := append([][2]string{}, baseHeaders...)
+	if token != "" {
+		hs := http.Header{}
+		config.decision.AuthHeaders(hs, token)
+		for k, vals := range hs {
+			for _, v := range vals {
+				calloutHeaders = append(calloutHeaders, [2]string{k, v})
+			}
 		}
 	}
-
 	_, err := proxywasm.DispatchHttpCall(
 		config.decision.DecisionCluster(),
 		calloutHeaders,
@@ -431,15 +534,169 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		nil,
 		config.decisionTimeoutMs,
 		func(numHeaders, bodySize, numTrailers int) {
+			if status := calloutStatus(); tokenFailureStatuses[status] {
+				markTokenUnavailable(config, token)
+				if idx+1 < len(tokens) {
+					proxywasm.LogWarnf("%s: decision service returned HTTP %s for token #%d; retrying with fallback token #%d of %d",
+						pluginName, status, idx+1, idx+2, len(tokens))
+					if err := dispatchDecisionCallout(config, baseHeaders, decisionReq, cands, tokens, idx+1); err != nil {
+						proxywasm.LogWarnf("%s: retry dispatch failed: %v", pluginName, err)
+						proxywasm.ResumeHttpRequest()
+					}
+					return
+				}
+			}
 			applyVerdict(readAnswer(bodySize), cands, config.rankWeight)
 		},
 	)
-	if err != nil {
-		// Degrade: no header written, the rest of the band routes normally.
-		proxywasm.LogWarnf("%s: dispatch decision call failed: %v", pluginName, err)
-		return types.ActionContinue
+	return err
+}
+
+// calloutStatus reads the :status of the decision callout response ("" when
+// unavailable) so the failover logic can classify the failure without
+// consuming the body.
+func calloutStatus() string {
+	if hs, err := proxywasm.GetHttpCallResponseHeaders(); err == nil {
+		for _, h := range hs {
+			if h[0] == ":status" {
+				return h[1]
+			}
+		}
 	}
-	return types.ActionPause
+	return ""
+}
+
+// activeTokens filters the provider's credential list down to tokens NOT in
+// cooldown — i.e. keys that did not fail with 401/403/429 within the last
+// tokenCooldownMs (ai-proxy's cooldownDuration recovery path, minus its
+// health checks: the token simply becomes eligible again once the window
+// passes and proves itself on the next real callout). Order is preserved.
+// Fail-open on every degenerate case: no cooldown configured, no state key
+// (single/anonymous provider), unreadable state, or ALL tokens cooling (a
+// total outage must not turn into "no tokens" — the request would then skip
+// the decision entirely instead of trying its luck with a recovering key).
+func activeTokens(config PluginConfig) []string {
+	if config.tokenCooldownMs <= 0 || config.tokenStateKey == "" || len(config.decisionTokens) <= 1 {
+		return config.decisionTokens
+	}
+	state := readTokenState(config.tokenStateKey)
+	live := filterCooledTokens(config.decisionTokens, state, currentTimeMillis(), config.tokenCooldownMs)
+	if len(live) == 0 {
+		proxywasm.LogWarnf("%s: all decision tokens in cooldown; trying them anyway (fail-open)", pluginName)
+		return config.decisionTokens
+	}
+	return live
+}
+
+// filterCooledTokens is the pure core of the cooldown filter: tokens whose
+// last recorded failure is still within cooldownMs of now are dropped,
+// order is preserved.
+func filterCooledTokens(tokens []string, state map[string]int64, now, cooldownMs int64) []string {
+	var live []string
+	for _, t := range tokens {
+		if since, ok := state[t]; !ok || now-since >= cooldownMs {
+			live = append(live, t)
+		}
+	}
+	return live
+}
+
+// markTokenUnavailable records that token just failed a callout with
+// 401/403/429, starting (or restarting) its cooldown window. The
+// read-merge-write is guarded by the shared-data CAS: two VMs failing
+// different keys simultaneously would otherwise each write a map holding
+// only its own update and lose the other's cooldown (CAS 0 is an
+// unconditional overwrite in the host), so the write retries on
+// ErrorStatusCasMismatch the way ai-proxy's failover.go does.
+func markTokenUnavailable(config PluginConfig, token string) {
+	if token == "" || config.tokenCooldownMs <= 0 || config.tokenStateKey == "" {
+		return
+	}
+	for attempt := 1; attempt <= tokenStateCasMaxRetries; attempt++ {
+		state, cas := readTokenStateCAS(config.tokenStateKey)
+		now := currentTimeMillis()
+		state[token] = now
+		// Prune entries that no longer belong: expired cooldowns and
+		// tokens removed from the config, so the map never grows
+		// unboundedly.
+		configured := map[string]bool{}
+		for _, t := range config.decisionTokens {
+			configured[t] = true
+		}
+		for t, since := range state {
+			if !configured[t] || now-since >= config.tokenCooldownMs {
+				delete(state, t)
+			}
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return
+		}
+		err = proxywasm.SetSharedData(config.tokenStateKey, data, cas)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, types.ErrorStatusCasMismatch) {
+			proxywasm.LogWarnf("%s: failed to record token cooldown: %v", pluginName, err)
+			return
+		}
+		// CAS mismatch: another worker wrote first — re-read, re-merge,
+		// retry. Exhausting the retries only delays one cooldown entry.
+	}
+	proxywasm.LogWarnf("%s: token cooldown state kept racing after %d attempts; giving up this update", pluginName, tokenStateCasMaxRetries)
+}
+
+// tokenStateCasMaxRetries bounds the read-merge-write retry loop (same
+// constant ai-proxy uses for its shared-data CAS loops).
+const tokenStateCasMaxRetries = 10
+
+// readTokenStateCAS reads the cooldown map together with its CAS token; a
+// missing/unreadable state yields an empty map and the CAS the host handed
+// back (0 for a fresh key, which the host treats as an unconditional set).
+func readTokenStateCAS(key string) (map[string]int64, uint32) {
+	data, cas, err := proxywasm.GetSharedData(key)
+	if err != nil || len(data) == 0 {
+		return map[string]int64{}, cas
+	}
+	var state map[string]int64
+	if err := json.Unmarshal(data, &state); err != nil {
+		return map[string]int64{}, cas
+	}
+	return state, cas
+}
+
+// readTokenState reads the cooldown map (token -> failed-at ms); any error
+// or empty value yields nil (treated as "nothing in cooldown").
+func readTokenState(key string) map[string]int64 {
+	data, _, err := proxywasm.GetSharedData(key)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var state map[string]int64
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil
+	}
+	return state
+}
+
+// resetSharedDataSafe clears a shared-data key, recovering from the SDK
+// mock's panic when no proxy-wasm host is attached (unit tests): a failed
+// reset only leaves a stale cooldown timestamp behind, never a wrong route.
+func resetSharedDataSafe(key string) {
+	defer func() { _ = recover() }()
+	_ = proxywasm.SetSharedData(key, nil, 0)
+}
+
+// currentTimeMillis returns the current time in milliseconds for the
+// cooldown windows. The higress proxy-wasm-go-sdk fork exports no time
+// hostcall (no GetSystemTimeNanoSeconds / GetCurrentTimeNanoseconds), so
+// time.Now() is the only source — and it is what the SDK itself
+// (internal logTiming) and ai-proxy's production token-cooldown
+// (failover.go) already rely on: higress wasm builds link a WASI clock.
+// Keeping a single helper means switching to a hostcall later, should the
+// SDK grow one, is a one-line change.
+func currentTimeMillis() int64 {
+	return time.Now().UnixMilli()
 }
 
 // applyVerdict turns the jev answer into a ranking opinion appended to the

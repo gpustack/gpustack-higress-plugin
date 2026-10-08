@@ -45,7 +45,11 @@ type DecisionProvider interface {
 	// ("" omits it — the server's default engine answers).
 	DecisionModel() string
 	// AuthHeaders returns headers (auth, ...) for the decision callout.
-	AuthHeaders(hs http.Header)
+	// apiToken is the credential to send this attempt — "" sends none. It
+	// comes from EffectiveAPITokens(); passing it per call (instead of
+	// reading cfg directly) is what lets the plugin retry the callout with
+	// the fallback tokens on auth/quota failures (401/403/429).
+	AuthHeaders(hs http.Header, apiToken string)
 	// ValidateDecisionRequest validates the composed decision request body.
 	ValidateDecisionRequest(body []byte) error
 }
@@ -56,7 +60,12 @@ type ProviderConfig struct {
 	Id       string `json:"id"`       // referenced by activeProviderId
 	Type     string `json:"type"`     // provider type, e.g. "typesafe"
 	Endpoint string `json:"endpoint"` // scheme://host[:port] of the jev service
-	APIToken string `json:"apiToken"` // optional bearer token
+	APIToken string `json:"apiToken"` // optional bearer token (single-token form)
+	// APITokens is the failover token list (spec auth.bearer): the first
+	// token serves the traffic; when the decision service answers 401/403/
+	// 429 (invalid/exhausted key) the callout is retried with the next
+	// one. When set it takes precedence over the legacy single apiToken.
+	APITokens []string `json:"apiTokens"`
 	// Cluster is the Envoy cluster the decision callout is dispatched to
 	// (proxy-wasm DispatchHttpCall needs a cluster, not a URL).
 	Cluster string `json:"cluster"`
@@ -103,6 +112,29 @@ func orType(t string) string {
 		return TypeSystemone
 	}
 	return t
+}
+
+// EffectiveAPITokens returns the credential list to try, in order. An
+// EXPLICIT `apiTokens` field always wins — even an empty (or all-empty)
+// list means "anonymous", never a silent fallback to the legacy single
+// `apiToken` (an operator writing apiTokens: [] is retiring the keys, not
+// asking for the deprecated field to resurrect). Only when the field is
+// absent (nil) does the legacy `apiToken` apply; nil APITokens vs empty
+// APITokens is exactly the presence signal the parser preserves.
+func (c *ProviderConfig) EffectiveAPITokens() []string {
+	if c.APITokens != nil {
+		var tokens []string
+		for _, t := range c.APITokens {
+			if t != "" {
+				tokens = append(tokens, t)
+			}
+		}
+		return tokens
+	}
+	if c.APIToken != "" {
+		return []string{c.APIToken}
+	}
+	return nil
 }
 
 // stripScheme turns scheme://host[:port][/path][?query] into host[:port]:
