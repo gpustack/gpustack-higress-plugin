@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -14,11 +15,13 @@ import (
 // inheritance tests need: a pointer they can compare identity against.
 type stubStore struct{}
 
-func (*stubStore) LoadStates([]string, int64, int64, func(map[string]clusterState)) types.Action {
+func (*stubStore) LoadStates([]targetRef, int64, int64, func(map[string]clusterState)) types.Action {
 	return types.ActionContinue
 }
-func (*stubStore) AddInflight(string, int64, int64) string { return "" }
-func (*stubStore) Done(doneRecord)                         {}
+func (*stubStore) Reserve([]reserveTarget, int64, int64, func(int, string) types.Action) types.Action {
+	return types.ActionContinue
+}
+func (*stubStore) Done(doneRecord) {}
 
 // ---------------------------------------------------------------------------
 // Backend selection and inheritance
@@ -349,19 +352,100 @@ func TestDecodeLoadReplyFailsWhole(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// candidateClusters
+// candidateRefs
 // ---------------------------------------------------------------------------
 
-// gpustack's several-model-names-on-one-cluster case puts the same cluster in
-// the candidate list more than once. Un-deduplicated, the redis backend would
-// put the same key in one KEYS array twice.
-func TestCandidateClustersDeduplicatesInOrder(t *testing.T) {
-	got := candidateClusters([]candidateSpec{
+// The in-flight budget is per target (Candidate.Key()), so two candidates
+// sharing a cluster but differing in targetId are two refs. What must not
+// happen is the same Key twice in one KEYS array -- and a candidate without a
+// targetId still yields its cluster as the Key.
+func TestCandidateRefsDeduplicatesByKeyInOrder(t *testing.T) {
+	got := candidateRefs([]candidateSpec{
 		{Candidate: Candidate{Cluster: "b", TargetID: "1"}},
 		{Candidate: Candidate{Cluster: "a", TargetID: "1"}},
+		{Candidate: Candidate{Cluster: "b", TargetID: "1"}}, // duplicate Key
 		{Candidate: Candidate{Cluster: "b", TargetID: "2"}},
+		{Candidate: Candidate{Cluster: "c"}}, // no targetId: Key() is the cluster
 	})
-	if len(got) != 2 || got[0] != "b" || got[1] != "a" {
-		t.Errorf("candidateClusters = %v, want [b a]", got)
+	want := []targetRef{
+		{Key: "b\x001", Cluster: "b"},
+		{Key: "a\x001", Cluster: "a"},
+		{Key: "b\x002", Cluster: "b"},
+		{Key: "c", Cluster: "c"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidateRefs = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidateRefs[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// reserveScript's wire contract
+// ---------------------------------------------------------------------------
+
+func TestReserveArgs(t *testing.T) {
+	args := reserveArgs(1700000000000, 600_000, "123-456", []int64{0, 4})
+	if len(args) != 6 {
+		t.Fatalf("reserveArgs = %v, want 6 slots", args)
+	}
+	for i, a := range args {
+		s, ok := a.(string)
+		if !ok {
+			t.Errorf("ARGV[%d] is %T, want a string", i+1, a)
+		}
+		if strings.ContainsAny(s, "eE.") {
+			t.Errorf("ARGV[%d] = %q looks like a float", i+1, s)
+		}
+	}
+	// The cutoff the script prunes and counts with is the same number the
+	// load path counts from, so reader and writer cannot disagree.
+	if got := args[1]; got != "1699999400000" {
+		t.Errorf("cutoff = %q, want 1699999400000", got)
+	}
+	// One cap per key, in KEYS order, after the shared header.
+	if args[4] != "0" || args[5] != "4" {
+		t.Errorf("maxRun ARGV = %v %v, want 0 4", args[4], args[5])
+	}
+}
+
+func TestDecodeReserveReply(t *testing.T) {
+	if pick, err := decodeReserveReply(3, resp.StringValue("2")); err != nil || pick != 2 {
+		t.Errorf("decodeReserveReply(2) = %d, %v; want 2, nil", pick, err)
+	}
+	if pick, err := decodeReserveReply(3, resp.StringValue("0")); err != nil || pick != 0 {
+		t.Errorf("decodeReserveReply(0) = %d, %v; want 0, nil (exhausted is valid)", pick, err)
+	}
+	for name, reply := range map[string]resp.Value{
+		"redis error":   resp.ErrorValue(errors.New("NOSCRIPT")),
+		"not a number":  resp.StringValue("OK"),
+		"out of range":  resp.StringValue("4"),
+		"negative":      resp.StringValue("-1"),
+		"float renders": resp.StringValue("2.5"),
+	} {
+		if pick, err := decodeReserveReply(3, reply); err == nil || pick != 0 {
+			t.Errorf("%s: decodeReserveReply = %d, %v; want 0, error", name, pick, err)
+		}
+	}
+}
+
+// reserveInflight's two-phase init is only safe because the unconditional
+// create write carries exactly the empty state: an init lost to another init
+// loses nothing. Pin the constant to the marshalled zero value so a struct
+// tag change cannot silently make the create path carry stale semantics.
+func TestEmptyInflightJSONMatchesZeroValue(t *testing.T) {
+	data, err := json.Marshal(inflightState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != emptyInflightJSON {
+		t.Errorf("inflightState{} marshals to %s, want %s", data, emptyInflightJSON)
+	}
+	var st inflightState
+	if err := json.Unmarshal([]byte(emptyInflightJSON), &st); err != nil {
+		t.Errorf("emptyInflightJSON does not round-trip: %v", err)
 	}
 }

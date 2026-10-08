@@ -98,7 +98,7 @@ func TestParseConfigRejectsBadMaxBodyBytes(t *testing.T) {
 // hangs until its own timeout).
 func TestRejectBodyIsNeverEmptyAndIsJSON(t *testing.T) {
 	for _, msg := range []string{"", "boom", "  "} {
-		body := buildRejectBody(msg, 503)
+		body := buildRejectBody(msg, "no_candidate", 503)
 		if len(body) == 0 {
 			t.Fatalf("empty reject body for %q", msg)
 		}
@@ -112,7 +112,7 @@ func TestRejectBodyIsNeverEmptyAndIsJSON(t *testing.T) {
 // can supply their own error envelope.
 func TestRejectBodyPassesThroughJSONObject(t *testing.T) {
 	raw := `{"error":{"message":"custom"}}`
-	if got := string(buildRejectBody(raw, 503)); got != raw {
+	if got := string(buildRejectBody(raw, "no_candidate", 503)); got != raw {
 		t.Errorf("got %s, want %s", got, raw)
 	}
 }

@@ -22,6 +22,7 @@ const (
 
 type chosen struct {
 	cluster   string
+	key       string
 	modelName string
 	kind      string
 	probation bool
@@ -54,38 +55,112 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		return types.ActionContinue
 	}
 
-	pick := selectCandidate(set)
-	if pick == nil {
-		// The candidate set is empty. **We must answer ourselves**: on this
-		// route Envoy's own 503 for a missing cluster measurably fails to
-		// flush to the client, and the request hangs until the client times
-		// out. Removing the header is only cleanup; the line below is what
-		// actually makes this fail-closed.
+	// The candidate set is empty. **We must answer ourselves**: on this route
+	// Envoy's own 503 for a missing cluster measurably fails to flush to the
+	// client, and the request hangs until the client times out. Removing the
+	// header is only cleanup; the line below is what actually makes this
+	// fail-closed.
+	if len(set.Candidates) == 0 {
 		_ = proxywasm.RemoveHttpRequestHeader(targetClusterHeader)
 		return reject(ctx, config)
 	}
 
+	// The reserve walk order: the winner of the usual selection first, then
+	// the rest -- so "the best candidate is momentarily full" degrades to the
+	// second-best rather than to a rejection.
+	ordered := reserveOrder(set, selectCandidate(set))
+	targets := make([]reserveTarget, 0, len(ordered))
+	for i := range ordered {
+		targets = append(targets, reserveTarget{
+			targetRef: targetRef{Key: ordered[i].Key(), Cluster: ordered[i].Cluster},
+			MaxRun:    ordered[i].MaxRunningRequests,
+		})
+	}
+
+	// Check-and-reserve replaces the old "pick, then +1 unconditionally": the
+	// cap check and the in-flight entry are now one atomic operation in the
+	// store, so concurrent requests can no longer all observe room that only
+	// existed once. The store's action is returned verbatim -- on redis it
+	// pauses under watermark and finalizeSelection runs from the callback.
+	return config.stateBackend().Reserve(targets, nowMillis(), config.maxInflightAgeMs,
+		func(pick int, token string) types.Action {
+			return finalizeSelection(ctx, config, ordered, pick, token)
+		})
+}
+
+// reserveOrder fixes the order the finisher tries targets in: the usual
+// selection's winner first, then every other candidate in published order,
+// de-duplicated by Candidate.Key() (same target = same budget, trying it
+// twice can only waste a round-trip).
+//
+// A **weighted** set stops at the winner: weight is a business traffic split,
+// and "the canary is full, send to stable instead" silently rewrites the
+// split the route promised. Full is full; the caller rejects.
+//
+// A pure function (the winner is passed in because selectCandidate reads the
+// request id, a host call), so the ordering is unit-testable.
+func reserveOrder(set CandidateSet, pick *Candidate) []Candidate {
+	if pick == nil {
+		return nil
+	}
+	out := []Candidate{*pick}
+	if isWeighted(set.Candidates) {
+		return out
+	}
+	seen := map[string]struct{}{pick.Key(): {}}
+	for i := range set.Candidates {
+		k := set.Candidates[i].Key()
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, set.Candidates[i])
+	}
+	return out
+}
+
+// finalizeSelection is the tail of the decision, run synchronously on the
+// shared-data backend and from the redis callback on the async one -- the
+// action it returns is what the sync path hands back to the filter chain.
+//
+// pick comes from the store's Reserve: a 1-based index into ordered on
+// success, reserveExhausted (every target full), or reserveFailOpen (the
+// backend degraded -- route the preferred candidate without a reservation,
+// the old soft-cap behaviour, rather than take the route down over a cache
+// blip).
+func finalizeSelection(ctx wrapper.HttpContext, config Config, ordered []Candidate, pick int, token string) types.Action {
+	var c *Candidate
+	switch {
+	case pick == reserveExhausted:
+		_ = proxywasm.RemoveHttpRequestHeader(targetClusterHeader)
+		return rejectCap(ctx, config)
+	case pick == reserveFailOpen:
+		c = &ordered[0]
+		token = "" // nothing was reserved, so there must be nothing to release
+	default:
+		c = &ordered[pick-1]
+	}
+
 	// Overwrite unconditionally if the client sent the header -- this plugin
 	// is the only writer, so there is no ambiguity about its origin.
-	if err := proxywasm.ReplaceHttpRequestHeader(targetClusterHeader, pick.Cluster); err != nil {
+	if err := proxywasm.ReplaceHttpRequestHeader(targetClusterHeader, c.Cluster); err != nil {
 		proxywasm.LogErrorf("%s: write %s failed: %v", pluginName, targetClusterHeader, err)
 	}
 
 	// The token identifies this request's in-flight entry; the store hands it
 	// back at onHttpStreamDone so exactly this entry is released. An empty
 	// token means nothing was written, and the release is skipped.
-	token := config.stateBackend().AddInflight(pick.Cluster, nowMillis(), config.maxInflightAgeMs)
-	ctx.SetContext(ctxKeyChosen, chosen{cluster: pick.Cluster, modelName: pick.ModelName, kind: pick.Kind, probation: pick.Probation})
+	ctx.SetContext(ctxKeyChosen, chosen{cluster: c.Cluster, key: c.Key(), modelName: c.ModelName, kind: c.Kind, probation: c.Probation})
 	ctx.SetContext(ctxKeyInflightToken, token)
-	proxywasm.LogDebugf("%s: selected %s (model=%s, weighted=%t)",
-		pluginName, pick.Cluster, pick.ModelName, isWeighted(set.Candidates))
+	proxywasm.LogDebugf("%s: selected %s (model=%s, reserve=%d)",
+		pluginName, c.Cluster, c.ModelName, pick)
 
 	// By this point the selection is done and the header is written -- so
 	// **requests with no body, non-JSON bodies, or non-matching paths still
 	// get a decision**. This route's weighted_clusters has been displaced by
 	// cluster_header, so no header means no cluster: the decision must never
 	// return early.
-	if !needsRewrite(ctx, config, pick) {
+	if !needsRewrite(ctx, config, c) {
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
@@ -172,14 +247,15 @@ func finisherOnStreamDone(ctx wrapper.HttpContext, config Config) {
 	}
 
 	config.stateBackend().Done(doneRecord{
-		Cluster:    pick.cluster,
-		Token:      token,
-		Outcome:    oc,
-		NowMs:      now,
-		MaxAgeMs:   config.maxInflightAgeMs,
-		Threshold:  threshold,
-		CooldownMs: config.cooldownMs,
-		RampMs:     config.rampMs,
+		Cluster:     pick.cluster,
+		InflightKey: pick.key,
+		Token:       token,
+		Outcome:     oc,
+		NowMs:       now,
+		MaxAgeMs:    config.maxInflightAgeMs,
+		Threshold:   threshold,
+		CooldownMs:  config.cooldownMs,
+		RampMs:      config.rampMs,
 	})
 }
 

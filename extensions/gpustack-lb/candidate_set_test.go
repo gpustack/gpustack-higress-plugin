@@ -48,8 +48,8 @@ func TestBuildCandidateSetWithNoState(t *testing.T) {
 
 func TestEjectedCandidateIsNotPublished(t *testing.T) {
 	states := map[string]clusterState{
-		"a": {Health: healthState{EjectedUntil: 2000, RampUntil: 3000}},
-		"b": {Inflight: 5},
+		"a\x001": {Health: healthState{EjectedUntil: 2000, RampUntil: 3000}},
+		"b\x002": {Inflight: 5},
 	}
 	set := buildCandidateSet(lbConfig(t, twoCandidates), 1000, "", states)
 	got := published(set)
@@ -71,8 +71,8 @@ func TestEjectedCandidateIsNotPublished(t *testing.T) {
 func TestRecoveryPenaltyDecays(t *testing.T) {
 	states := map[string]clusterState{
 		// Cooldown over, halfway through the ramp.
-		"a": {Health: healthState{EjectedUntil: 1000, RampUntil: 2000}},
-		"b": {Inflight: 3},
+		"a\x001": {Health: healthState{EjectedUntil: 1000, RampUntil: 2000}},
+		"b\x002": {Inflight: 3},
 	}
 	set := buildCandidateSet(lbConfig(t, twoCandidates), 1500, "", states)
 	got := published(set)
@@ -103,10 +103,10 @@ func TestPenaltyBaseIgnoresEjectedLoad(t *testing.T) {
 		{"cluster":"c","targetId":"3"}
 	]}`)
 	states := map[string]clusterState{
-		"a": {Health: healthState{EjectedUntil: 1000, RampUntil: 2000}},
-		"b": {Inflight: 2},
+		"a\x001": {Health: healthState{EjectedUntil: 1000, RampUntil: 2000}},
+		"b\x002": {Inflight: 2},
 		// Ejected, and carrying a pile of leaked in-flight entries.
-		"c": {Inflight: 500, Health: healthState{EjectedUntil: 9000, RampUntil: 9000}},
+		"c\x003": {Inflight: 500, Health: healthState{EjectedUntil: 9000, RampUntil: 9000}},
 	}
 	set := buildCandidateSet(config, 1500, "", states)
 	// maxLoad is b's 2, not c's 500: 0.5 * (2+1)
@@ -115,39 +115,57 @@ func TestPenaltyBaseIgnoresEjectedLoad(t *testing.T) {
 	}
 }
 
-func TestOverCapCandidateIsNotPublished(t *testing.T) {
+// The concurrency cap is no longer a publish filter: the snapshot a filter
+// could act on is stale by the time the finisher runs, so the cap is enforced
+// by the finisher's atomic reserve instead. What publishing must do is carry
+// the cap (and the load, for ranking) so the reserve knows each target's
+// budget.
+func TestOverCapCandidateIsPublishedWithItsCap(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[
 		{"cluster":"a","targetId":"1","maxRunningRequests":4},
 		{"cluster":"b","targetId":"2"}
 	]}`)
-	set := buildCandidateSet(config, 1000, "", map[string]clusterState{"a": {Inflight: 4}})
-	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "b" {
-		t.Fatalf("published %v, want only b", set.Candidates)
+	set := buildCandidateSet(config, 1000, "", map[string]clusterState{"a\x001": {Inflight: 4}})
+	got := published(set)
+	if len(got) != 2 {
+		t.Fatalf("published %v, want both candidates (cap is the finisher's job)", set.Candidates)
+	}
+	if got["a\x001"].MaxRunningRequests != 4 {
+		t.Errorf("a.MaxRunningRequests = %d, want 4 published for the reserve", got["a\x001"].MaxRunningRequests)
+	}
+	if got["a\x001"].Inflight != 4 {
+		t.Errorf("a.Inflight = %d, want 4 for ranking", got["a\x001"].Inflight)
+	}
+	if got["b\x002"].MaxRunningRequests != 0 {
+		t.Errorf("b.MaxRunningRequests = %d, want 0 (unlimited)", got["b\x002"].MaxRunningRequests)
 	}
 }
 
-// failOpen re-admits everything health ejected, because a misconfigured cluster
-// name or a fleet-wide engine restart turns "reject" into a guaranteed 100%
-// failure. It deliberately does **not** re-admit over-capacity candidates --
-// that is a rate-limiting semantic, not a health one.
-func TestFailOpenReadmitsEjectedButNotOverCap(t *testing.T) {
+// failOpen re-admits everything health ejected when **everything** is ejected,
+// because a misconfigured cluster name or a fleet-wide engine restart turns
+// "reject" into a guaranteed 100% failure. There is no over-cap exclusion any
+// more because over-cap is no longer a filter here at all -- the finisher's
+// reserve owns that verdict.
+func TestFailOpenReadmitsEjected(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[
 		{"cluster":"a","targetId":"1"},
 		{"cluster":"b","targetId":"2","maxRunningRequests":1}
 	]}`)
+	// Both ejected; b additionally at its (snapshot) cap, which must not
+	// keep it out of the re-admission any more.
 	states := map[string]clusterState{
-		"a": {Health: healthState{EjectedUntil: 5000, RampUntil: 6000}},
-		"b": {Inflight: 9},
+		"a\x001": {Health: healthState{EjectedUntil: 5000, RampUntil: 6000}},
+		"b\x002": {Inflight: 9, Health: healthState{EjectedUntil: 5000, RampUntil: 6000}},
 	}
 	set := buildCandidateSet(config, 1000, "", states)
-	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "a" {
-		t.Fatalf("published %v, want only the ejected a re-admitted", set.Candidates)
+	if len(set.Candidates) != 2 {
+		t.Fatalf("published %v, want both ejected candidates re-admitted", set.Candidates)
 	}
 }
 
 func TestFailClosedPublishesNothing(t *testing.T) {
 	config := lbConfig(t, `{"health":{"failOpen":false},"candidates":[{"cluster":"a","targetId":"1"}]}`)
-	states := map[string]clusterState{"a": {Health: healthState{EjectedUntil: 5000, RampUntil: 6000}}}
+	states := map[string]clusterState{"a\x001": {Health: healthState{EjectedUntil: 5000, RampUntil: 6000}}}
 	if set := buildCandidateSet(config, 1000, "", states); len(set.Candidates) != 0 {
 		t.Fatalf("published %v, want nothing", set.Candidates)
 	}
@@ -158,7 +176,7 @@ func TestFailClosedPublishesNothing(t *testing.T) {
 func TestProviderIgnoresHealthButNotLoad(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[{"cluster":"p","targetId":"1","kind":"provider"}]}`)
 	states := map[string]clusterState{
-		"p": {Inflight: 7, Health: healthState{EjectedUntil: 5000, RampUntil: 6000}},
+		"p\x001": {Inflight: 7, Health: healthState{EjectedUntil: 5000, RampUntil: 6000}},
 	}
 	set := buildCandidateSet(config, 1000, "", states)
 	if len(set.Candidates) != 1 {
@@ -169,29 +187,72 @@ func TestProviderIgnoresHealthButNotLoad(t *testing.T) {
 	}
 }
 
-// Several candidates may share a cluster and differ only in targetId. They
-// share the backend, so they share the state -- but each resolves its own
-// rewrite target.
-func TestSharedClusterCandidatesShareStateAndResolveSeparately(t *testing.T) {
+// Several candidates may share a cluster and differ only in targetId. Their
+// **health** is the shared backend's (one ejection verdict for the cluster),
+// but their in-flight budgets are separate: maxRunningRequests is configured
+// per target, and merging the counts would spend target 2's requests out of
+// target 1's budget.
+func TestSharedClusterCandidatesShareHealthNotBudget(t *testing.T) {
 	config := lbConfig(t, `{
 		"candidates":[
-			{"cluster":"a","targetId":"1"},
+			{"cluster":"a","targetId":"1","maxRunningRequests":2},
 			{"cluster":"a","targetId":"2"}
 		],
 		"modelMappers":{"1":{"gpt-4o":"qwen3-32b"},"2":{"*":"deepseek-v3"}}
 	}`)
-	set := buildCandidateSet(config, 1000, "gpt-4o", map[string]clusterState{"a": {Inflight: 4}})
+	// Both ejected (cluster-level health), target 1 carrying 4 in-flight.
+	states := map[string]clusterState{
+		"a\x001": {Inflight: 4, Health: healthState{EjectedUntil: 9000, RampUntil: 9000}},
+		"a\x002": {Inflight: 0, Health: healthState{EjectedUntil: 9000, RampUntil: 9000}},
+	}
+	set := buildCandidateSet(config, 1000, "gpt-4o", states)
 	got := published(set)
 	if len(got) != 2 {
 		t.Fatalf("published %d candidates, want 2", len(got))
 	}
-	if got["a\x001"].Inflight != 4 || got["a\x002"].Inflight != 4 {
-		t.Error("candidates on one cluster disagree about its in-flight count")
+	if got["a\x001"].Inflight != 4 || got["a\x002"].Inflight != 0 {
+		t.Errorf("candidates on one cluster share an in-flight budget: %+v", got)
 	}
 	if got["a\x001"].ModelName != "qwen3-32b" {
 		t.Errorf("targetId 1 resolved to %q", got["a\x001"].ModelName)
 	}
 	if got["a\x002"].ModelName != "deepseek-v3" {
 		t.Errorf("targetId 2 resolved to %q", got["a\x002"].ModelName)
+	}
+}
+
+func TestReserveOrderWinnerFirstThenPublishedOrder(t *testing.T) {
+	set := CandidateSet{Candidates: []Candidate{
+		{Cluster: "a", TargetID: "1"},
+		{Cluster: "b", TargetID: "2"},
+		{Cluster: "a", TargetID: "1"}, // duplicate Key: dropped
+		{Cluster: "c", TargetID: "3"},
+	}}
+	pick := &set.Candidates[1] // b wins
+	got := reserveOrder(set, pick)
+	if len(got) != 3 || got[0].Cluster != "b" || got[1].Cluster != "a" || got[2].Cluster != "c" {
+		t.Errorf("reserveOrder = %v, want [b a c]", got)
+	}
+}
+
+// A weighted set is a business traffic split; "the canary is full, send to
+// stable" would silently rewrite the split the route promised. The walk stops
+// at the winner.
+func TestReserveOrderWeightedStopsAtWinner(t *testing.T) {
+	w := int64(70)
+	set := CandidateSet{Candidates: []Candidate{
+		{Cluster: "a", TargetID: "1", Weight: &w},
+		{Cluster: "b", TargetID: "2", Weight: &w},
+	}}
+	got := reserveOrder(set, &set.Candidates[0])
+	if len(got) != 1 || got[0].Cluster != "a" {
+		t.Errorf("reserveOrder = %v, want only the winner", got)
+	}
+}
+
+func TestReserveOrderNoPickIsEmpty(t *testing.T) {
+	set := CandidateSet{Candidates: []Candidate{{Cluster: "a"}}}
+	if got := reserveOrder(set, nil); got != nil {
+		t.Errorf("reserveOrder(nil pick) = %v, want nil", got)
 	}
 }
