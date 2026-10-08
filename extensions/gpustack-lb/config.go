@@ -23,6 +23,14 @@ const (
 	defaultRejectStatus       = 503
 	defaultRejectMessage      = "no healthy model instance available"
 
+	// The max-inflight rejection is a **rate-limit verdict**, not a health
+	// one: 429 says "back off and retry" where 503 says "this deployment is
+	// broken", and conflating the two is how gpustack/gpustack#6309 was read
+	// in the field. Separately configurable for deployments that must keep a
+	// uniform status across both rejects.
+	defaultCapRejectStatus  = 429
+	defaultCapRejectMessage = "max inflight requests reached, please retry later"
+
 	// failOpen defaults to on. Passive health judges by response.flags, and
 	// those can go red for every candidate at once for reasons that have
 	// nothing to do with the instances themselves: a misconfigured cluster
@@ -77,6 +85,15 @@ type Config struct {
 	rejectStatus  int64
 	rejectMessage string
 	rejectBody    []byte
+
+	// -- The cap-reject path (§7.3): every candidate at or over its
+	// maxRunningRequests when the finisher's reserve comes back empty.
+	// Kept alongside the pair above rather than merged with it, because the
+	// two verdicts mean different things and are configurable independently
+	// (see the defaults in the const block).
+	capRejectStatus  int64
+	capRejectMessage string
+	capRejectBody    []byte
 
 	// -- Specific to mode: context.
 	lbMode     bool
@@ -224,7 +241,19 @@ func parseConfig(j gjson.Result, config *Config) error {
 	}
 	config.rejectStatus = status
 	config.rejectMessage = rejectMessage(j)
-	config.rejectBody = buildRejectBody(config.rejectMessage, config.rejectStatus)
+	config.rejectBody = buildRejectBody(config.rejectMessage, "no_candidate", config.rejectStatus)
+
+	// The cap-reject pair, same treatment: 429 is the semantic default (a
+	// rate-limit verdict, see reject.go), the message says what actually
+	// happened rather than "no healthy model instance".
+	capStatus, capOK := normalizeRejectStatus(j.Get("reject.capStatus").Int())
+	if !capOK {
+		proxywasm.LogWarnf("%s: reject.capStatus %d out of range, using %d",
+			pluginName, j.Get("reject.capStatus").Int(), defaultCapRejectStatus)
+	}
+	config.capRejectStatus = capStatus
+	config.capRejectMessage = capRejectMessage(j)
+	config.capRejectBody = buildRejectBody(config.capRejectMessage, "max_inflight", config.capRejectStatus)
 
 	return nil
 }
@@ -240,6 +269,16 @@ func rejectMessage(j gjson.Result) string {
 		return msg
 	}
 	return defaultRejectMessage
+}
+
+// capRejectMessage is rejectMessage's counterpart for the max-inflight
+// rejection, with the same non-empty-body requirement and for the same
+// reason.
+func capRejectMessage(j gjson.Result) string {
+	if msg := j.Get("reject.capMessage").String(); msg != "" {
+		return msg
+	}
+	return defaultCapRejectMessage
 }
 
 // normalizeRejectStatus is a pure function -- the warning in parseConfig goes
@@ -436,7 +475,24 @@ func parseOverrideConfig(j gjson.Result, global Config, config *Config) error {
 		// inherited status. Reuse it rather than re-rendering identical JSON.
 		config.rejectBody = global.rejectBody
 	default:
-		config.rejectBody = buildRejectBody(config.rejectMessage, config.rejectStatus)
+		config.rejectBody = buildRejectBody(config.rejectMessage, "no_candidate", config.rejectStatus)
+	}
+
+	// -- The cap-reject pair: same inheritance rule as above, for the same
+	// reason (the body embeds the status).
+	capStatusSet := j.Get("reject.capStatus").Exists()
+	capMessageSet := j.Get("reject.capMessage").Exists()
+	if !capStatusSet && global.capRejectStatus > 0 {
+		config.capRejectStatus = global.capRejectStatus
+	}
+	if !capMessageSet && global.capRejectMessage != "" {
+		config.capRejectMessage = global.capRejectMessage
+	}
+	switch {
+	case !capStatusSet && !capMessageSet && len(global.capRejectBody) > 0:
+		config.capRejectBody = global.capRejectBody
+	default:
+		config.capRejectBody = buildRejectBody(config.capRejectMessage, "max_inflight", config.capRejectStatus)
 	}
 
 	// -- Body-handling parameters, shared by both modes.

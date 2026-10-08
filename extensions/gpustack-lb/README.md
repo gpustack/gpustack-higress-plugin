@@ -120,7 +120,7 @@ matchRules:
 | `candidates[].weight` | absent | **The presence of the field is the criterion switch.** A pointer rather than "treat 0 as absent": `weight: 0` is meaningful -- a canary dialled down to 0% is still healthy and usable, its share is just zero |
 | `candidates[].targetId` | empty | Looks up the `modelMappers` group, **and is part of the candidate's scoring identity** — see below. Several candidates may share one cluster and differ only here |
 | `candidates[].kind` | `instance` | `provider` must be given explicitly; it cannot be inferred from "there is only one candidate" -- a single-instance self-hosted model also has only one |
-| `candidates[].maxRunningRequests` | 0 (unlimited) | An input to the filter, **not published downstream**: what downstream sees already excludes anything over the limit. A **soft** cap — see below |
+| `candidates[].maxRunningRequests` | 0 (unlimited) | The candidate's concurrency cap. Enforced as a **hard** cap by the finisher's atomic check-and-reserve (see below); published on the candidate so the finisher knows the budget. Rejected requests get `reject.capStatus` / `reject.capMessage` (default 429) |
 | `modelMappers` | none | Model name mappings grouped by `targetId`; keys within a group use model-mapper syntax (exact / `prefix*` / `*`) |
 | `health.failOpen` | `true` | When every candidate has been ejected, pass through rather than reject. With a misconfigured path or a fleet-wide engine restart, it is better to send the request and have it fail than to take the whole route out of service. **Can be set globally in `defaultConfig` and overridden by matchRules** |
 | `modelMapping` etc. | — | The existing model-mapper config for non-LB routes; upstream semantics are followed verbatim |
@@ -130,17 +130,39 @@ cooldown and recovery windows are all configured on the finisher -- at the
 moment of ejection the finisher stamps both end timestamps into shared state,
 and context only reads them, so it never needs to know the window lengths.
 
-#### `maxRunningRequests` is a soft cap
+#### `maxRunningRequests` is a hard cap (check-and-reserve)
 
-The check reads a snapshot in `context` (340) while the increment happens in the
-finisher (325), so requests on different worker threads can all see
-`inflight < maxRunningRequests`, all be published, and all be routed — the cap
-can be overshot by up to the number of admissions in that window.
+The cap is enforced **in the finisher**, as one atomic operation per backend:
+`store.Reserve` checks each candidate's live in-flight count against its
+`maxRunningRequests` **and records the +1 in the same operation** — a single
+Lua script (`ZCOUNT` + `ZADD`) on redis, a single CAS read-modify-write in
+shared data. Concurrent requests can no longer all observe room that only
+existed once; the historical soft-cap overshoot
+(gpustack/gpustack#6309: "6 concurrent requests against `maxRun: 1`, up to 6
+succeeded") is gone.
 
-Closing that would take an atomic check-and-reserve plus a release on every exit
-path, which is exactly the machinery §6.3 rejected for half-open health: miss
-one release and the instance is wedged for good. A bounded overshoot is the
-better trade, and exact enforcement is `gpustack-rate-limit`'s job.
+The walk tries candidates in the finisher's preference order (selection winner
+first, then published order; weighted sets stop at the winner — falling back
+across a business traffic split would rewrite it). When **every** target is
+full the request is answered with the cap-reject response — `429` by default,
+message "max inflight requests reached, please retry later", both configurable
+as `reject.capStatus` / `reject.capMessage`. The old conflation of "capped"
+with "no healthy model instance" (a 503) is deliberate history.
+
+The reservation is released at `onHttpStreamDone` with the same token
+mechanism as before; a crashed gateway's leaked reservations age out via
+`maxInflightAgeMs`, which is the bounded-release answer to §6.3's
+"miss one release and the instance is wedged" objection. When the backend
+itself degrades (dispatch error, redis error reply, CAS budget exhausted) the
+reserve **fails open**: the preferred candidate is routed without a
+reservation — the old soft-cap behaviour for the duration of the blip, rather
+than taking the route out of service over a cache.
+
+Consequently the context role **no longer filters over-cap candidates**: the
+snapshot it loads can only be stale by the time the finisher runs, so it is
+used for *ranking* (least-load, penalty) only, and the candidate's cap itself
+is published on the wire (`maxRunningRequests` on `Candidate`) for the
+finisher's reserve.
 
 #### What matchRules inherit
 
@@ -218,7 +240,7 @@ counts and health verdicts. A candidate's published `inflight` is the count on
 *this* thread, not the instance's real load.
 
 Redis makes both facts deployment-wide. Least-load sees the true aggregate,
-`maxRunningRequests` becomes a fleet-wide soft cap rather than a per-process
+`maxRunningRequests` becomes a fleet-wide hard cap rather than a per-process
 one, and one replica ejecting a dead instance ejects it for every replica.
 
 ```yaml
@@ -312,14 +334,17 @@ redis-cli HGETALL '{gpustack_lb}:health:outbound|80||model-2-12.static'
 
 The context role has to **wait** for the read, so an LB request carries one
 blocking round-trip: it returns `HeaderStopAllIterationAndWatermark` at 340 and
-resumes from the redis callback. That is the same shape Higress's own
+resumes from the redis callback. Since the cap moved into the finisher's
+reserve, that role pauses and resumes the same way — so an LB request now
+carries **two** blocking round-trips. That is the same shape Higress's own
 `prefix_cache` uses and the one `gpustack-rate-limit` already runs in
-production; against an LLM request measured in seconds, an in-cluster
-round-trip well under a millisecond is noise.
+production; against an LLM request measured in seconds, in-cluster
+round-trips well under a millisecond are noise.
 
-The two writes are **fire-and-forget** (`+1` at selection, and one script at
-`onHttpStreamDone` that releases the entry and records the health outcome
-together) and never block anything.
+The write at `onHttpStreamDone` (release + health outcome, one script) is
+**fire-and-forget** and never blocks anything. The reserve's `+1` is not: its
+result **is** the routing decision, so it blocks under watermark like the
+reads do.
 
 Only the read is batched across candidates. The writes concern exactly one
 cluster each, so they are single-key by nature.

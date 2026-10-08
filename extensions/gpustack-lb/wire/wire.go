@@ -72,6 +72,17 @@ type Candidate struct {
 
 	Kind string `json:"kind"`
 
+	// MaxRunningRequests is this candidate's concurrency cap, published so the
+	// finisher can enforce it **at selection time** with an atomic
+	// check-and-reserve against the store (see gpustack-lb's store.Reserve).
+	//
+	// 0 means unlimited. It rides on the wire because the finisher reads the
+	// candidate set from filter state and has no other way to know the cap;
+	// capability plugins must ignore it -- ranking sees Inflight and Penalty
+	// already, and a plugin re-filtering by this number would re-introduce the
+	// soft-cap overshoot the reserve exists to close.
+	MaxRunningRequests int64 `json:"maxRunningRequests,omitempty"`
+
 	// Inflight and Penalty are published separately rather than pre-combined
 	// into one load scalar: there is more than one consumer and they each want
 	// something different. Capability plugins read load **from here** -- do not
@@ -118,10 +129,18 @@ const candidateKeySep = "\x00"
 // request to request, which is precisely the opposite of what the affinity
 // plugin exists to do.
 //
-// The cluster alone remains the right key for **shared state** (in-flight
-// counts, passive health): those describe the backend, and candidates sharing a
-// cluster genuinely share one backend. Only *scoring* identity needed
-// splitting.
+// Shared state is keyed on both dimensions, deliberately split:
+//
+//   - **passive health** is keyed by cluster alone -- it describes the
+//     physical backend, and candidates sharing a cluster genuinely share one;
+//   - **in-flight counts** are keyed by this function -- maxRunningRequests
+//     is configured per target (per provider / per model-route-target), so
+//     the concurrency budget must not be merged across targets that happen
+//     to share a cluster. Two provider targets pointing at the same DNS
+//     cluster each get their own budget, exactly as configured.
+//
+// Only *scoring* identity needed splitting beyond that; see gpustack-lb's
+// store.go for the key layout.
 //
 // ⚠️ Every capability plugin must key its Scores map with this function,
 // including separately shipped ones. A plugin still keying by cluster does not

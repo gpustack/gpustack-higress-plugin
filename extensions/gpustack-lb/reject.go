@@ -55,6 +55,37 @@ func reject(ctx wrapper.HttpContext, config Config) types.Action {
 	return types.ActionPause
 }
 
+// rejectCap answers the client when every candidate is at or over its
+// maxRunningRequests.
+//
+// Same delivery rules as reject (they were learned on the same filter chain:
+// DisableReroute first, ActionPause after, non-empty JSON body). The one
+// difference is the **response**: this is a rate-limit verdict, not a health
+// one, and reporting it as "no healthy model instance available" (the 503) is
+// actively misleading -- clients cannot tell "back off" from "this deployment
+// is broken", which is exactly how gpustack/gpustack#6309 read in the field.
+// Defaults to 429 with an explicit message; both configurable next to the
+// no-candidate pair.
+//
+// On the async (redis) path this runs from the store's reserve callback,
+// where the request is paused under watermark; the SendHttpResponse below
+// terminates the stream, and the store deliberately does not resume (the
+// rate-limit pattern -- resuming would race the local-reply queueing).
+func rejectCap(ctx wrapper.HttpContext, config Config) types.Action {
+	ctx.DisableReroute()
+
+	if err := proxywasm.SendHttpResponseWithDetail(
+		uint32(config.capRejectStatus),
+		pluginName+".max_inflight",
+		[][2]string{{"content-type", "application/json"}},
+		config.capRejectBody,
+		-1,
+	); err != nil {
+		proxywasm.LogErrorf("%s: SendHttpResponseWithDetail failed: %v", pluginName, err)
+	}
+	return types.ActionPause
+}
+
 // buildRejectBody wraps the message in an OpenAI-style error envelope.
 //
 // JSON is the right contract for AI clients; and on a streaming request the
@@ -62,7 +93,7 @@ func reject(ctx wrapper.HttpContext, config Config) types.Action {
 // where a non-JSON rejection body has historically been swallowed as an
 // incomplete SSE fragment. If the message is already a JSON object it is
 // passed through verbatim.
-func buildRejectBody(message string, status int64) []byte {
+func buildRejectBody(message, errType string, status int64) []byte {
 	trimmed := strings.TrimSpace(message)
 	if strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed)) {
 		return []byte(trimmed)
@@ -70,7 +101,7 @@ func buildRejectBody(message string, status int64) []byte {
 	payload := map[string]any{
 		"error": map[string]any{
 			"message": message,
-			"type":    "no_candidate",
+			"type":    errType,
 			"code":    status,
 		},
 	}

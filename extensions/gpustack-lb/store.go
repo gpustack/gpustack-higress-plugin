@@ -26,16 +26,46 @@ import (
 // health update there is one atomic script rather than a CAS loop. What the two
 // genuinely have in common is this handful of operations.
 
-// clusterState is everything the context role needs to know about one cluster
-// in order to filter and score it. It is keyed by **cluster name, not by
-// Candidate.Key()**: several candidates can share a cluster and differ only in
-// targetId, and in-flight load and health describe the backend, which they
-// genuinely share.
+// candidateState is everything the context role needs to know about one
+// candidate target in order to filter and score it.
+//
+// It is keyed by **Candidate.Key(), not by cluster**: the in-flight budget
+// belongs to the target (maxRunningRequests is configured per target), so
+// two candidates sharing a cluster but differing in targetId each carry
+// their own count. The Health inside it is the **cluster's** health -- the
+// store loads it per target but from the cluster's health key, so candidates
+// sharing a backend still share one ejection verdict.
 type clusterState struct {
 	// Inflight is the number of requests in flight that have not aged out.
 	Inflight int64
 	Health   healthState
 }
+
+// targetRef names one inflight-budget owner: Key is Candidate.Key() (the
+// budget identity), Cluster is the physical backend (the health identity).
+type targetRef struct {
+	Key     string
+	Cluster string
+}
+
+// reserveTarget is one step of the finisher's ordered check-and-reserve walk.
+type reserveTarget struct {
+	targetRef
+	// MaxRun is the candidate's maxRunningRequests; 0 means unlimited.
+	MaxRun int64
+}
+
+// Reserve outcomes, delivered as `pick` to the done callback:
+const (
+	// reserveExhausted: every target was at or over its cap. A deterministic
+	// rejection -- the finisher answers with the cap-reject response.
+	reserveExhausted = 0
+	// reserveFailOpen: the backend degraded (dispatch error, redis error
+	// reply, CAS budget exhausted). The finisher routes its preferred
+	// candidate **without** a reservation -- the old soft-cap behaviour --
+	// rather than taking the route out of service over a cache blip.
+	reserveFailOpen = -1
+)
 
 // outcome is what the finisher learned about the request when it ended.
 //
@@ -55,8 +85,12 @@ const (
 // probation), so no backend has to know what probation means -- and neither one
 // can resolve it differently from the other.
 type doneRecord struct {
+	// Cluster is the physical backend: passive health is keyed by it.
 	Cluster string
-	// Token is what AddInflight returned. Empty means nothing was written and
+	// InflightKey is Candidate.Key() of the chosen candidate -- the in-flight
+	// budget is keyed by it, and it is what the reservation was made under.
+	InflightKey string
+	// Token is what Reserve returned. Empty means nothing was written and
 	// there is nothing to release.
 	Token   string
 	Outcome outcome
@@ -71,10 +105,10 @@ type doneRecord struct {
 }
 
 type stateStore interface {
-	// LoadStates fetches the state of every cluster and then invokes done
-	// **exactly once**, with a map keyed by cluster name. A cluster missing
-	// from the map has no state yet, which is the same thing as zero in-flight
-	// requests and a clean health record.
+	// LoadStates fetches the state of every candidate target and then invokes
+	// done **exactly once**, with a map keyed by Candidate.Key(). A key
+	// missing from the map has no state yet, which is the same thing as zero
+	// in-flight requests and a clean health record.
 	//
 	// The returned action has to be returned from the filter handler
 	// unmodified. A backend that pauses the request owns the matching resume;
@@ -83,21 +117,34 @@ type stateStore interface {
 	// ⚠️ done may be invoked **after** LoadStates returns (that is the whole
 	// point of the async backend), so anything it needs must be captured by the
 	// closure rather than read afterwards.
-	LoadStates(clusters []string, nowMs, maxAgeMs int64, done func(map[string]clusterState)) types.Action
+	LoadStates(refs []targetRef, nowMs, maxAgeMs int64, done func(map[string]clusterState)) types.Action
 
-	// AddInflight records one in-flight request and returns the token that
-	// identifies it, to be handed back in doneRecord.Token.
+	// Reserve atomically checks each target's in-flight count against its cap
+	// **in the given order** and records one in-flight entry on the first
+	// target that is under its cap. This check-and-reserve is what makes
+	// maxRunningRequests a hard limit: the check and the +1 are one operation
+	// on every backend, so concurrent requests can no longer all observe
+	// "inflight < maxRun" and all be admitted (the soft-cap overshoot).
 	//
-	// An empty token means **nothing was written** (the backend gave up, or the
-	// dispatch failed). The finisher passes it back anyway; every backend
-	// treats it as "nothing to release", which keeps the paired call from
-	// spending a write on a record that never existed.
-	AddInflight(cluster string, nowMs, maxAgeMs int64) string
+	// done is invoked exactly once with pick (see the reserve* constants):
+	// a 1-based index into targets on success, reserveExhausted when every
+	// target is full, reserveFailOpen when the backend degraded. On success
+	// it also receives the token identifying the entry, to be handed back in
+	// doneRecord.Token.
+	//
+	// done's return value is the filter action for the synchronous path; a
+	// backend that pauses the request (redis) invokes done from its callback,
+	// ignores its return and owns the resume -- **except on
+	// reserveExhausted**, where the finisher's local reply already terminates
+	// the stream and resuming would race with it (the pattern
+	// gpustack-rate-limit established). The returned action must be passed
+	// through by the caller.
+	Reserve(targets []reserveTarget, nowMs, maxAgeMs int64, done func(pick int, token string) types.Action) types.Action
 
 	// Done releases the in-flight entry and records the health outcome. The two
 	// are one operation rather than two because they always happen together, in
-	// the same hook, for the same cluster -- and on the redis backend that lets
-	// them share a single round-trip.
+	// the same hook, for the same candidate -- and on the redis backend that
+	// lets them share a single round-trip.
 	Done(rec doneRecord)
 }
 
@@ -143,23 +190,24 @@ func buildStateStore(j gjson.Result) (stateStore, error) {
 	return newRedisStore(settings)
 }
 
-// candidateClusters is the de-duplicated cluster list for a candidate set, in
+// candidateRefs is the de-duplicated target list for a candidate set, in
 // config order.
 //
-// De-duplication is not an optimisation: gpustack's several-model-names-on-one-
-// cluster case puts the same cluster in the candidate list more than once, and
-// on the redis backend a repeated cluster would mean the same key appearing
-// twice in one KEYS array -- extra work per request, and a needless second copy
-// of the same answer.
-func candidateClusters(candidates []candidateSpec) []string {
-	out := make([]string, 0, len(candidates))
+// De-duplication is by **Candidate.Key()**, not by cluster: the in-flight
+// budget is per target, so two candidates sharing a cluster but differing in
+// targetId are two budgets and must both be loaded. What must not happen is
+// the same Key appearing twice in one KEYS array -- extra work per request,
+// and a needless second copy of the same answer.
+func candidateRefs(candidates []candidateSpec) []targetRef {
+	out := make([]targetRef, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))
 	for _, c := range candidates {
-		if _, dup := seen[c.Cluster]; dup {
+		key := c.Key()
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		seen[c.Cluster] = struct{}{}
-		out = append(out, c.Cluster)
+		seen[key] = struct{}{}
+		out = append(out, targetRef{Key: key, Cluster: c.Cluster})
 	}
 	return out
 }

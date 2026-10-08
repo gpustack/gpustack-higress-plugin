@@ -45,15 +45,12 @@ const (
 	SharedHealthPrefix   = "gpustack_lb_health_"
 )
 
-// candidateSpec is the **config-parse-time** candidate: the wire contract plus
-// a concurrency cap.
+// candidateSpec is the **config-parse-time** candidate.
 //
-// maxRunningRequests stays out of wire.Candidate because it is an input to the
-// filter, and the filter is applied by the publisher before publishing.
-// Downstream never sees over-cap candidates, so carrying the number would only
-// invite capability plugins to re-implement the filter -- and worse, it does
-// not exist in the JSON at all, so they would always read 0 and conclude
-// "no cap".
+// maxRunningRequests is duplicated onto wire.Candidate at publish time (the
+// finisher reads the candidate set from filter state and needs the cap for its
+// reserve walk), so this field is the parse-time input to that copy rather
+// than the sole owner of the number.
 type candidateSpec struct {
 	wire.Candidate
 	maxRunningRequests int64

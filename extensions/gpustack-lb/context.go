@@ -53,7 +53,7 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// below the load is identical either way, which is what keeps the two
 	// backends from drifting apart.
 	nowMs := nowMillis()
-	return config.stateBackend().LoadStates(candidateClusters(config.candidates), nowMs, config.maxInflightAgeMs,
+	return config.stateBackend().LoadStates(candidateRefs(config.candidates), nowMs, config.maxInflightAgeMs,
 		func(states map[string]clusterState) {
 			set := buildCandidateSet(config, nowMs, clientModel, states)
 			publishCandidates(set)
@@ -118,19 +118,25 @@ func contextOnBody(ctx wrapper.HttpContext, config Config, body []byte) types.Ac
 	})
 }
 
-// buildCandidateSet applies every filter to the state the store just loaded and
-// produces the candidate set to publish.
+// buildCandidateSet applies every **health** filter to the state the store
+// just loaded and produces the candidate set to publish.
 //
-// All the filters (health, concurrency, kind) are applied here, so capability
-// plugins never need to know anything about health -- that is the direct
-// benefit of putting filtering in the publisher (design §7.1).
+// The concurrency cap is **deliberately not applied here**. Filtering on the
+// loaded snapshot is a read-then-decide: requests on different workers (or
+// different gateway replicas) can all observe inflight < maxRun and all be
+// published, overshooting the cap by the number of admissions in the window.
+// The cap is enforced by the finisher's atomic check-and-reserve instead
+// (store.Reserve), where the check and the +1 are one operation; what this
+// function publishes is the candidate's **cap itself** (MaxRunningRequests)
+// alongside its load, so the finisher knows each target's budget. Stale
+// snapshots therefore only affect *ranking*, never correctness of the cap.
 //
 // It takes the state as an argument rather than reading it, which makes it a
-// **pure function**: the whole filter -- ejection, the concurrency cap, the
-// penalty curve, fail-open re-admission -- is unit-testable without a wasm
-// host, and it is the same code on both backends.
+// **pure function**: the whole filter -- ejection, the penalty curve,
+// fail-open re-admission -- is unit-testable without a wasm host, and it is
+// the same code on both backends.
 //
-// A cluster missing from states has no state yet, which reads as zero in-flight
+// A key missing from states has no state yet, which reads as zero in-flight
 // requests and a clean health record. That is also exactly what a failed redis
 // load produces, which is the fail-open posture: no state means nothing is
 // filtered out.
@@ -138,12 +144,8 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 	var out CandidateSet
 
 	type scratch struct {
-		c        Candidate
-		ejected  bool
-		overCap  bool
-		maxRun   int64
-		inflight int64
-		penalty  float64
+		c       Candidate
+		ejected bool
 	}
 
 	items := make([]scratch, 0, len(config.candidates))
@@ -157,11 +159,11 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 		// finisher receives a settled value and needs no mapping logic.
 		s.c.ModelName = resolveCandidateModel(config, c.TargetID, clientModel)
 
-		state := states[c.Cluster]
-
-		s.maxRun = c.maxRunningRequests
-		s.inflight = state.Inflight
-		s.c.Inflight = s.inflight
+		// The cap rides on the candidate so the finisher can reserve against
+		// it; the load snapshot rides along for ranking only.
+		s.c.MaxRunningRequests = c.maxRunningRequests
+		state := states[c.Key()]
+		s.c.Inflight = state.Inflight
 
 		// provider candidates take no part in passive health marking: their
 		// single DNS cluster has many endpoints, so ejecting the whole cluster
@@ -178,36 +180,19 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 				// requests, so without a penalty it is immediately the optimal
 				// choice and gets saturated the moment it returns. The penalty
 				// decays linearly from 1 to 0.
-				s.penalty = float64(h.RampUntil-nowMs) / float64(h.RampUntil-h.EjectedUntil)
+				s.c.Penalty = float64(h.RampUntil-nowMs) / float64(h.RampUntil-h.EjectedUntil)
 				s.c.Probation = true
 			}
 		}
 
-		// ⚠️ **maxRunningRequests is a soft cap, not a reservation.** This reads
-		// a snapshot at 795 and the finisher increments at 700, so requests on
-		// different worker threads can all observe inflight < maxRun, all be
-		// published, and all be routed -- overshooting the cap by up to the
-		// number of admissions in that window.
-		//
-		// Closing that would mean an atomic check-and-reserve here plus a
-		// release on every exit path, which is precisely the machinery §6.3
-		// rejected for half-open health: a cross-thread CAS test-and-set whose
-		// release path, missed once, wedges the instance for good. Trading a
-		// bounded overshoot for a permanent-starvation bug is the wrong side of
-		// that deal, and the exact enforcement job belongs to
-		// gpustack-rate-limit, which is built for it.
-		if s.maxRun > 0 && s.inflight >= s.maxRun {
-			s.overCap = true
-		}
-
 		// maxLoad only counts candidates that will actually be **published**.
-		// Ejected and over-cap ones take no part in the selection that
-		// follows, and including them inflates P₀ -- especially an ejected
-		// instance, whose in-flight count is often a batch of hung requests
-		// that never returned: a high, stale number that would hold a
-		// recovering candidate down far longer than it should.
-		if !s.ejected && !s.overCap {
-			if l := float64(s.inflight); l > maxLoad {
+		// Ejected ones take no part in the selection that follows, and
+		// including them inflates P₀ -- especially an ejected instance, whose
+		// in-flight count is often a batch of hung requests that never
+		// returned: a high, stale number that would hold a recovering
+		// candidate down far longer than it should.
+		if !s.ejected {
+			if l := float64(state.Inflight); l > maxLoad {
 				maxLoad = l
 			}
 		}
@@ -218,14 +203,14 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 	// with no extra knob. At t=0 a recovering candidate sorts behind everyone
 	// else, then linearly returns to normal.
 	for i := range items {
-		if items[i].penalty > 0 {
-			items[i].c.Penalty = items[i].penalty * (maxLoad + 1)
+		if items[i].c.Penalty > 0 {
+			items[i].c.Penalty = items[i].c.Penalty * (maxLoad + 1)
 		}
 	}
 
 	alive := make([]Candidate, 0, len(items))
 	for _, s := range items {
-		if s.ejected || s.overCap {
+		if s.ejected {
 			continue
 		}
 		alive = append(alive, s.c)
@@ -233,14 +218,12 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 
 	// When everything is ejected, failOpen re-admits them all: with a
 	// misconfigured path, or engines restarting en masse, it is better to send
-	// the request and fail than to take the whole route out of service. Note
-	// this only opens up for **health** failures; over-capacity is excluded,
-	// which is a deliberate rate-limiting semantic.
+	// the request and fail than to take the whole route out of service. (The
+	// concurrency cap needs no equivalent here: over-cap is no longer a
+	// publish filter, and the finisher's reserve answers "everything full"
+	// with the cap-reject response on its own.)
 	if len(alive) == 0 && config.shouldFailOpen() {
 		for _, s := range items {
-			if s.overCap {
-				continue
-			}
 			alive = append(alive, s.c)
 		}
 	}

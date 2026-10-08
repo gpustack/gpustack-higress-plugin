@@ -20,16 +20,18 @@ import (
 // runs one wasm VM per worker thread, so even a single-replica deployment
 // already keeps several independent in-flight counts and health verdicts.
 // Redis makes both facts deployment-wide: least-load sees the real aggregate,
-// maxRunningRequests becomes a fleet-wide soft cap instead of a per-process
+// maxRunningRequests becomes a fleet-wide hard cap instead of a per-process
 // one, and one replica ejecting a dead instance ejects it for all of them.
 //
 // **What it costs**: the context role has to wait for the read, so every LB
 // request carries one blocking round-trip (returns
-// HeaderStopAllIterationAndWatermark, resumes in the callback). This is the
-// shape Higress's own prefix_cache uses and the one gpustack-rate-limit already
-// runs in production; against an LLM request measured in seconds, an in-cluster
-// round-trip of well under a millisecond is noise. The two writes are
-// fire-and-forget and never block anything.
+// HeaderStopAllIterationAndWatermark, resumes in the callback). Since the cap
+// moved into the finisher's reserve, that role pauses and resumes the same
+// way, so the request carries a second blocking round-trip. This is the
+// shape Higress's own prefix_cache uses and the one gpustack-rate-limit
+// already runs in production; against an LLM request measured in seconds, an
+// in-cluster round-trip of well under a millisecond is noise. The
+// onStreamDone write remains fire-and-forget and never blocks anything.
 //
 // **Fail-open on every failure.** A dispatch error, a redis error reply, a
 // timeout or a malformed reply all resolve to "no state": every candidate is
@@ -193,21 +195,71 @@ end
 return out
 `
 
-// addScript records one in-flight request.
+// reserveScript atomically checks each target's in-flight count against its
+// cap **in KEYS order** and records one entry on the first target with room.
 //
-// ARGV: [1] now ms, [2] cutoff ms (anything at or below it has aged out),
-// [3] member, [4] key TTL in seconds.
+// KEYS: the inflight keys of the targets, in the finisher's preference order.
+// ARGV: [1] now ms, [2] cutoff ms, [3] member, [4] key TTL in seconds,
+// [5..N+4] the maxRunningRequests of each target (0 = unlimited).
 //
-// The sorted set replaces the shared-data backend's timestamp array wholesale:
-// ZADD/ZREM/ZREMRANGEBYSCORE need no read-modify-write, so there is no CAS loop,
-// no retry budget, and none of the "the first write to a new key bypasses CAS"
-// window that state.go has to document.
-const addScript = `
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
-redis.call('ZADD', KEYS[1], ARGV[1], ARGV[3])
-redis.call('EXPIRE', KEYS[1], ARGV[4])
-return 1
+// Returns the 1-based index of the target it reserved, or 0 when every target
+// was at or over its cap. Redis executes scripts serially, so the ZCOUNT and
+// the ZADD below cannot interleave with another request's -- this is the
+// check-and-reserve that makes maxRunningRequests a hard limit, and the reason
+// the cap is enforced here rather than by the context role's read-then-filter
+// (which can only ever produce a soft cap).
+const reserveScript = `
+local live = '(' .. ARGV[2]
+for i = 1, #KEYS do
+  local maxRun = tonumber(ARGV[4 + i])
+  redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', ARGV[2])
+  if maxRun <= 0 or redis.call('ZCOUNT', KEYS[i], live, '+inf') < maxRun then
+    redis.call('ZADD', KEYS[i], ARGV[1], ARGV[3])
+    redis.call('EXPIRE', KEYS[i], ARGV[4])
+    return i
+  end
+end
+return 0
 `
+
+// reserveArgs builds reserveScript's ARGV. Pure, like doneArgs, and for the
+// same reasons: the positional slots have to line up with the script by
+// index, and the millisecond timestamps must be pre-formatted as strings (a
+// Lua number arg round-trips through a float formatter, and a timestamp that
+// renders as "1.7e+12" would never parse back).
+func reserveArgs(nowMs, maxAgeMs int64, member string, maxRuns []int64) []interface{} {
+	args := []interface{}{
+		strconv.FormatInt(nowMs, 10),
+		strconv.FormatInt(inflightCutoff(nowMs, maxAgeMs), 10),
+		member,
+		strconv.FormatInt(inflightTTLSeconds(maxAgeMs), 10),
+	}
+	for _, mr := range maxRuns {
+		args = append(args, strconv.FormatInt(mr, 10))
+	}
+	return args
+}
+
+// decodeReserveReply turns reserveScript's reply into a pick.
+//
+// **Pure** -- no host calls, not even logging (the caller logs), same rule as
+// decodeLoadReply. An error reply, a non-numeric value or an out-of-range
+// index is an error, and the caller fails open: a malformed reply must not be
+// readable as "every target is full", which would turn a cache hiccup into a
+// 100% rejection rate on the route.
+func decodeReserveReply(numKeys int, response resp.Value) (int, error) {
+	if err := response.Error(); err != nil {
+		return 0, err
+	}
+	pick, err := strconv.Atoi(response.String())
+	if err != nil {
+		return 0, fmt.Errorf("unparseable reserve reply %q", response.String())
+	}
+	if pick < 0 || pick > numKeys {
+		return 0, fmt.Errorf("reserve reply %d out of range for %d targets", pick, numKeys)
+	}
+	return pick, nil
+}
 
 // doneScript releases the in-flight entry and records the health outcome in one
 // round-trip, because they always happen together in the same hook.
@@ -268,15 +320,20 @@ func outcomeArg(oc outcome) string {
 	}
 }
 
-func (s *redisStore) LoadStates(clusters []string, nowMs, maxAgeMs int64, done func(map[string]clusterState)) types.Action {
-	if len(clusters) == 0 {
+func (s *redisStore) LoadStates(refs []targetRef, nowMs, maxAgeMs int64, done func(map[string]clusterState)) types.Action {
+	if len(refs) == 0 {
 		done(nil)
 		return types.ActionContinue
 	}
 
-	keys := make([]interface{}, 0, len(clusters)*2)
-	for _, cluster := range clusters {
-		keys = append(keys, s.inflightKey(cluster), s.healthKey(cluster))
+	keys := make([]interface{}, 0, len(refs)*2)
+	keyNames := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		// In-flight by Candidate.Key() (per-target budget), health by cluster
+		// (shared backend verdict) -- the pair repeats the cluster's health
+		// for each of its targets, which decodeLoadReply keys under each Key.
+		keys = append(keys, s.inflightKey(ref.Key), s.healthKey(ref.Cluster))
+		keyNames = append(keyNames, ref.Key)
 	}
 	args := []interface{}{strconv.FormatInt(inflightCutoff(nowMs, maxAgeMs), 10)}
 
@@ -286,7 +343,7 @@ func (s *redisStore) LoadStates(clusters []string, nowMs, maxAgeMs int64, done f
 	// into a resp error value rather than swallowed). That is what makes the
 	// pause safe -- there is no branch on which the request stays parked.
 	err := s.client.Eval(loadScript, len(keys), keys, args, func(response resp.Value) {
-		states, decodeErr := decodeLoadReply(clusters, response)
+		states, decodeErr := decodeLoadReply(keyNames, response)
 		if decodeErr != nil {
 			proxywasm.LogWarnf("%s: redis state load failed, continuing without state: %v", pluginName, decodeErr)
 		}
@@ -310,32 +367,69 @@ func (s *redisStore) LoadStates(clusters []string, nowMs, maxAgeMs int64, done f
 	return types.HeaderStopAllIterationAndWatermark
 }
 
-func (s *redisStore) AddInflight(cluster string, nowMs, maxAgeMs int64) string {
+// Reserve runs reserveScript for the ordered targets and pauses the request
+// until the reply lands -- unlike the old fire-and-forget add, the result is
+// now the routing decision, so it has to be on the critical path. The pause
+// shape is LoadStates's: HeaderStopAllIterationAndWatermark up front, resume
+// from the callback.
+//
+// **On reserveExhausted the callback does not resume**: the finisher's local
+// reply (sent from inside done) already terminates the stream, and resuming
+// would race with the local-reply queueing on some Higress builds -- the exact
+// pattern gpustack-rate-limit established and documented.
+func (s *redisStore) Reserve(targets []reserveTarget, nowMs, maxAgeMs int64, done func(int, string) types.Action) types.Action {
+	if len(targets) == 0 {
+		return done(reserveExhausted, "")
+	}
 	member := newInflightToken(nowMs)
-	keys := []interface{}{s.inflightKey(cluster)}
-	args := []interface{}{
-		strconv.FormatInt(nowMs, 10),
-		strconv.FormatInt(inflightCutoff(nowMs, maxAgeMs), 10),
-		member,
-		strconv.FormatInt(inflightTTLSeconds(maxAgeMs), 10),
+	keys := make([]interface{}, 0, len(targets))
+	maxRuns := make([]int64, 0, len(targets))
+	for _, t := range targets {
+		keys = append(keys, s.inflightKey(t.Key))
+		maxRuns = append(maxRuns, t.MaxRun)
 	}
-	// Fire-and-forget: a nil callback keeps this off the request's critical
-	// path. The consequence is that the increment is not guaranteed to be
-	// visible to a concurrent request being published right now -- the same
-	// window the shared-data backend has between the read at 795 and the write
-	// at 700, which is why maxRunningRequests is documented as a soft cap.
-	if err := s.client.Eval(addScript, len(keys), keys, args, nil); err != nil {
-		proxywasm.LogWarnf("%s: redis inflight add for %s failed: %v", pluginName, cluster, err)
-		// Returning an empty token makes Done skip the release. That is the
-		// correct pairing: there is nothing to release, and ZREM of a member
-		// that was never added would be a wasted round-trip.
-		return ""
+	args := reserveArgs(nowMs, maxAgeMs, member, maxRuns)
+
+	err := s.client.Eval(reserveScript, len(keys), keys, args, func(response resp.Value) {
+		// Keep the callback minimal between entry and any SendHttpResponse
+		// (inside done), matching the known-good shape of cluster-key-rate-
+		// limit: extra hostcalls here can confuse Envoy's async local-reply
+		// path on some Higress builds.
+		pick, decodeErr := decodeReserveReply(len(targets), response)
+		if decodeErr != nil {
+			proxywasm.LogWarnf("%s: redis reserve failed, failing open: %v", pluginName, decodeErr)
+			pick = reserveFailOpen
+		}
+		token := ""
+		if pick > 0 {
+			token = member
+		}
+		done(pick, token)
+		if pick != reserveExhausted {
+			if err := proxywasm.ResumeHttpRequest(); err != nil {
+				// Only reachable in a host-side anomaly (the stream is no
+				// longer paused, the VM is being torn down). The request then
+				// hangs until Envoy's idle timeout; a log line is all the
+				// signal an operator gets.
+				proxywasm.LogWarnf("%s: ResumeHttpRequest failed after reserve: %v", pluginName, err)
+			}
+		}
+	})
+	if err != nil {
+		// The dispatch never happened, so no callback is coming and the
+		// request was never paused. Fail open to the finisher's preferred
+		// candidate without a reservation -- see the fail-open note at the
+		// top of this file.
+		proxywasm.LogWarnf("%s: redis reserve dispatch failed, failing open: %v", pluginName, err)
+		return done(reserveFailOpen, "")
 	}
-	return member
+	return types.HeaderStopAllIterationAndWatermark
 }
 
 func (s *redisStore) Done(rec doneRecord) {
-	keys := []interface{}{s.inflightKey(rec.Cluster), s.healthKey(rec.Cluster)}
+	// The in-flight entry lives under the candidate Key (per-target budget),
+	// the health verdict under the cluster (shared backend).
+	keys := []interface{}{s.inflightKey(rec.InflightKey), s.healthKey(rec.Cluster)}
 	if err := s.client.Eval(doneScript, len(keys), keys, doneArgs(rec), nil); err != nil {
 		proxywasm.LogWarnf("%s: redis done for %s failed: %v", pluginName, rec.Cluster, err)
 	}
