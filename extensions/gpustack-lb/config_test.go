@@ -29,6 +29,9 @@ func TestParseConfigDefaults(t *testing.T) {
 	if c.rejectStatus != defaultRejectStatus {
 		t.Errorf("rejectStatus = %d", c.rejectStatus)
 	}
+	if c.capRejectStatus != defaultCapRejectStatus {
+		t.Errorf("capRejectStatus = %d, want %d", c.capRejectStatus, defaultCapRejectStatus)
+	}
 	if c.modelKey != "model" {
 		t.Errorf("modelKey = %q", c.modelKey)
 	}
@@ -114,6 +117,33 @@ func TestRejectBodyPassesThroughJSONObject(t *testing.T) {
 	raw := `{"error":{"message":"custom"}}`
 	if got := string(buildRejectBody(raw, "no_candidate", 503)); got != raw {
 		t.Errorf("got %s, want %s", got, raw)
+	}
+}
+
+func TestCapRejectConfigInheritance(t *testing.T) {
+	global := parse(t, `{"reject":{"capStatus":502,"capMessage":"global cap"}}`)
+	for _, tt := range []struct {
+		name, raw, message string
+		status             int64
+	}{
+		{"explicit zero", `{"reject":{"capStatus":0}}`, "global cap", 429},
+		{"inherit", `{}`, "global cap", 502},
+		{"override status", `{"reject":{"capStatus":503}}`, "global cap", 503},
+		{"override message", `{"reject":{"capMessage":"rule cap"}}`, "rule cap", 502},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var c Config
+			if err := parseOverrideConfig(gjson.Parse(tt.raw), global, &c); err != nil {
+				t.Fatal(err)
+			}
+			if c.capRejectStatus != tt.status || c.capRejectMessage != tt.message {
+				t.Fatalf("cap reject = %d %q, want %d %q", c.capRejectStatus, c.capRejectMessage, tt.status, tt.message)
+			}
+			body := gjson.ParseBytes(c.capRejectBody)
+			if body.Get("error.code").Int() != tt.status || body.Get("error.message").String() != tt.message || body.Get("error.type").String() != "max_inflight" {
+				t.Fatalf("cap reject body disagrees with config: %s", c.capRejectBody)
+			}
+		})
 	}
 }
 
@@ -500,11 +530,17 @@ func TestRejectStatusRange(t *testing.T) {
 		{-1, defaultRejectStatus, false},
 		{99, defaultRejectStatus, false},
 	}
-	for _, tt := range tests {
-		got, ok := normalizeRejectStatus(tt.raw)
-		if got != tt.want || ok != tt.wantOK {
-			t.Errorf("normalizeRejectStatus(%d) = (%d,%v), want (%d,%v)",
-				tt.raw, got, ok, tt.want, tt.wantOK)
+	for _, fallback := range []int64{defaultRejectStatus, defaultCapRejectStatus} {
+		for _, tt := range tests {
+			want := tt.want
+			if tt.raw == 0 || !tt.wantOK {
+				want = fallback
+			}
+			got, ok := normalizeRejectStatus(tt.raw, fallback)
+			if got != want || ok != tt.wantOK {
+				t.Errorf("normalizeRejectStatus(%d, %d) = (%d,%v), want (%d,%v)",
+					tt.raw, fallback, got, ok, want, tt.wantOK)
+			}
 		}
 	}
 	// End to end: a valid value must land in the config.
@@ -788,12 +824,12 @@ func TestCandidateOrderIsDeterministicWithinACluster(t *testing.T) {
 // §7.3 requires in order to flush at all.
 func TestRejectStatusMustBeAnErrorCode(t *testing.T) {
 	for _, raw := range []int64{200, 201, 204, 301, 302, 399} {
-		if got, ok := normalizeRejectStatus(raw); ok || got != defaultRejectStatus {
+		if got, ok := normalizeRejectStatus(raw, defaultRejectStatus); ok || got != defaultRejectStatus {
 			t.Errorf("normalizeRejectStatus(%d) = (%d,%v), want the default and not-ok", raw, got, ok)
 		}
 	}
 	for _, raw := range []int64{400, 429, 503, 599} {
-		if got, ok := normalizeRejectStatus(raw); !ok || got != raw {
+		if got, ok := normalizeRejectStatus(raw, defaultRejectStatus); !ok || got != raw {
 			t.Errorf("normalizeRejectStatus(%d) = (%d,%v), want it accepted", raw, got, ok)
 		}
 	}

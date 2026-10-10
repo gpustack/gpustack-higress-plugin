@@ -229,7 +229,7 @@ func TestReserveOrderWinnerFirstThenPublishedOrder(t *testing.T) {
 		{Cluster: "c", TargetID: "3"},
 	}}
 	pick := &set.Candidates[1] // b wins
-	got := reserveOrder(set, pick)
+	got := reserveOrder(set, pick, nil)
 	if len(got) != 3 || got[0].Cluster != "b" || got[1].Cluster != "a" || got[2].Cluster != "c" {
 		t.Errorf("reserveOrder = %v, want [b a c]", got)
 	}
@@ -244,7 +244,7 @@ func TestReserveOrderWeightedStopsAtWinner(t *testing.T) {
 		{Cluster: "a", TargetID: "1", Weight: &w},
 		{Cluster: "b", TargetID: "2", Weight: &w},
 	}}
-	got := reserveOrder(set, &set.Candidates[0])
+	got := reserveOrder(set, &set.Candidates[0], []float64{0, 1})
 	if len(got) != 1 || got[0].Cluster != "a" {
 		t.Errorf("reserveOrder = %v, want only the winner", got)
 	}
@@ -252,7 +252,54 @@ func TestReserveOrderWeightedStopsAtWinner(t *testing.T) {
 
 func TestReserveOrderNoPickIsEmpty(t *testing.T) {
 	set := CandidateSet{Candidates: []Candidate{{Cluster: "a"}}}
-	if got := reserveOrder(set, nil); got != nil {
+	if got := reserveOrder(set, nil, nil); got != nil {
 		t.Errorf("reserveOrder(nil pick) = %v, want nil", got)
+	}
+}
+
+func TestReserveOrderPreservesScoresAfterFullWinner(t *testing.T) {
+	set := CandidateSet{Candidates: []Candidate{
+		{Cluster: "a", Inflight: 90, MaxRunningRequests: 100},
+		{Cluster: "b", Inflight: 1, MaxRunningRequests: 1},
+		{Cluster: "c", Inflight: 2, MaxRunningRequests: 100},
+	}}
+	totals, _ := combineRanks(set.Candidates, []RankEntry{{
+		Weight: 1,
+		Scores: map[string]float64{"a": 1.0 / 91, "b": 1.0 / 2, "c": 1.0 / 3},
+	}})
+	ordered := reserveOrder(set, bestTotal(set.Candidates, totals), totals)
+	for _, c := range ordered {
+		if c.MaxRunningRequests > 0 && c.Inflight >= c.MaxRunningRequests {
+			continue
+		}
+		if c.Cluster != "c" {
+			t.Fatalf("fallback = %s (inflight=%d), want c (inflight=2)", c.Cluster, c.Inflight)
+		}
+		return
+	}
+	t.Fatal("no available candidate")
+}
+
+func TestReserveOrderRandomizesTiedFallbacks(t *testing.T) {
+	set := CandidateSet{Candidates: []Candidate{
+		{Cluster: "a", TargetID: "1"},
+		{Cluster: "b", TargetID: "2"},
+		{Cluster: "a", TargetID: "1"},
+		{Cluster: "c", TargetID: "3"},
+		{Cluster: "c", TargetID: "4"},
+	}}
+	seen := map[string]bool{}
+	for range 200 {
+		ordered := reserveOrder(set, &set.Candidates[1], []float64{1, 2, 1, 1, 0})
+		if len(ordered) != 4 || ordered[0].Cluster != "b" || ordered[3].TargetID != "4" {
+			t.Fatalf("unexpected reserve order: %+v", ordered)
+		}
+		seen[ordered[1].Key()] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("equal-score fallbacks should both be reachable, saw %v", seen)
+	}
+	if set.Candidates[0].Cluster != "a" || set.Candidates[1].Cluster != "b" {
+		t.Fatal("reserve order mutated the published candidates")
 	}
 }

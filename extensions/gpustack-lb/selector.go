@@ -28,8 +28,8 @@ import (
 // and wasm callbacks run serially, so no synchronisation is needed here.
 var rrCursor = rand.Uint64()
 
-// selectCandidate returns the chosen candidate, or nil when the candidate set
-// is empty (the caller then rejects).
+// selectCandidate returns the chosen candidate and its set's combined scores
+// for the reserve walk. Scores are nil for weighted and round-robin selection.
 //
 // **The criterion is decided by whether the candidates carry a weight**; there
 // is no separate selection switch:
@@ -47,12 +47,12 @@ var rrCursor = rand.Uint64()
 // The request id is read here rather than by the caller because only the
 // weighted branch uses it: reading it costs a host call, and on the scored path
 // a miss also burns a random draw, both for a value that is then discarded.
-func selectCandidate(set CandidateSet) *Candidate {
+func selectCandidate(set CandidateSet) (*Candidate, []float64) {
 	if len(set.Candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 	if isWeighted(set.Candidates) {
-		return selectWeighted(set, requestID())
+		return selectWeighted(set, requestID()), nil
 	}
 	return selectScored(set)
 }
@@ -164,21 +164,21 @@ func selectWeighted(set CandidateSet, reqID string) *Candidate {
 // stickiness holds). L1 preserves the information about *how far apart* the
 // candidates actually are, and that is the premise on which the weights can be
 // interpreted at all.
-func selectScored(set CandidateSet) *Candidate {
+func selectScored(set CandidateSet) (*Candidate, []float64) {
 	ranks, ok := readRanks()
 	if !ok || len(ranks) == 0 {
-		return roundRobin(set.Candidates)
+		return roundRobin(set.Candidates), nil
 	}
 	totals, contributed := combineRanks(set.Candidates, ranks)
 	if !contributed {
-		return roundRobin(set.Candidates)
+		return roundRobin(set.Candidates), nil
 	}
 	pick := bestTotal(set.Candidates, totals)
 	if pick != nil {
 		proxywasm.LogDebugf("%s: picked %s by weighted sum over %d ranks",
 			pluginName, pick.Cluster, len(ranks))
 	}
-	return pick
+	return pick, totals
 }
 
 // combineRanks is a pure function: L1 normalisation plus weighted

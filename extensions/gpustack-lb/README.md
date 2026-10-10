@@ -142,9 +142,10 @@ existed once; the historical soft-cap overshoot
 succeeded") is gone.
 
 The walk tries candidates in the finisher's preference order (selection winner
-first, then published order; weighted sets stop at the winner — falling back
-across a business traffic split would rewrite it). When **every** target is
-full the request is answered with the cap-reject response — `429` by default,
+first, then descending combined score with random tie-breaking; without scores,
+the remaining candidates follow published order). Weighted sets stop at the
+winner — falling back across a business traffic split would rewrite it. When
+**every** target is full the request is answered with the cap-reject response — `429` by default,
 message "max inflight requests reached, please retry later", both configurable
 as `reject.capStatus` / `reject.capMessage`. The old conflation of "capped"
 with "no healthy model instance" (a 503) is deliberate history.

@@ -41,7 +41,7 @@ spec:
   # deserves one live check after the move).
   phase: AUTHN
   priority: 340
-  url: oci://<registry>/<org>/gpustack-lb:0.1.0
+  url: oci://<registry>/<org>/gpustack-lb:0.1.2
   defaultConfigDisable: false
   # mode belongs in defaultConfig: Higress applies defaultConfig to routes not
   # listed in matchRules as well, so it cannot be turned off by omission.
@@ -125,7 +125,7 @@ metadata:
 spec:
   phase: AUTHN
   priority: 325
-  url: oci://<registry>/<org>/gpustack-lb:0.1.0
+  url: oci://<registry>/<org>/gpustack-lb:0.1.2
   defaultConfigDisable: false
   # **No matchRules**: the config is entirely deployment-level, and "does this
   # route do LB" exists in exactly one place, the context role. With no
