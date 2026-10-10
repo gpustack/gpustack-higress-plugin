@@ -392,7 +392,7 @@ func TestBestTotalTiesStayWithinTiedSet(t *testing.T) {
 }
 
 func TestSelectCandidateEmptySetReturnsNil(t *testing.T) {
-	if got := selectCandidate(CandidateSet{}); got != nil {
+	if got, _ := selectCandidate(CandidateSet{}); got != nil {
 		t.Fatalf("want nil for empty candidate set, got %v", got)
 	}
 }
