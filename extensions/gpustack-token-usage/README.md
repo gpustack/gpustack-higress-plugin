@@ -217,7 +217,7 @@ User ID and access key are read from the `x-mse-consumer` request header, which 
 | Field | Always present | Meaning |
 | --- | --- | --- |
 | `model` | yes | Model name from the request (or upstream usage payload as fallback). |
-| `input_token` / `output_token` / `total_token` / `input_cached_token` | yes (may be `0`) | Token counts from the upstream usage chunk. `0` does not necessarily mean the request was free — see `completed` below. |
+| `input_token` / `output_token` / `total_token` / `input_cached_token` | yes (may be `0`) | Token counts from the upstream usage chunk. `0` does not necessarily mean the request was free — see `completed` below. `input_token` is normalized to the OpenAI `prompt_tokens` semantics (total input tokens): for Anthropic responses it includes `cache_read_input_tokens` and `cache_creation_input_tokens`. |
 | `request_count` | yes (always `1`) | Reserved for future per-batch reporting. |
 | `completed` | yes | `true` iff the response reached its normal terminus — independent of whether any tokens were emitted. Set when the body callback observes `endOfStream=true` (covers SSE streams and non-streaming JSON), or when the body-skip fast path (TTS/STT/image) observed a 2xx upstream status. `false` indicates a mid-stream client disconnect or upstream reset. Crucially: a TTS request that completes normally has all token fields `0` but `completed: true`; an LLM stream cut mid-flight also has token fields `0` but `completed: false`. |
 | `output_chunk_count` | yes (may be `0`) | Number of streaming delta chunks observed with non-empty content. Always populated; useful for output-token estimation when `completed=false` and for calibrating the `chunks → tokens` ratio when `completed=true`. |
