@@ -49,6 +49,11 @@ remote_plugins:
     version: 2.0.0
     digest: sha256:40ff2e000dcfd94da76c36593bdfd50f4d0f094309c013732da8e1c35171f321
 
+  - source: ai-data-masking:2.0.3
+    name: ai-data-masking
+    version: 2.0.3
+    digest: sha256:f792b1a0a16c69fff36fcc199df47739fc0d4054f182e9e2b6d45e89ead1c8ee
+
   # Use full OCI URL to override default registry
   # - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0
   #   name: jwt-auth
