@@ -1462,7 +1462,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 	completed := ctx.GetBoolContext(ResponseCompletedKey, false)
 	metrics := ModelUsageMetrics{
 		Model:               model,
-		InputToken:          usage.InputToken,
+		InputToken:          resolveInputToken(usage),
 		OutputToken:         usage.OutputToken,
 		TotalToken:          usage.TotalToken,
 		InputCachedToken:    resolveInputCachedToken(usage),
@@ -1537,6 +1537,17 @@ func optionalInt64(v any) *int64 {
 		return nil
 	}
 	return &ms
+}
+
+// resolveInputToken normalizes input (prompt) tokens to the OpenAI
+// `prompt_tokens` semantics -- total input tokens including cache hits and
+// cache writes. Anthropic reports `input_tokens` excluding
+// cache_read_input_tokens and cache_creation_input_tokens, so without this
+// normalization a heavily cached Claude request reports input_cached_token
+// larger than input_token, and input_token means different things per
+// protocol. See https://github.com/gpustack/gpustack/issues/6405.
+func resolveInputToken(usage tokenusage.TokenUsage) int64 {
+	return usage.InputToken + usage.AnthropicCacheReadInputToken + usage.AnthropicCacheCreationInputToken
 }
 
 // resolveInputCachedToken returns cached input (prompt) tokens across upstream
