@@ -1,8 +1,10 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"math/rand"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -68,7 +70,8 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 	// The reserve walk order: the winner of the usual selection first, then
 	// the rest -- so "the best candidate is momentarily full" degrades to the
 	// second-best rather than to a rejection.
-	ordered := reserveOrder(set, selectCandidate(set))
+	pick, totals := selectCandidate(set)
+	ordered := reserveOrder(set, pick, totals)
 	targets := make([]reserveTarget, 0, len(ordered))
 	for i := range ordered {
 		targets = append(targets, reserveTarget{
@@ -89,9 +92,9 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 }
 
 // reserveOrder fixes the order the finisher tries targets in: the usual
-// selection's winner first, then every other candidate in published order,
+// selection's winner first, then every other candidate by descending score,
 // de-duplicated by Candidate.Key() (same target = same budget, trying it
-// twice can only waste a round-trip).
+// twice can only waste a round-trip). Without scores, retain published order.
 //
 // A **weighted** set stops at the winner: weight is a business traffic split,
 // and "the canary is full, send to stable instead" silently rewrites the
@@ -99,7 +102,7 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 //
 // A pure function (the winner is passed in because selectCandidate reads the
 // request id, a host call), so the ordering is unit-testable.
-func reserveOrder(set CandidateSet, pick *Candidate) []Candidate {
+func reserveOrder(set CandidateSet, pick *Candidate, totals []float64) []Candidate {
 	if pick == nil {
 		return nil
 	}
@@ -107,8 +110,17 @@ func reserveOrder(set CandidateSet, pick *Candidate) []Candidate {
 	if isWeighted(set.Candidates) {
 		return out
 	}
+	indices := make([]int, len(set.Candidates))
+	for i := range indices {
+		indices[i] = i
+	}
+	if len(totals) > 0 {
+		// Shuffle before stable sorting so equal-score fallbacks share traffic.
+		rand.Shuffle(len(indices), func(i, j int) { indices[i], indices[j] = indices[j], indices[i] })
+		slices.SortStableFunc(indices, func(a, b int) int { return cmp.Compare(totals[b], totals[a]) })
+	}
 	seen := map[string]struct{}{pick.Key(): {}}
-	for i := range set.Candidates {
+	for _, i := range indices {
 		k := set.Candidates[i].Key()
 		if _, dup := seen[k]; dup {
 			continue

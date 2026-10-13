@@ -234,7 +234,7 @@ func parseConfig(j gjson.Result, config *Config) error {
 	}
 	config.store = store
 
-	status, ok := normalizeRejectStatus(j.Get("reject.status").Int())
+	status, ok := normalizeRejectStatus(j.Get("reject.status").Int(), defaultRejectStatus)
 	if !ok {
 		proxywasm.LogWarnf("%s: reject.status %d out of range, using %d",
 			pluginName, j.Get("reject.status").Int(), defaultRejectStatus)
@@ -246,7 +246,7 @@ func parseConfig(j gjson.Result, config *Config) error {
 	// The cap-reject pair, same treatment: 429 is the semantic default (a
 	// rate-limit verdict, see reject.go), the message says what actually
 	// happened rather than "no healthy model instance".
-	capStatus, capOK := normalizeRejectStatus(j.Get("reject.capStatus").Int())
+	capStatus, capOK := normalizeRejectStatus(j.Get("reject.capStatus").Int(), defaultCapRejectStatus)
 	if !capOK {
 		proxywasm.LogWarnf("%s: reject.capStatus %d out of range, using %d",
 			pluginName, j.Get("reject.capStatus").Int(), defaultCapRejectStatus)
@@ -298,12 +298,12 @@ func capRejectMessage(j gjson.Result) string {
 //
 // ok is false when the supplied value is out of range (0, meaning unset, is
 // not out of range -- that is the normal default path).
-func normalizeRejectStatus(raw int64) (status int64, ok bool) {
+func normalizeRejectStatus(raw, fallback int64) (status int64, ok bool) {
 	if raw == 0 {
-		return defaultRejectStatus, true
+		return fallback, true
 	}
 	if raw < 400 || raw > 599 {
-		return defaultRejectStatus, false
+		return fallback, false
 	}
 	return raw, true
 }
