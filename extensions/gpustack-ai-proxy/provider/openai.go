@@ -225,5 +225,19 @@ func (m *openaiProvider) TransformRequestBody(ctx wrapper.HttpContext, apiName A
 		request.ResponseFormat = m.config.responseJsonSchema
 		body, _ = json.Marshal(request)
 	}
-	return m.config.defaultTransformRequestBody(ctx, apiName, body)
+	body, err := m.config.defaultTransformRequestBody(ctx, apiName, body)
+	if err != nil {
+		return nil, err
+	}
+	// GPUStack-local: normalize the deprecated max_tokens parameter per the
+	// OpenAI Chat Completions spec for reasoning models that only accept
+	// max_completion_tokens. Helpers live in max_completion_tokens.go so other
+	// providers can reuse them with their own model prefix list.
+	// See gpustack/gpustack#6505.
+	if apiName == ApiNameChatCompletion {
+		if body, err = rewriteMaxTokensToMaxCompletionTokens(body, openaiMaxCompletionTokenModelPrefixes); err != nil {
+			return nil, err
+		}
+	}
+	return body, nil
 }
