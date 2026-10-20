@@ -230,8 +230,11 @@ func parseConfigInto(json gjson.Result, config *PluginConfig, fromGlobal bool) e
 		// systemone providers with different endpoints would share a map,
 		// so a failure on one route could suppress a shared token on the
 		// other), so the key folds in every identity-bearing field:
-		// type, id, endpoint and cluster.
-		config.tokenStateKey = tokenUnavailableSinceKeyPrefix + provCfg.Type + "-" + provCfg.Id + "-" + provCfg.Endpoint + "-" + provCfg.Cluster
+		// type, id, endpoint and the cluster list actually in effect —
+		// DecisionClusters() (not the raw config fields) so an explicit
+		// cluster and the endpoint-derived default for the same target
+		// share one namespace.
+		config.tokenStateKey = tokenStateKeyFor(provCfg, config.decision.DecisionClusters())
 		if fromGlobal {
 			// A global config (re)load means the token list may have
 			// changed: reset stale cooldown state, matching ai-proxy's
@@ -332,8 +335,36 @@ func parseProviderConfig(pj gjson.Result) *provider.ProviderConfig {
 		Type:     pj.Get("type").String(),
 		Endpoint: pj.Get("endpoint").String(),
 		APIToken: pj.Get("apiToken").String(),
-		Cluster:  pj.Get("cluster").String(),
 		Model:    pj.Get("model").String(),
+	}
+	// `cluster` is a string in the legacy form; the array form
+	// (cluster: [a, b]) is accepted as a convenience and folded into
+	// the canonical Clusters list. gjson's String() on a non-string
+	// returns the raw JSON (["a","b"]), so guard on the type rather
+	// than letting that garbage into Cluster.
+	cj := pj.Get("cluster")
+	if cj.Type == gjson.String {
+		pc.Cluster = cj.String()
+	}
+	// Canonical multi-cluster form: clusters: [a, b, ...] — one cluster
+	// is picked uniformly at random per decision callout, which is how
+	// a multi-replica decision service (e.g. GPUStack model instances,
+	// one Envoy cluster each) serves as the provider. It takes
+	// precedence over the cluster field (single or array form).
+	if cs := pj.Get("clusters"); cs.IsArray() {
+		pc.Clusters = []string{}
+		for _, c := range cs.Array() {
+			if s := c.String(); s != "" {
+				pc.Clusters = append(pc.Clusters, s)
+			}
+		}
+	} else if cj.IsArray() {
+		pc.Clusters = []string{}
+		for _, c := range cj.Array() {
+			if s := c.String(); s != "" {
+				pc.Clusters = append(pc.Clusters, s)
+			}
+		}
 	}
 	if ts := pj.Get("apiTokens"); ts.IsArray() {
 		// Always materialise the slice when the field is present —
@@ -350,6 +381,25 @@ func parseProviderConfig(pj gjson.Result) *provider.ProviderConfig {
 		pc.Type = provider.TypeSystemone
 	}
 	return pc
+}
+
+// tokenStateKeyFor builds the token-cooldown shared-data key of one
+// provider entry (see parseConfigInto for why every identity-bearing
+// field is folded in). clusters is the RESOLVED cluster list
+// (DecisionClusters), not the raw config fields, so an explicit cluster
+// and the endpoint-derived default for the same target share one
+// namespace. The list is JSON-encoded rather than comma-joined: a join
+// is not injective (["a,b"] and ["a", "b"] are different cluster sets
+// but would collide into one shared cooldown map), while JSON quoting
+// and escaping keeps distinct lists on distinct keys. Marshal of a
+// []string never fails; the fallback only guards that impossible case
+// so a marshalling bug could not break the config load.
+func tokenStateKeyFor(provCfg *provider.ProviderConfig, clusters []string) string {
+	clusterNames, err := json.Marshal(clusters)
+	if err != nil {
+		clusterNames = []byte("[]")
+	}
+	return tokenUnavailableSinceKeyPrefix + provCfg.Type + "-" + provCfg.Id + "-" + provCfg.Endpoint + "-" + string(clusterNames)
 }
 
 // readCandidates reads the candidate set published by the gpustack-lb

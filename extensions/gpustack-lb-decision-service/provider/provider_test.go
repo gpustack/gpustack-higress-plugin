@@ -50,3 +50,79 @@ func TestAuthHeadersPerAttempt(t *testing.T) {
 		t.Errorf("Authorization = %q, want empty for anonymous callout", got)
 	}
 }
+
+func TestEffectiveClusters(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ProviderConfig
+		want []string
+	}{
+		{"list wins over legacy", ProviderConfig{Cluster: "legacy", Clusters: []string{"a", "b"}}, []string{"a", "b"}},
+		{"legacy alone", ProviderConfig{Cluster: "legacy"}, []string{"legacy"}},
+		{"empty entries dropped", ProviderConfig{Clusters: []string{"a", "", "c"}}, []string{"a", "c"}},
+		{"only empty entries -> none", ProviderConfig{Clusters: []string{"", ""}}, nil},
+		{"explicit empty list beats legacy cluster", ProviderConfig{Cluster: "legacy", Clusters: []string{}}, nil},
+		{"nothing -> none", ProviderConfig{}, nil},
+	}
+	for _, c := range cases {
+		if got := c.cfg.EffectiveClusters(); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: EffectiveClusters() = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestDecisionClusterMultiClusterRandomPick(t *testing.T) {
+	clusters := []string{"outbound|8010||jev-0.static", "outbound|8010||jev-1.static", "outbound|8010||jev-2.static"}
+	s := NewSystemone(&ProviderConfig{Endpoint: "http://10.0.0.1:8010", Clusters: clusters})
+
+	if got := s.DecisionClusters(); !reflect.DeepEqual(got, clusters) {
+		t.Fatalf("DecisionClusters() = %v, want %v", got, clusters)
+	}
+
+	// Every pick must land inside the configured set, and over enough
+	// draws every cluster must be hit — the uniform random pick is what
+	// spreads decision traffic across GPUStack model-instance replicas.
+	// With 300 draws over 3 clusters the chance of one never appearing
+	// is 3*(2/3)^300 ≈ 0, so this cannot flake.
+	seen := map[string]int{}
+	for i := 0; i < 300; i++ {
+		pick := s.DecisionCluster()
+		valid := false
+		for _, c := range clusters {
+			if pick == c {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			t.Fatalf("DecisionCluster() = %q, want one of %v", pick, clusters)
+		}
+		seen[pick]++
+	}
+	if len(seen) != len(clusters) {
+		t.Errorf("random pick covered %d of %d clusters: %v", len(seen), len(clusters), seen)
+	}
+}
+
+func TestDecisionClusterSingleForms(t *testing.T) {
+	// Single configured cluster: deterministic, no randomness.
+	single := NewSystemone(&ProviderConfig{Endpoint: "http://10.0.0.1:8010", Cluster: "outbound|8010||jev.static"})
+	for i := 0; i < 10; i++ {
+		if got := single.DecisionCluster(); got != "outbound|8010||jev.static" {
+			t.Fatalf("DecisionCluster() = %q, want outbound|8010||jev.static", got)
+		}
+	}
+
+	// No configured cluster: the endpoint-derived default applies.
+	derived := NewSystemone(&ProviderConfig{Endpoint: "https://jev.internal:8010"})
+	if got := derived.DecisionClusters(); !reflect.DeepEqual(got, []string{"outbound|8010||jev.internal"}) {
+		t.Errorf("DecisionClusters() = %v, want [outbound|8010||jev.internal]", got)
+	}
+
+	// Explicit empty clusters list: derives from the endpoint too — the
+	// operator retired the explicit cluster, not the endpoint.
+	empty := NewSystemone(&ProviderConfig{Endpoint: "http://jev.internal", Clusters: []string{}})
+	if got := empty.DecisionCluster(); got != "outbound|80||jev.internal" {
+		t.Errorf("DecisionCluster() = %q, want outbound|80||jev.internal", got)
+	}
+}

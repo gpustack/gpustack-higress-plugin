@@ -39,7 +39,15 @@ type DecisionProvider interface {
 	DecisionPath() string
 	// DecisionHost is the :authority of the decision callout.
 	DecisionHost() string
-	// DecisionCluster is the Envoy cluster the callout is dispatched to.
+	// DecisionClusters returns every Envoy cluster the callout may be
+	// dispatched to (configured clusters first, else the endpoint-derived
+	// default) — in configured order, no selection applied.
+	DecisionClusters() []string
+	// DecisionCluster is the cluster THIS callout attempt is dispatched
+	// to: when several clusters are configured (e.g. one per GPUStack
+	// model instance) one is picked uniformly at random, spreading the
+	// decision traffic across the replicas; a single configured or
+	// endpoint-derived cluster returns deterministically.
 	DecisionCluster() string
 	// DecisionModel is the optional `model` field of the decision request
 	// ("" omits it — the server's default engine answers).
@@ -69,6 +77,15 @@ type ProviderConfig struct {
 	// Cluster is the Envoy cluster the decision callout is dispatched to
 	// (proxy-wasm DispatchHttpCall needs a cluster, not a URL).
 	Cluster string `json:"cluster"`
+	// Clusters is the multi-cluster form: several Envoy clusters the
+	// decision callout may be dispatched to, one picked uniformly at
+	// random per callout. This is how a decision service with several
+	// replicas — e.g. a GPUStack model instance set, every instance
+	// reachable through its own cluster — serves as the provider: list
+	// the instance clusters and the decision traffic spreads across
+	// them. When set it takes precedence over the legacy single
+	// `cluster` (mirroring apiTokens-over-apiToken).
+	Clusters []string `json:"clusters"`
 	// Model optionally sets the decision request's `model` field (spec
 	// request.model-alias: "jev-latest" MUST be accepted; servers MAY
 	// accept other names to pick an engine profile). Empty omits the
@@ -133,6 +150,32 @@ func (c *ProviderConfig) EffectiveAPITokens() []string {
 	}
 	if c.APIToken != "" {
 		return []string{c.APIToken}
+	}
+	return nil
+}
+
+// EffectiveClusters returns the Envoy cluster list the decision callout may
+// be dispatched to, in configured order. An EXPLICIT `clusters` field always
+// wins — empty entries are dropped, and an explicit all-empty (or empty)
+// list means "no configured cluster" (the endpoint-derived default then
+// applies), never a silent fallback to the legacy single `cluster` (an
+// operator writing clusters: [] is retiring the explicit cluster, not asking
+// the deprecated field to resurrect). Only when the field is absent (nil)
+// does the legacy `cluster` apply; nil Clusters vs empty Clusters is exactly
+// the presence signal the parser preserves — the same contract as
+// EffectiveAPITokens.
+func (c *ProviderConfig) EffectiveClusters() []string {
+	if c.Clusters != nil {
+		var clusters []string
+		for _, cl := range c.Clusters {
+			if cl != "" {
+				clusters = append(clusters, cl)
+			}
+		}
+		return clusters
+	}
+	if c.Cluster != "" {
+		return []string{c.Cluster}
 	}
 	return nil
 }

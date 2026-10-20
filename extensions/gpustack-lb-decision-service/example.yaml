@@ -16,7 +16,7 @@ spec:
   # x-higress-target-cluster — the finisher MUST also run on this route.
   phase: AUTHN
   priority: 328
-  url: oci://<your-registry>/<your-org>/gpustack-lb-decision-service:0.1.1
+  url: oci://<your-registry>/<your-org>/gpustack-lb-decision-service:0.2.0
   sha256: "<sha256-digest>"
   defaultConfigDisable: false
 
@@ -38,6 +38,11 @@ spec:
     #        port: 443, protocol: HTTPS}
     #     - {type: static, name: jev-tenant-a, domain: "10.0.0.1:8010", port: 8010}
     #     - {type: dns,    name: jev-tenant-b, domain: jev.tenant-b.internal, port: 8010}
+    #
+    # Multi-replica decision services (GPUStack model instances as the
+    # provider): list every instance cluster in `clusters` — each decision
+    # callout picks one uniformly at random, spreading the decision traffic
+    # across the replicas (Envoy keeps balancing within each cluster).
     providers:
       - id: default
         # type: typesafe = the TypeSafe-hosted flavour (inherits the
@@ -69,6 +74,21 @@ spec:
         # e.g. a larger engine profile for harder routing calls). Empty
         # omits the field and the server default answers.
         # model: jev-larger
+      - id: gpustack-model
+        # A GPUStack model instance set as the decision service: every
+        # instance is reachable through its own cluster (provisioned by
+        # GPUStack / gpustack-lb). List them in `clusters` (canonical
+        # multi-cluster form — the legacy `cluster` string only names one
+        # target) and each decision callout picks one uniformly at random,
+        # spreading the decision traffic across the replicas.
+        type: systemone
+        # The endpoint supplies the callout's :authority — any one
+        # instance host works (the actual target is the picked cluster).
+        endpoint: http://10.0.0.1:8010
+        clusters:
+          - "outbound|8010||gpustack-model-jev-0.static"
+          - "outbound|8010||gpustack-model-jev-1.static"
+          - "outbound|8010||gpustack-model-jev-2.static"
     activeProviderId: default
 
     # Decision knobs.
