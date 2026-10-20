@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"math/rand"
 	"net/http"
 	"strings"
 
@@ -38,21 +39,44 @@ func (s *Systemone) DecisionPath() string { return "/v1/systemone" }
 // callout's :authority header.
 func (s *Systemone) DecisionHost() string { return stripScheme(s.cfg.Endpoint) }
 
-// DecisionCluster is the Envoy cluster the callout is dispatched to — the
-// configured cluster wins; otherwise it is derived from the endpoint host
+// DecisionClusters returns every Envoy cluster the callout may be dispatched
+// to: the configured clusters (clusters list / legacy single cluster) when
+// any are set; otherwise the single cluster derived from the endpoint host
 // following Higress's DNS-service cluster naming (outbound|<port>||<host>).
 // The default port follows the endpoint scheme: 443 for https:// (or no
 // scheme), 80 for http://.
-func (s *Systemone) DecisionCluster() string {
-	if s.cfg.Cluster != "" {
-		return s.cfg.Cluster
+func (s *Systemone) DecisionClusters() []string {
+	if clusters := s.cfg.EffectiveClusters(); len(clusters) > 0 {
+		return clusters
 	}
 	defaultPort := defaultSystemonePort
 	if strings.HasPrefix(s.cfg.Endpoint, "http://") {
 		defaultPort = "80"
 	}
 	host, port := splitHostPort(s.DecisionHost(), defaultPort)
-	return "outbound|" + port + "||" + host
+	return []string{"outbound|" + port + "||" + host}
+}
+
+// DecisionCluster picks the cluster for THIS callout attempt: with a single
+// configured (or endpoint-derived) cluster the pick is deterministic, but
+// with several configured — the multi-replica form, e.g. one cluster per
+// GPUStack model instance — one is chosen uniformly at random per attempt,
+// so the decision traffic spreads across the replicas (Envoy already
+// load-balances within a cluster; the random pick is what balances ACROSS
+// them). The global math/rand is the right generator here, exactly as in
+// gpustack-lb's selector: no seeding ceremony is needed for load spreading,
+// and one OS thread owns one VM with serial callbacks, so no synchronisation
+// is needed either.
+func (s *Systemone) DecisionCluster() string {
+	clusters := s.DecisionClusters()
+	switch len(clusters) {
+	case 0:
+		return ""
+	case 1:
+		return clusters[0]
+	default:
+		return clusters[rand.Intn(len(clusters))]
+	}
 }
 
 // DecisionModel returns the configured decision-engine model ("" = omit the

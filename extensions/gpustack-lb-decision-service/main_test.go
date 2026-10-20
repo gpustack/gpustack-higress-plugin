@@ -208,14 +208,18 @@ func TestTokenCooldownFilter(t *testing.T) {
 
 func TestTokenCooldownKnobAndStateKey(t *testing.T) {
 	// Default cooldown applies (30s) and the shared-data key is namespaced
-	// per provider entry (type + id), so tenants never share cooldowns.
+	// per provider entry (type + id + endpoint + the resolved cluster
+	// list), so tenants never share cooldowns. No explicit cluster is
+	// configured here: the endpoint-derived default appears in the key
+	// (JSON-encoded), so an explicit cluster naming the same target
+	// resolves to the SAME key.
 	cfg := parseTestConfig(t, `{
 		"provider": {"id": "p1", "type": "typesafe", "endpoint": "https://api.typesafe.ai", "apiTokens": ["a", "b"]}
 	}`)
 	if cfg.tokenCooldownMs != defaultTokenCooldownMs {
 		t.Errorf("tokenCooldownMs = %d, want default %d", cfg.tokenCooldownMs, defaultTokenCooldownMs)
 	}
-	if want := tokenUnavailableSinceKeyPrefix + "typesafe-p1-https://api.typesafe.ai-"; cfg.tokenStateKey != want {
+	if want := tokenUnavailableSinceKeyPrefix + "typesafe-p1-https://api.typesafe.ai-" + `["outbound|443||api.typesafe.ai"]`; cfg.tokenStateKey != want {
 		t.Errorf("tokenStateKey = %q, want %q", cfg.tokenStateKey, want)
 	}
 	// Explicit 0 disables the cooldown.
@@ -723,5 +727,80 @@ func TestRuleProviderOverrideClearsInheritedDecision(t *testing.T) {
 	}
 	if rule.decision == nil || rule.decision.DecisionHost() != "rule-jev.internal:8010" {
 		t.Fatalf("rule decision = %v, want rule-jev.internal:8010", rule.decision)
+	}
+}
+
+func TestParseProviderMultiCluster(t *testing.T) {
+	// Canonical multi-cluster form (clusters: [...]): the provider
+	// resolves to the list and every callout picks one cluster at random
+	// — the GPUStack model-instance shape (one cluster per instance).
+	cfg := parseTestConfig(t, `{"provider": {"endpoint": "http://10.0.0.1:8010", "clusters": ["outbound|8010||jev-0.static", "outbound|8010||jev-1.static"]}}`)
+	if cfg.decision == nil {
+		t.Fatal("decision should be set")
+	}
+	want := []string{"outbound|8010||jev-0.static", "outbound|8010||jev-1.static"}
+	if got := cfg.decision.DecisionClusters(); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("DecisionClusters() = %v, want %v", got, want)
+	}
+	for i := 0; i < 50; i++ {
+		pick := cfg.decision.DecisionCluster()
+		if pick != want[0] && pick != want[1] {
+			t.Fatalf("DecisionCluster() = %q, want one of %v", pick, want)
+		}
+	}
+
+	// Array form of the legacy `cluster` field folds into the list too.
+	cfgArr := parseTestConfig(t, `{"provider": {"endpoint": "http://10.0.0.1:8010", "cluster": ["c0", "c1"]}}`)
+	if got := cfgArr.decision.DecisionClusters(); len(got) != 2 || got[0] != "c0" || got[1] != "c1" {
+		t.Errorf("array-form cluster: DecisionClusters() = %v, want [c0 c1]", got)
+	}
+
+	// `clusters` wins over the legacy `cluster` (single or array form),
+	// mirroring apiTokens-over-apiToken.
+	cfgPrec := parseTestConfig(t, `{"provider": {"endpoint": "http://10.0.0.1:8010", "cluster": "legacy", "clusters": ["winner"]}}`)
+	if got := cfgPrec.decision.DecisionCluster(); got != "winner" {
+		t.Errorf("DecisionCluster() = %q, want winner (clusters beats legacy cluster)", got)
+	}
+
+	// An explicit empty clusters list retires the explicit cluster: the
+	// endpoint-derived default applies.
+	cfgEmpty := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "cluster": "legacy", "clusters": []}}`)
+	if got := cfgEmpty.decision.DecisionCluster(); got != "outbound|8010||jev.internal" {
+		t.Errorf("DecisionCluster() = %q, want endpoint-derived outbound|8010||jev.internal", got)
+	}
+
+	// Single-cluster configs keep their deterministic behaviour.
+	cfgLegacy := parseTestConfig(t, `{"provider": {"endpoint": "http://10.0.0.1:8010", "cluster": "solo"}}`)
+	if got := cfgLegacy.decision.DecisionCluster(); got != "solo" {
+		t.Errorf("DecisionCluster() = %q, want solo", got)
+	}
+}
+
+func TestProviderMultiClusterTokenStateKeyNamespacing(t *testing.T) {
+	// The cooldown shared-data key folds in the WHOLE cluster list in
+	// effect, so two providers that differ only in their cluster sets
+	// never share cooldown state.
+	a := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "clusters": ["c0", "c1"]}}`)
+	b := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "clusters": ["c0", "c2"]}}`)
+	if a.tokenStateKey == "" || a.tokenStateKey == b.tokenStateKey {
+		t.Errorf("tokenStateKey not namespaced by cluster list: a=%q b=%q", a.tokenStateKey, b.tokenStateKey)
+	}
+
+	// The list encoding must be injective: ["a,b"] and ["a", "b"] are
+	// different cluster sets and must not collide into one cooldown map.
+	joined := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "clusters": ["a,b"]}}`)
+	split := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "clusters": ["a", "b"]}}`)
+	if joined.tokenStateKey == split.tokenStateKey {
+		t.Errorf("cluster list encoding not injective: [\"a,b\"] and [\"a\", \"b\"] share key %q", joined.tokenStateKey)
+	}
+
+	// An explicit cluster and the endpoint-derived default for the SAME
+	// target share one namespace: the key is built from the resolved
+	// cluster list (DecisionClusters), not the raw config fields, so
+	// migrating a config from derived to explicit keeps the cooldowns.
+	explicit := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010", "cluster": "outbound|8010||jev.internal"}}`)
+	derived := parseTestConfig(t, `{"provider": {"endpoint": "http://jev.internal:8010"}}`)
+	if explicit.tokenStateKey != derived.tokenStateKey {
+		t.Errorf("explicit and endpoint-derived cluster for the same target should share a key: explicit=%q derived=%q", explicit.tokenStateKey, derived.tokenStateKey)
 	}
 }
