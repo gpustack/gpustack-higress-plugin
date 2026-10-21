@@ -15,9 +15,14 @@ description: Reference for configuring the AI Proxy plugin
 >
 > **Local changes**:
 >
-> - Fixed Claude->OpenAI protocol conversion leaving more than one `system` message in
->   the request, which made strict OpenAI-compatible backends (such as vLLM) reject it
->   with `System message must be at the beginning.` (see gpustack/gpustack#5934).
+> - Fixed Claude->OpenAI conversion hoisting inline `system` messages from `messages[]`
+>   into index 0, which changed the stable request prefix on every turn and invalidated
+>   prefix cache. The top-level `system` stays leading; later `system` messages are
+>   demoted or merged into an adjacent `user` message while retaining their content and
+>   `cache_control`. Reminders never split an assistant tool call from its tool results,
+>   preserving the role/order requirements of strict OpenAI-compatible backends such as
+>   vLLM. Inline reminders no longer receive top-level `system` instruction priority (see
+>   gpustack/gpustack#5934).
 > - Added `ApiNameResponses` to the deepseek provider's default capabilities, since
 >   DeepSeek serves the OpenAI Responses API natively.
 > - Allowed the three Anthropic surfaces (`anthropic/v1/messages`,
