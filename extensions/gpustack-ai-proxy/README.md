@@ -14,8 +14,11 @@ description: AI 代理插件配置参考
 >
 > **本地改动**：
 >
-> - 修复 Claude→OpenAI 协议转换时多个 `system` 消息未合并、导致严格 OpenAI 后端（如 vLLM）
->   报 `System message must be at the beginning.` 的问题（见 gpustack/gpustack#5934）。
+> - 修复 Claude→OpenAI 协议转换把 `messages[]` 中的内联 `system` 消息提升到索引 0、
+>   从而让动态提醒每轮改写稳定前缀并破坏 prefix cache 的问题。顶层 `system` 保持在前，
+>   其余 `system` 的内容与 `cache_control` 会保留并降级/合入相邻 `user` 消息；工具调用与
+>   工具结果之间不会被插入 `user`，同时满足严格 OpenAI 后端（如 vLLM）对消息位置和角色的要求。
+>   注意：内联提醒不再具有顶层 `system` 的指令优先级（见 gpustack/gpustack#5934）。
 > - 为 deepseek provider 的默认能力补充 `ApiNameResponses`，DeepSeek 原生提供 OpenAI Responses API。
 > - 在 `capabilities` 白名单中放行三个 Anthropic 能力（`anthropic/v1/messages`、
 >   `anthropic/v1/messages/count_tokens`、`anthropic/v1/complete`），使原生支持 Claude 协议的
