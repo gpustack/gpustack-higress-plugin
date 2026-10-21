@@ -280,6 +280,9 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 			conversionResult := c.convertContentArray(claudeRequest.System.ArrayValue)
 			systemMsg.Content = conversionResult.openaiContents
 		}
+		if isEmptyChatContent(systemMsg.Content) {
+			systemMsg.Content = ""
+		}
 		// Insert system message at the beginning
 		openaiRequest.Messages = append([]chatMessage{systemMsg}, openaiRequest.Messages...)
 	}
@@ -288,9 +291,8 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 	// messages array in addition to Claude's top-level system field. After conversion
 	// this leaves more than one system message, and any system message that is not the
 	// first one makes strict OpenAI-compatible backends (such as vLLM) reject the request
-	// with "System message must be at the beginning.". Merge every system message into a
-	// single leading one so the output always has at most one system message at index 0.
-	openaiRequest.Messages = mergeSystemMessages(openaiRequest.Messages)
+	// with "System message must be at the beginning.".
+	openaiRequest.Messages = demoteInlineSystemMessages(openaiRequest.Messages)
 
 	// Convert tools if present
 	for _, claudeTool := range claudeRequest.Tools {
@@ -370,76 +372,228 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 	return result, nil
 }
 
-// mergeSystemMessages collapses every system-role message into a single leading
-// system message. Strict OpenAI-compatible backends (e.g. vLLM) reject a request
-// when a system message appears anywhere other than the first position. This can
-// happen when the client embeds a system-role message inside the messages array
-// on top of Claude's top-level system field.
+// demoteInlineSystemMessages keeps at most one system message, and only at index 0.
+// Strict OpenAI-compatible backends (e.g. vLLM) reject a request when a system
+// message appears anywhere other than the first position, which is what happens
+// when the client embeds a system-role message inside the messages array on top of
+// Claude's top-level system field (Claude Code does this on every turn).
 //
-//   - No system message: the messages are returned unchanged.
-//   - Exactly one system message: its content is preserved as-is and it is moved to
-//     the front (a no-op when it already leads).
-//   - Multiple system messages: their contents are concatenated into a single block
-//     array and emitted as one leading system message. If that concatenation yields
-//     nothing, the content degrades to an empty string rather than a nil slice —
-//     `Content any` holding a nil []chatMessageContent marshals to `"content":null`
-//     (omitempty does not fire on a non-nil interface), and strict OpenAI-style
-//     providers reject that outright. Same reasoning as the role-only guard in
-//     ConvertClaudeRequestToOpenAI.
-func mergeSystemMessages(messages []chatMessage) []chatMessage {
-	var systemMessages []chatMessage
-	others := make([]chatMessage, 0, len(messages))
-	for _, msg := range messages {
+// The previous fix merged every system message into a single leading one. That is
+// valid protocol-wise, but it moves inline system content into the global prefix:
+// Claude Code refreshes a token-budget reminder (<total_tokens>) inside messages[]
+// on every turn, so index 0 changed on every request and the reusable
+// conversation prefix was invalidated.
+//
+// So instead of hoisting, a system message past index 0 is demoted in place to a
+// user message and keeps its content verbatim. The stable top-level system prompt
+// stays at index 0, and the per-turn reminder only perturbs its own position.
+// Demoting rather than dropping keeps the text in front of the model, since these
+// inline reminders carry instructions the turn relies on.
+//
+// Some chat templates also reject adjacent user messages or a user message between
+// an assistant tool call and its tool results. A demoted reminder is therefore
+// merged into an adjacent user turn when possible. If it belongs to a tool-call
+// exchange, it is emitted after the contiguous tool-result messages. Empty inline
+// content is dropped because it has no text to preserve and strict backends reject
+// role-only user messages.
+func demoteInlineSystemMessages(messages []chatMessage) []chatMessage {
+	result := make([]chatMessage, 0, len(messages))
+	pendingBeforeUser := make(map[int][]chatMessage)
+	var deferredToolMessages []chatMessage
+	mergeNextUser := false
+
+	for i, msg := range messages {
 		if msg.Role == roleSystem {
-			systemMessages = append(systemMessages, msg)
-		} else {
-			others = append(others, msg)
+			msg.Content = normalizeChatContent(msg.Content)
+			if i == 0 {
+				result = append(result, msg)
+				continue
+			}
+			if isEmptyChatContent(msg.Content) {
+				continue
+			}
+			if len(deferredToolMessages) > 0 {
+				deferred := mergeInlineSystemMessages(deferredToolMessages)
+				msg.Content = mergeChatContents(deferred.Content, msg.Content)
+				deferredToolMessages = nil
+			}
+			if splitsToolCallAndResult(messages, i) {
+				deferredToolMessages = append(deferredToolMessages, msg)
+				continue
+			}
+
+			if next := nextNonSystemMessage(messages, i); next >= 0 && messages[next].Role == roleUser {
+				pendingBeforeUser[next] = append(pendingBeforeUser[next], msg)
+				if len(result) > 0 && result[len(result)-1].Role == roleUser {
+					mergeNextUser = true
+				}
+				continue
+			}
+			if len(result) > 0 && result[len(result)-1].Role == roleUser {
+				result[len(result)-1].Content = mergeChatContents(result[len(result)-1].Content, msg.Content)
+				continue
+			}
+
+			msg.Role = roleUser
+			result = append(result, msg)
+			continue
 		}
+
+		if len(deferredToolMessages) > 0 {
+			if msg.Role == roleTool && continuesToolResultGroup(result) {
+				result = append(result, msg)
+				continue
+			}
+			deferred := mergeInlineSystemMessages(deferredToolMessages)
+			if msg.Role == roleUser {
+				msg.Content = mergeChatContents(deferred.Content, msg.Content)
+			} else {
+				result = append(result, deferred)
+			}
+			deferredToolMessages = nil
+		}
+
+		if pending := pendingBeforeUser[i]; len(pending) > 0 {
+			prefix := any("")
+			for _, inlineSystem := range pending {
+				prefix = mergeChatContents(prefix, inlineSystem.Content)
+			}
+			msg.Content = mergeChatContents(prefix, msg.Content)
+		}
+
+		if mergeNextUser && msg.Role == roleUser {
+			if len(result) > 0 && result[len(result)-1].Role == roleUser {
+				result[len(result)-1].Content = mergeChatContents(result[len(result)-1].Content, msg.Content)
+				mergeNextUser = false
+				continue
+			}
+		}
+
+		mergeNextUser = false
+		result = append(result, msg)
 	}
 
-	switch len(systemMessages) {
-	case 0:
-		return messages
-	case 1:
-		return append([]chatMessage{systemMessages[0]}, others...)
+	if len(deferredToolMessages) > 0 {
+		result = append(result, mergeInlineSystemMessages(deferredToolMessages))
+	}
+	return result
+}
+
+func normalizeChatContent(content any) any {
+	if isEmptyChatContent(content) {
+		return ""
+	}
+	return content
+}
+
+func isEmptyChatContent(content any) bool {
+	switch v := content.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []chatMessageContent:
+		return len(v) == 0
+	case []any:
+		return len(v) == 0
 	default:
-		var mergedContent []chatMessageContent
-		for _, msg := range systemMessages {
-			mergedContent = append(mergedContent, systemContentBlocks(msg.Content)...)
-		}
-		merged := chatMessage{Role: roleSystem, Content: mergedContent}
-		if len(mergedContent) == 0 {
-			// Never emit "content":null — see the doc comment above.
-			merged.Content = ""
-		}
-		return append([]chatMessage{merged}, others...)
+		return false
 	}
 }
 
-// systemContentBlocks normalizes a system message's content into a list of content
-// blocks so multiple system messages can be concatenated. String content becomes a
-// single text block; an existing block array (preserving any cache_control) is kept.
-//
-// Anything else is dropped. On the Claude->OpenAI path a system message's Content is
-// only ever a string, a []chatMessageContent (see contentConversionResult.openaiContents)
-// or nil, so this is unreachable today — but Content is typed `any`, so a future
-// upstream re-sync could start feeding it something else and silently lose the system
-// prompt. Hence the warning rather than a bare `return nil`.
-func systemContentBlocks(content any) []chatMessageContent {
+func mergeInlineSystemMessages(messages []chatMessage) chatMessage {
+	merged := chatMessage{Role: roleUser, Content: ""}
+	for _, msg := range messages {
+		merged.Content = mergeChatContents(merged.Content, msg.Content)
+	}
+	return merged
+}
+
+// mergeChatContents preserves the original content order. It uses a text string
+// when both sides are text and a block array when either side already has blocks,
+// so cache_control and multimodal parts survive the merge.
+func mergeChatContents(base any, extra any) any {
+	if isEmptyChatContent(base) {
+		return normalizeChatContent(extra)
+	}
+	if isEmptyChatContent(extra) {
+		return normalizeChatContent(base)
+	}
+
+	baseText, baseIsText := base.(string)
+	extraText, extraIsText := extra.(string)
+	if baseIsText && extraIsText {
+		return baseText + "\n\n" + extraText
+	}
+
+	blocks := append(chatContentBlocks(base), chatContentBlocks(extra)...)
+	if len(blocks) == 0 {
+		return ""
+	}
+	return blocks
+}
+
+func chatContentBlocks(content any) []chatMessageContent {
 	switch v := content.(type) {
 	case string:
-		if v == "" {
+		if strings.TrimSpace(v) == "" {
 			return nil
 		}
 		return []chatMessageContent{{Type: contentTypeText, Text: v}}
 	case []chatMessageContent:
 		return v
+	case []any:
+		blocks := make([]chatMessageContent, 0, len(v))
+		for _, item := range v {
+			if block, ok := item.(chatMessageContent); ok {
+				blocks = append(blocks, block)
+				continue
+			}
+			log.Warnf("[Claude->OpenAI] dropping unsupported chat content block type %T during inline system demotion", item)
+		}
+		return blocks
 	case nil:
 		return nil
 	default:
-		log.Warnf("[Claude->OpenAI] dropping system message content of unsupported type %T while merging system messages", content)
+		log.Warnf("[Claude->OpenAI] dropping unsupported chat content type %T during inline system demotion", content)
 		return nil
 	}
+}
+
+func nextNonSystemMessage(messages []chatMessage, index int) int {
+	for i := index + 1; i < len(messages); i++ {
+		if messages[i].Role != roleSystem {
+			return i
+		}
+	}
+	return -1
+}
+
+func previousNonSystemMessage(messages []chatMessage, index int) int {
+	for i := index - 1; i >= 0; i-- {
+		if messages[i].Role != roleSystem {
+			return i
+		}
+	}
+	return -1
+}
+
+func splitsToolCallAndResult(messages []chatMessage, index int) bool {
+	previous := previousNonSystemMessage(messages, index)
+	next := nextNonSystemMessage(messages, index)
+	return previous >= 0 &&
+		next >= 0 &&
+		(messages[previous].Role == roleTool ||
+			(messages[previous].Role == roleAssistant && len(messages[previous].ToolCalls) > 0)) &&
+		messages[next].Role == roleTool
+}
+
+func continuesToolResultGroup(messages []chatMessage) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	last := messages[len(messages)-1]
+	return last.Role == roleTool || (last.Role == roleAssistant && len(last.ToolCalls) > 0)
 }
 
 // computeClaudeInputTokens computes Claude-compatible input_tokens from OpenAI usage.

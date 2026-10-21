@@ -7,6 +7,7 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -100,12 +101,13 @@ func TestClaudeToOpenAIConverter_ConvertClaudeRequestToOpenAI(t *testing.T) {
 		require.Contains(t, string(result), `"parallel_tool_calls":false`)
 	})
 
-	t.Run("merge_top_level_system_with_inline_system_message", func(t *testing.T) {
-		// Regression test for gpustack/gpustack#5934: Claude Code sends a system-role
-		// message inside the messages array on top of the top-level system field. The
-		// naive conversion produced [system, user, system], and strict OpenAI backends
-		// (e.g. vLLM) reject it with "System message must be at the beginning.".
-		// The converter must merge both system messages into a single leading one.
+	t.Run("demote_inline_system_message_keeps_top_level_system_leading", func(t *testing.T) {
+		// Regression test for gpustack/gpustack#5934 (a system message past index 0
+		// makes vLLM reject the request) combined with the prefix-cache defect: an
+		// inline system message must NOT be hoisted into index 0, because clients
+		// such as Claude Code refresh their inline reminder on every turn and that
+		// would invalidate the reusable conversation prefix. It is demoted in place
+		// to user.
 		claudeRequest := `{
 			"model": "qwen3.6-35b-a3b",
 			"max_tokens": 1000,
@@ -123,30 +125,25 @@ func TestClaudeToOpenAIConverter_ConvertClaudeRequestToOpenAI(t *testing.T) {
 		err = json.Unmarshal(result, &openaiRequest)
 		require.NoError(t, err)
 
-		// Exactly one system message, and it must be the first message.
 		require.Len(t, openaiRequest.Messages, 2)
+		// The top-level system prompt stays alone at index 0, untouched.
 		assert.Equal(t, roleSystem, openaiRequest.Messages[0].Role)
-		assert.Equal(t, "user", openaiRequest.Messages[1].Role)
+		assert.Equal(t, "You are Claude Code.", openaiRequest.Messages[0].Content)
 		for i, msg := range openaiRequest.Messages {
 			if i != 0 {
 				assert.NotEqual(t, roleSystem, msg.Role, "no system message allowed after index 0")
 			}
 		}
-
-		// Merged system content should contain both the top-level and inline system text,
-		// in order, as a content-block array.
-		systemContentArray, ok := openaiRequest.Messages[0].Content.([]interface{})
-		require.True(t, ok, "merged system content should be a block array")
-		require.Len(t, systemContentArray, 2)
-		firstBlock := systemContentArray[0].(map[string]interface{})
-		secondBlock := systemContentArray[1].(map[string]interface{})
-		assert.Equal(t, "You are Claude Code.", firstBlock["text"])
-		assert.Equal(t, "Available agent types for the Agent tool: ...", secondBlock["text"])
+		// The inline system content survives as part of the adjacent user turn.
+		assert.Equal(t, "user", openaiRequest.Messages[1].Role)
+		assert.Equal(t, "hello\n\nAvailable agent types for the Agent tool: ...", openaiRequest.Messages[1].Content)
 	})
 
-	t.Run("move_inline_system_message_to_front_without_top_level_system", func(t *testing.T) {
-		// A system-role message inside messages with no top-level system field must
-		// still be relocated to the beginning so the request is accepted.
+	t.Run("demote_inline_system_message_without_top_level_system", func(t *testing.T) {
+		// With no top-level system field there is nothing to protect at index 0, but
+		// the inline message still must not become a leading system message when it
+		// sits after other turns. It is folded into the preceding user turn so the
+		// output does not introduce adjacent user roles.
 		claudeRequest := `{
 			"model": "qwen3.6-35b-a3b",
 			"max_tokens": 1000,
@@ -163,11 +160,362 @@ func TestClaudeToOpenAIConverter_ConvertClaudeRequestToOpenAI(t *testing.T) {
 		err = json.Unmarshal(result, &openaiRequest)
 		require.NoError(t, err)
 
+		require.Len(t, openaiRequest.Messages, 1)
+		assert.Equal(t, "user", openaiRequest.Messages[0].Role)
+		assert.Equal(t, "hello\n\nYou are a helpful assistant.", openaiRequest.Messages[0].Content)
+	})
+
+	t.Run("leading_inline_system_message_stays_system", func(t *testing.T) {
+		// A system message already at index 0 is legal for strict backends and is
+		// left alone; only messages past index 0 are demoted.
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "system", "content": "You are a helpful assistant."},
+				{"role": "user", "content": "hello"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
 		require.Len(t, openaiRequest.Messages, 2)
 		assert.Equal(t, roleSystem, openaiRequest.Messages[0].Role)
-		// Single system message keeps its original (string) content untouched.
 		assert.Equal(t, "You are a helpful assistant.", openaiRequest.Messages[0].Content)
 		assert.Equal(t, "user", openaiRequest.Messages[1].Role)
+	})
+
+	t.Run("inline_system_message_does_not_split_tool_call_and_result", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"system": "You are Claude Code.",
+			"messages": [
+				{"role": "user", "content": "inspect the file"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "a.go"}}
+				]},
+				{"role": "system", "content": "<system-reminder>context changed</system-reminder>"},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "tool-1", "content": "package a"}
+				]},
+				{"role": "user", "content": "continue"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 5)
+		assert.Equal(t, roleSystem, openaiRequest.Messages[0].Role)
+		assert.Equal(t, roleUser, openaiRequest.Messages[1].Role)
+		assert.Equal(t, roleAssistant, openaiRequest.Messages[2].Role)
+		require.Len(t, openaiRequest.Messages[2].ToolCalls, 1)
+		assert.Equal(t, roleTool, openaiRequest.Messages[3].Role)
+		assert.Equal(t, "tool-1", openaiRequest.Messages[3].ToolCallId)
+		toolContent := openaiRequest.Messages[3].Content.(string)
+		assert.NotContains(t, toolContent, "context changed")
+		assert.Equal(t, roleUser, openaiRequest.Messages[4].Role)
+		assert.Contains(t, openaiRequest.Messages[4].Content, "context changed")
+	})
+
+	t.Run("deferred_tool_reminders_keep_order_before_user", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"system": "You are Claude Code.",
+			"messages": [
+				{"role": "user", "content": "inspect the file"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "a.go"}}
+				]},
+				{"role": "system", "content": "first reminder"},
+				{"role": "system", "content": "second reminder"},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "tool-1", "content": "package a"}
+				]},
+				{"role": "user", "content": "continue"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 5)
+		assert.Equal(t, roleTool, openaiRequest.Messages[3].Role)
+		assert.Equal(t, "tool-1", openaiRequest.Messages[3].ToolCallId)
+		assert.Equal(t, "first reminder\n\nsecond reminder\n\ncontinue", openaiRequest.Messages[4].Content)
+	})
+
+	t.Run("reminders_around_tool_group_are_coalesced_in_order", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"system": "You are Claude Code.",
+			"messages": [
+				{"role": "user", "content": "inspect the file"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "a.go"}}
+				]},
+				{"role": "system", "content": "before tool result"},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "tool-1", "content": "package a"}
+				]},
+				{"role": "system", "content": "after tool result"},
+				{"role": "assistant", "content": "finished"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 6)
+		assert.Equal(t, roleTool, openaiRequest.Messages[3].Role)
+		assert.Equal(t, roleUser, openaiRequest.Messages[4].Role)
+		assert.Equal(t, "before tool result\n\nafter tool result", openaiRequest.Messages[4].Content)
+		assert.Equal(t, roleAssistant, openaiRequest.Messages[5].Role)
+	})
+
+	t.Run("reminder_between_parallel_tool_results_stays_out_of_group", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"system": "You are Claude Code.",
+			"messages": [
+				{"role": "user", "content": "inspect both files"},
+				{"role": "assistant", "content": [
+					{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {"path": "a.go"}},
+					{"type": "tool_use", "id": "tool-2", "name": "Read", "input": {"path": "b.go"}}
+				]},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "tool-1", "content": "package a"}
+				]},
+				{"role": "system", "content": "between results"},
+				{"role": "user", "content": [
+					{"type": "tool_result", "tool_use_id": "tool-2", "content": "package b"}
+				]}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 6)
+		assert.Equal(t, roleTool, openaiRequest.Messages[3].Role)
+		assert.Equal(t, "tool-1", openaiRequest.Messages[3].ToolCallId)
+		assert.Equal(t, roleTool, openaiRequest.Messages[4].Role)
+		assert.Equal(t, "tool-2", openaiRequest.Messages[4].ToolCallId)
+		assert.Equal(t, roleUser, openaiRequest.Messages[5].Role)
+		assert.Equal(t, "between results", openaiRequest.Messages[5].Content)
+	})
+
+	t.Run("empty_leading_inline_system_never_marshals_null_content", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "system", "content": []},
+				{"role": "user", "content": "hello"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+		assert.NotContains(t, string(result), `"content":null`)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 2)
+		assert.Equal(t, roleSystem, openaiRequest.Messages[0].Role)
+		assert.Equal(t, "", openaiRequest.Messages[0].Content)
+	})
+
+	t.Run("inline_system_between_user_turns_is_coalesced", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "user", "content": "first"},
+				{"role": "system", "content": "reminder"},
+				{"role": "user", "content": "second"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 1)
+		assert.Equal(t, roleUser, openaiRequest.Messages[0].Role)
+		assert.Equal(t, "first\n\nreminder\n\nsecond", openaiRequest.Messages[0].Content)
+	})
+
+	t.Run("empty_inline_system_content_is_not_role_only", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "user", "content": "hello"},
+				{"role": "assistant", "content": "hi"},
+				{"role": "system", "content": ""}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 2)
+		assert.Equal(t, roleAssistant, openaiRequest.Messages[1].Role)
+		assert.NotContains(t, string(result), `"role":"system"`)
+		assert.NotContains(t, string(result), `"content":null`)
+	})
+
+	t.Run("inline_system_blocks_and_cache_control_are_preserved", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "user", "content": "hello"},
+				{"role": "assistant", "content": "hi"},
+				{"role": "system", "content": [
+					{"type": "text", "text": "first reminder", "cache_control": {"type": "ephemeral"}},
+					{"type": "text", "text": "second reminder"}
+				]},
+				{"role": "user", "content": "continue"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 3)
+		userContent, ok := openaiRequest.Messages[2].Content.([]interface{})
+		require.True(t, ok)
+		require.Len(t, userContent, 3)
+		first := userContent[0].(map[string]interface{})
+		assert.Equal(t, "first reminder", first["text"])
+		assert.Equal(t, "ephemeral", first["cache_control"].(map[string]interface{})["type"])
+		second := userContent[1].(map[string]interface{})
+		assert.Equal(t, "second reminder", second["text"])
+		third := userContent[2].(map[string]interface{})
+		assert.Equal(t, "continue", third["text"])
+	})
+
+	t.Run("multiple_inline_system_messages_keep_order", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"messages": [
+				{"role": "user", "content": "hello"},
+				{"role": "assistant", "content": "hi"},
+				{"role": "system", "content": "first reminder"},
+				{"role": "system", "content": "second reminder"},
+				{"role": "user", "content": "continue"}
+			]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 3)
+		assert.Equal(t, "first reminder\n\nsecond reminder\n\ncontinue", openaiRequest.Messages[2].Content)
+	})
+
+	t.Run("consecutive_turns_keep_a_stable_prefix", func(t *testing.T) {
+		// The prefix-cache regression itself: two adjacent Claude Code turns whose
+		// only difference is the inline <total_tokens> reminder. The converted
+		// requests must agree on every message up to the reminder, so vLLM can reuse
+		// the history's KV prefix. Under the hoisting implementation index 0 changed
+		// on every turn and the reusable conversation prefix was invalidated.
+		converter := &ClaudeToOpenAIConverter{}
+		build := func(remaining string) chatCompletionRequest {
+			claudeRequest := fmt.Sprintf(`{
+				"model": "qwen3.6-35b-a3b",
+				"max_tokens": 1000,
+				"system": "You are Claude Code.",
+				"messages": [
+					{"role": "user", "content": "first question"},
+					{"role": "assistant", "content": "first answer"},
+					{"role": "user", "content": "second question"},
+					{"role": "assistant", "content": "second answer"},
+					{"role": "user", "content": "third question"},
+					{"role": "system", "content": "<system-reminder><total_tokens>%s tokens left</total_tokens></system-reminder>"}
+				]
+			}`, remaining)
+
+			result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+			require.NoError(t, err)
+			var openaiRequest chatCompletionRequest
+			require.NoError(t, json.Unmarshal(result, &openaiRequest))
+			return openaiRequest
+		}
+
+		first := build("14939973")
+		second := build("14939113")
+
+		require.Len(t, first.Messages, len(second.Messages))
+		// Index 0 is the stable system prompt and must be byte-identical.
+		assert.Equal(t, first.Messages[0].Role, second.Messages[0].Role)
+		assert.Equal(t, first.Messages[0].Content, second.Messages[0].Content)
+		assert.Equal(t, "You are Claude Code.", first.Messages[0].Content)
+
+		// Everything except the last (reminder) turn must be identical, so the
+		// common prefix covers the whole conversation history.
+		for i := 0; i < len(first.Messages)-1; i++ {
+			assert.Equal(t, first.Messages[i].Role, second.Messages[i].Role, "role mismatch at index %d", i)
+			assert.Equal(t, first.Messages[i].Content, second.Messages[i].Content, "content mismatch at index %d", i)
+		}
+
+		// No system message anywhere past index 0, so vLLM accepts both.
+		for i, msg := range first.Messages {
+			if i != 0 {
+				assert.NotEqual(t, roleSystem, msg.Role, "no system message allowed after index 0")
+			}
+		}
+
+		// The only difference sits in the final demoted reminder turn.
+		last := len(first.Messages) - 1
+		assert.Equal(t, "user", first.Messages[last].Role)
+		assert.NotEqual(t, first.Messages[last].Content, second.Messages[last].Content)
+	})
+
+	t.Run("empty_top_level_system_never_marshals_null_content", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen3.6-35b-a3b",
+			"max_tokens": 1000,
+			"system": [],
+			"messages": [{"role": "user", "content": "hello"}]
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		require.NoError(t, json.Unmarshal(result, &openaiRequest))
+		require.Len(t, openaiRequest.Messages, 2)
+		assert.Equal(t, roleSystem, openaiRequest.Messages[0].Role)
+		assert.Equal(t, "", openaiRequest.Messages[0].Content)
+		assert.NotContains(t, string(result), `"content":null`)
 	})
 
 	t.Run("convert_multiple_text_content_blocks", func(t *testing.T) {
