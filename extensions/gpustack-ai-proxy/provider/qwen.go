@@ -86,6 +86,19 @@ func (m *qwenProviderInitializer) DefaultCapabilities(qwenEnableCompatible bool)
 			string(ApiNameQwenAsyncAIGC):       qwenAsyncAIGCPath,
 			string(ApiNameQwenAsyncTask):       qwenAsyncTaskPath,
 			string(ApiNameQwenV1Rerank):        qwenCompatibleTextRerankPath,
+			// GPUStack-local: an inbound Cohere-style /v1/rerank (the de-facto
+			// standard spelling GPUStack exposes and its UI sends) resolves to
+			// ApiNameCohereV1Rerank, not ApiNameQwenV1Rerank (that one is the
+			// /v1/reranks spelling, mirroring DashScope's own path). DashScope's
+			// compatible-mode rerank endpoint is itself Cohere/Jina-shaped —
+			// {"model","query","documents","top_n"[,"return_documents"]} in,
+			// results[].index/relevance_score out — so a path rewrite plus model
+			// mapping is the whole conversion; the body passes through verbatim.
+			// Without this entry the request dies at isSupportedAPI with
+			// "unsupported API name". Deliberately absent from the native branch
+			// below: /api/v1/services/rerank/... expects input.query/input.documents
+			// and cannot parse a Cohere body.
+			string(ApiNameCohereV1Rerank):      qwenCompatibleTextRerankPath,
 			string(ApiNameQwenV1Conversations): qwenCompatibleConversationsPath,
 			string(ApiNameAnthropicMessages):   qwenAnthropicMessagesPath,
 		}

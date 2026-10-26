@@ -26,6 +26,12 @@ description: Reference for configuring the AI Proxy plugin
 >   configuration.
 > - Added the `toolCallValidation` structural tool/tool_calls pairing check on the Chat
 >   Completions request path, off by default (see gpustack/gpustack#6210).
+> - Added `cohere/v1/rerank` → `/compatible-api/v1/reranks` to the qwen provider's default
+>   capabilities in compatible mode (`qwenEnableCompatible: true`, GPUStack's default): an
+>   inbound Cohere-style `/v1/rerank` (the standard spelling used by the GPUStack UI,
+>   llama-box and vLLM) used to be rejected at `isSupportedAPI` with
+>   `unsupported API name`. DashScope's compatible rerank endpoint speaks the same
+>   Cohere/Jina contract, so a path rewrite plus model mapping is the whole conversion.
 >
 > **Upstream files removed**: this repository does not use the Higress official CLI
 > `hgctl` for building/releasing — it goes through `extensions/Makefile` (plain `go build`

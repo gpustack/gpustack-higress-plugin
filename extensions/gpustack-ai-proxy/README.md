@@ -22,6 +22,11 @@ description: AI 代理插件配置参考
 >   provider 可以通过配置声明，而不必依赖 provider 类型硬编码。
 > - 新增 `toolCallValidation`：在 Chat Completions 请求路径上做 tool/tool_calls 结构化配对校验，
 >   默认关闭（见 gpustack/gpustack#6210）。
+> - 为 qwen provider 兼容模式（`qwenEnableCompatible: true`，GPUStack 默认）的默认能力补充
+>   `cohere/v1/rerank` → `/compatible-api/v1/reranks`：入站 Cohere 风格的标准路径 `/v1/rerank`
+>   （GPUStack UI / llama-box / vLLM 所用的拼写）此前会在 `isSupportedAPI` 处被拒
+>   （`unsupported API name`）。DashScope 兼容模式 rerank 端点本身就是 Cohere/Jina 同构契约，
+>   路径重写 + 模型映射即可完成转换，body 与响应原样透传。
 >
 > **已删除的上游文件**：本仓库的构建/发布流程不使用 Higress 官方 CLI `hgctl`，而是走
 > `extensions/Makefile`（直接 `go build` 生成 wasm）+ `scripts/generate_metadata.py`。因此以下随
