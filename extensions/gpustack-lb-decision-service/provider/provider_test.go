@@ -150,7 +150,13 @@ func TestDecisionHeaders(t *testing.T) {
 		{"worker proxy dns form", "outbound|10176||model-12-41.dns", [][2]string{
 			{"X-GPUStack-Model-Instance", "model-12-41.dns"},
 		}},
+		{"subset form keeps the service segment", "outbound|80|gold||model-12-35.static", [][2]string{
+			{"X-GPUStack-Model-Instance", "model-12-35.static"},
+		}},
 		{"not the outbound form", "api.typesafe.ai", nil},
+		{"four segments but not outbound", "foo|bar|baz|service", nil},
+		{"outbound with empty service segment", "outbound|80||", nil},
+		{"outbound with empty subset-only tail", "outbound|80|||", nil},
 	}
 	for _, c := range cases {
 		if got := p.DecisionHeaders(c.cluster); !reflect.DeepEqual(got, c.want) {

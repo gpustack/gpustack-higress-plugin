@@ -197,6 +197,7 @@ const (
 	ctxKeyContentPushed          = "contentPushed"
 	ctxKeyReasoningContentPushed = "reasoningContentPushed"
 	ctxKeyHasContentDelta        = "hasContentDelta"
+	ctxKeyQueuedLocalReply       = "queuedLocalReply"
 	ctxKeyBufferedReasoning      = "bufferedReasoning"
 
 	// SSE framing keys: one per call site so coexisting framers on the same
@@ -965,16 +966,18 @@ func CreateProvider(pc ProviderConfig) (Provider, error) {
 }
 
 // applyProviderBasePath prepends the ProviderBasePath to the given path if configured.
-// The decision is made at a path-segment boundary (pathutil.WithinPrefix on the
-// path portion) rather than by a byte prefix: with providerBasePath "/v" a normal
-// "/v2/models" must still get "/v" prepended.
+// The decision is made at a path-segment boundary (on the path portion) rather
+// than by a byte prefix: with providerBasePath "/v" a normal "/v2/models" must
+// still get "/v" prepended. A single trailing slash on providerBasePath names
+// the same location, so the comparison runs against the trimmed base.
 func (c *ProviderConfig) applyProviderBasePath(path string) string {
 	if c.providerBasePath == "" {
 		return path
 	}
+	base := strings.TrimSuffix(c.providerBasePath, "/")
 	pathPart, _ := pathutil.SplitTarget(path)
-	if !pathutil.WithinPrefix(pathPart, c.providerBasePath) {
-		return c.providerBasePath + path
+	if pathPart != base && !strings.HasPrefix(pathPart, base+"/") {
+		return base + path
 	}
 	return path
 }
@@ -993,7 +996,12 @@ func (c *ProviderConfig) applyProviderBasePath(path string) string {
 // needed "/api" prepended.
 func (c *ProviderConfig) prependBasePath(currentPath string) (string, error) {
 	pathPart, _ := pathutil.SplitTarget(currentPath)
-	if pathPart == c.basePath || strings.HasPrefix(pathPart, c.basePath+"/") {
+	// validatePrefix accepts a single trailing slash on basePath ("/api/"
+	// names the same location as "/api"), so the boundary comparison runs
+	// against the trimmed base; the containment validation below still
+	// receives the configured value.
+	base := strings.TrimSuffix(c.basePath, "/")
+	if pathPart == base || strings.HasPrefix(pathPart, base+"/") {
 		if err := pathutil.ValidateWithin(c.basePath, currentPath); err != nil {
 			return "", err
 		}
@@ -1466,6 +1474,16 @@ func stripClaudeInternalMessageFields(body []byte, preserveMessageReasoningConte
 	return result
 }
 
+// HasQueuedLocalReply reports whether a local reply was already queued on
+// this request's stream during header processing (GPUStack-local). The caller
+// must stop the callback with types.ActionPause when this returns true:
+// continuing to iterate (or queueing another reply through an error handler)
+// on a stream that already has a local reply queued is undefined behaviour.
+func HasQueuedLocalReply(ctx wrapper.HttpContext) bool {
+	v, _ := ctx.GetContext(ctxKeyQueuedLocalReply).(bool)
+	return v
+}
+
 func (c *ProviderConfig) handleRequestHeaders(provider Provider, ctx wrapper.HttpContext, apiName ApiName) {
 	headers := util.GetRequestHeaders()
 	originPath := headers.Get(":path")
@@ -1502,6 +1520,14 @@ func (c *ProviderConfig) handleRequestHeaders(provider Provider, ctx wrapper.Htt
 			log.Errorf("rejecting request path %q for basePath %q: %v", headers.Get(":path"), c.basePath, err)
 			_ = proxywasm.SendHttpResponseWithDetail(http.StatusBadRequest, "ai-proxy.path_traversal",
 				util.CreateHeaders(util.HeaderContentType, util.MimeTypeTextPlain), []byte("invalid request path"), -1)
+			// GPUStack-local: a queued local reply must terminate the callback
+			// with ActionPause, exactly like the 413 rejection in main.go. The
+			// signature has no error return (changing it would touch every
+			// provider's OnRequestHeaders), so the state travels via the
+			// context and main.go checks HasQueuedLocalReply right after the
+			// handler call -- before its error path, which would queue a
+			// second reply on the same stream.
+			ctx.SetContext(ctxKeyQueuedLocalReply, true)
 			return
 		}
 		headers.Set(":path", prependedPath)

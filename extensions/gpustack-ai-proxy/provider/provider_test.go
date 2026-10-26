@@ -357,7 +357,11 @@ func TestApplyProviderBasePath(t *testing.T) {
 			name:             "base_path_with_trailing_slash",
 			providerBasePath: "/api/ai/",
 			originalPath:     "/v1/chat/completions",
-			expectedPath:     "/api/ai//v1/chat/completions",
+			// GPUStack-local: a single trailing slash on providerBasePath
+			// names the same location as its trimmed form, so the prefix is
+			// joined against the trimmed base instead of producing a
+			// double-slash path.
+			expectedPath: "/api/ai/v1/chat/completions",
 		},
 		{
 			name:             "deep_base_path",
