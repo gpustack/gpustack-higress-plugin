@@ -7,9 +7,9 @@ description: AI 代理插件配置参考
 > **Fork 说明**
 >
 > 本插件 fork 自 Higress `ai-proxy` 插件：
-> https://github.com/alibaba/higress/tree/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy
+> https://github.com/alibaba/higress/tree/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy
 >
-> 基于 higress commit `aae6fbce36a2` 复制，并在 gpustack/gpustack-higress-plugins 中独立维护。
+> 基于 higress commit `36f2f1ac5c73` 复制，并在 gpustack/gpustack-higress-plugins 中独立维护。
 > 每个 `.go` 文件头部保留了对应的上游来源标注；本地改动可能与上游产生差异。
 >
 > **本地改动**：

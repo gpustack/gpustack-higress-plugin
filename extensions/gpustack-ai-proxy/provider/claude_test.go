@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/claude_test.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
+// Upstream: https://github.com/alibaba/higress/blob/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy/provider/claude_test.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit 36f2f1ac5c73.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -479,7 +479,7 @@ func TestClaudeProvider_StreamPreservesNativeSignatureAndStopsForClaudeConversio
 	})
 	signatureBody, err := json.Marshal(signatureResponse)
 	require.NoError(t, err)
-	converted, err := converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(signatureBody)+"\n\n"))
+	converted, err := converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(signatureBody)+"\n\n"), false)
 	require.NoError(t, err)
 	events := parseClaudeSSEEvents(t, converted)
 	require.Len(t, events, 2)
@@ -493,7 +493,7 @@ func TestClaudeProvider_StreamPreservesNativeSignatureAndStopsForClaudeConversio
 	})
 	stopBody, err := json.Marshal(stopResponse)
 	require.NoError(t, err)
-	converted, err = converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(stopBody)+"\n\n"))
+	converted, err = converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(stopBody)+"\n\n"), false)
 	require.NoError(t, err)
 	events = parseClaudeSSEEvents(t, converted)
 	require.Len(t, events, 1)

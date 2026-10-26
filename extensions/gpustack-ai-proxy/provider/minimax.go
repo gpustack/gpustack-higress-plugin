@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/minimax.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
+// Upstream: https://github.com/alibaba/higress/blob/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy/provider/minimax.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit 36f2f1ac5c73.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -169,11 +169,11 @@ func (m *minimaxProvider) TransformResponseHeaders(ctx wrapper.HttpContext, apiN
 
 // OnStreamingResponseBody handles streaming response chunks from the Minimax service only for requests using the OpenAI protocol and corresponding to the chat completion Pro API.
 func (m *minimaxProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name ApiName, chunk []byte, isLastChunk bool) ([]byte, error) {
-	if isLastChunk || len(chunk) == 0 {
-		return nil, nil
-	}
 	if name != ApiNameChatCompletion {
 		return chunk, nil
+	}
+	if len(chunk) == 0 && !isLastChunk {
+		return nil, nil
 	}
 	// Sample event response:
 	// data: {"created":1689747645,"model":"abab6.5s-chat","reply":"","choices":[{"messages":[{"sender_type":"BOT","sender_name":"MM智能助理","text":"am from China."}]}],"output_sensitive":false}
@@ -181,25 +181,26 @@ func (m *minimaxProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name 
 	// Sample end event response:
 	// data: {"created":1689747645,"model":"abab6.5s-chat","reply":"I am from China.","choices":[{"finish_reason":"stop","messages":[{"sender_type":"BOT","sender_name":"MM智能助理","text":"I am from China."}]}],"usage":{"total_tokens":187},"input_sensitive":false,"output_sensitive":false,"id":"0106b3bc9fd844a9f3de1aa06004e2ab","base_resp":{"status_code":0,"status_msg":""}}
 	responseBuilder := &strings.Builder{}
-	lines := strings.Split(string(chunk), "\n")
-	for _, data := range lines {
-		if len(data) < 6 {
-			// Ignore blank line or improperly formatted lines.
-			continue
+	for _, event := range frameSSEEvents(ctx, ctxKeyMinimaxSSEFraming, chunk, isLastChunk) {
+		for _, data := range strings.Split(event, "\n") {
+			if len(data) < 6 {
+				// Ignore blank line or improperly formatted lines.
+				continue
+			}
+			data = data[6:]
+			var minimaxResp minimaxChatCompletionProResp
+			if err := json.Unmarshal([]byte(data), &minimaxResp); err != nil {
+				log.Errorf("unable to unmarshal minimax response: %v", err)
+				continue
+			}
+			response := m.responseProToOpenAI(&minimaxResp)
+			responseBody, err := json.Marshal(response)
+			if err != nil {
+				log.Errorf("unable to marshal response: %v", err)
+				return nil, err
+			}
+			m.appendResponse(responseBuilder, string(responseBody))
 		}
-		data = data[6:]
-		var minimaxResp minimaxChatCompletionProResp
-		if err := json.Unmarshal([]byte(data), &minimaxResp); err != nil {
-			log.Errorf("unable to unmarshal minimax response: %v", err)
-			continue
-		}
-		response := m.responseProToOpenAI(&minimaxResp)
-		responseBody, err := json.Marshal(response)
-		if err != nil {
-			log.Errorf("unable to marshal response: %v", err)
-			return nil, err
-		}
-		m.appendResponse(responseBuilder, string(responseBody))
 	}
 	modifiedResponseChunk := responseBuilder.String()
 	log.Debugf("=== modified response chunk: %s", modifiedResponseChunk)
