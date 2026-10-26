@@ -965,8 +965,15 @@ func CreateProvider(pc ProviderConfig) (Provider, error) {
 }
 
 // applyProviderBasePath prepends the ProviderBasePath to the given path if configured.
+// The decision is made at a path-segment boundary (pathutil.WithinPrefix on the
+// path portion) rather than by a byte prefix: with providerBasePath "/v" a normal
+// "/v2/models" must still get "/v" prepended.
 func (c *ProviderConfig) applyProviderBasePath(path string) string {
-	if c.providerBasePath != "" && !strings.HasPrefix(path, c.providerBasePath) {
+	if c.providerBasePath == "" {
+		return path
+	}
+	pathPart, _ := pathutil.SplitTarget(path)
+	if !pathutil.WithinPrefix(pathPart, c.providerBasePath) {
 		return c.providerBasePath + path
 	}
 	return path
@@ -979,9 +986,14 @@ func (c *ProviderConfig) applyProviderBasePath(path string) string {
 //
 // The already-prefixed branch is validated as well: a path that starts with
 // basePath can still climb back out of it, and returning it untouched would skip
-// every check.
+// every check. "Already prefixed" is decided at a path-segment boundary on the
+// raw path portion (equal to basePath, or followed by "/") rather than by a byte
+// prefix: with basePath "/api" a normal "/api2/v1/models" does not share the
+// "/api" segment, and treating it as prefixed would 400 a request that only
+// needed "/api" prepended.
 func (c *ProviderConfig) prependBasePath(currentPath string) (string, error) {
-	if strings.HasPrefix(currentPath, c.basePath) {
+	pathPart, _ := pathutil.SplitTarget(currentPath)
+	if pathPart == c.basePath || strings.HasPrefix(pathPart, c.basePath+"/") {
 		if err := pathutil.ValidateWithin(c.basePath, currentPath); err != nil {
 			return "", err
 		}
