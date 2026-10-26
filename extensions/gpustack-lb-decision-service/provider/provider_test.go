@@ -126,3 +126,40 @@ func TestDecisionClusterSingleForms(t *testing.T) {
 		t.Errorf("DecisionCluster() = %q, want outbound|80||jev.internal", got)
 	}
 }
+
+func TestDecisionHeaders(t *testing.T) {
+	// clusterNameHeader carries the chosen cluster's service name (segment
+	// 4 of the outbound|<port>||<service> form), derived per attempt so the
+	// value follows the random cluster pick — an entrypoint shared by
+	// several members routes by it. No header when the field is unset or
+	// the cluster is not in the outbound form.
+	cfg := &ProviderConfig{
+		Endpoint:          "http://d3.internal:8010",
+		ClusterNameHeader: "X-GPUStack-Model-Instance",
+	}
+	p := NewSystemone(cfg)
+
+	cases := []struct {
+		name    string
+		cluster string
+		want    [][2]string
+	}{
+		{"static registry form", "outbound|80||model-12-35.static", [][2]string{
+			{"X-GPUStack-Model-Instance", "model-12-35.static"},
+		}},
+		{"worker proxy dns form", "outbound|10176||model-12-41.dns", [][2]string{
+			{"X-GPUStack-Model-Instance", "model-12-41.dns"},
+		}},
+		{"not the outbound form", "api.typesafe.ai", nil},
+	}
+	for _, c := range cases {
+		if got := p.DecisionHeaders(c.cluster); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: DecisionHeaders(%q) = %v, want %v", c.name, c.cluster, got, c.want)
+		}
+	}
+
+	bare := NewSystemone(&ProviderConfig{Endpoint: "http://d3.internal:8010"})
+	if got := bare.DecisionHeaders("outbound|80||model-12-35.static"); got != nil {
+		t.Errorf("no header configured: DecisionHeaders() = %v, want nil", got)
+	}
+}

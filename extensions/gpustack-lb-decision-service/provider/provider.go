@@ -52,6 +52,13 @@ type DecisionProvider interface {
 	// DecisionModel is the optional `model` field of the decision request
 	// ("" omits it — the server's default engine answers).
 	DecisionModel() string
+	// DecisionHeaders returns extra headers for a callout dispatched to
+	// the given cluster. Today that is the clusterNameHeader entry: the
+	// cluster's service name (segment 4 of the outbound|<port>||<service>
+	// form) under the configured header name, derived per attempt so it
+	// follows the randomly picked cluster. nil when no header is
+	// configured or the cluster is not in the outbound form.
+	DecisionHeaders(cluster string) [][2]string
 	// AuthHeaders returns headers (auth, ...) for the decision callout.
 	// apiToken is the credential to send this attempt — "" sends none. It
 	// comes from EffectiveAPITokens(); passing it per call (instead of
@@ -91,6 +98,15 @@ type ProviderConfig struct {
 	// accept other names to pick an engine profile). Empty omits the
 	// field — the server then uses its default engine.
 	Model string `json:"model"`
+	// ClusterNameHeader names a header that carries the chosen cluster's
+	// service name — segment 4 of the outbound|<port>||<service> form —
+	// on every callout, the same value gpustack-set-header-pre-route
+	// writes for routed traffic from the matched cluster. An entrypoint
+	// shared by several members (replicas behind one proxy routing by
+	// this header) then selects the member the picked cluster names;
+	// deriving the value per attempt is what lets it follow the random
+	// cluster pick. Empty disables it.
+	ClusterNameHeader string `json:"clusterNameHeader"`
 }
 
 // CreateProvider builds the decision provider for cfg.Type. Two provider

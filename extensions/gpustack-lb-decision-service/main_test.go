@@ -166,6 +166,29 @@ func TestRuleProviderOverrideClearsInheritedTokens(t *testing.T) {
 	}
 }
 
+func TestParseProviderClusterNameHeader(t *testing.T) {
+	// clusterNameHeader names the header carrying the chosen cluster's
+	// service name on every callout; absent means no extra callout header.
+	pc := parseProviderConfig(gjson.Parse(`{
+		"id": "p1",
+		"type": "systemone",
+		"endpoint": "http://d3.internal:8010",
+		"clusters": ["outbound|80||model-12-35.static"],
+		"clusterNameHeader": "X-GPUStack-Model-Instance"
+	}`))
+	if pc.ClusterNameHeader != "X-GPUStack-Model-Instance" {
+		t.Errorf("ClusterNameHeader = %q, want X-GPUStack-Model-Instance", pc.ClusterNameHeader)
+	}
+	bare := parseProviderConfig(gjson.Parse(`{
+		"id": "p2",
+		"type": "systemone",
+		"endpoint": "http://d3.internal:8010"
+	}`))
+	if bare.ClusterNameHeader != "" {
+		t.Errorf("ClusterNameHeader = %q, want empty", bare.ClusterNameHeader)
+	}
+}
+
 func TestTokenFailureStatuses(t *testing.T) {
 	// Only credential-level failures (invalid key 401/403, exhausted
 	// quota 429) are retried with the fallback token; service-side
