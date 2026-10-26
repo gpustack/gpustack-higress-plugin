@@ -43,6 +43,17 @@ func TestPrependBasePathDecidesAtSegmentBoundary(t *testing.T) {
 	joined, err = c.prependBasePath("/api/a/../b")
 	require.NoError(t, err)
 	assert.Equal(t, "/api/a/../b", joined)
+
+	// A single trailing slash on basePath names the same location, so an
+	// already-prefixed path must survive the comparison against the trimmed
+	// base instead of being prefixed twice.
+	trailing := &ProviderConfig{basePath: "/api/"}
+	joined, err = trailing.prependBasePath("/api/v1/models")
+	require.NoError(t, err)
+	assert.Equal(t, "/api/v1/models", joined)
+	joined, err = trailing.prependBasePath("/api2/v1/models")
+	require.NoError(t, err)
+	assert.Equal(t, "/api/api2/v1/models", joined)
 }
 
 func TestApplyProviderBasePathDecidesAtSegmentBoundary(t *testing.T) {
@@ -52,4 +63,10 @@ func TestApplyProviderBasePathDecidesAtSegmentBoundary(t *testing.T) {
 	assert.Equal(t, "/v/chat/completions", c.applyProviderBasePath("/chat/completions"))
 	assert.Equal(t, "/v/chat/completions", c.applyProviderBasePath("/v/chat/completions"))
 	assert.Equal(t, "/v/plain", c.applyProviderBasePath("/plain"))
+
+	// A trailing slash on providerBasePath must behave like its trimmed form.
+	trailing := &ProviderConfig{providerBasePath: "/v/"}
+	assert.Equal(t, "/v/chat/completions", trailing.applyProviderBasePath("/chat/completions"))
+	assert.Equal(t, "/v/chat/completions", trailing.applyProviderBasePath("/v/chat/completions"))
+	assert.Equal(t, "/v/v2/models", trailing.applyProviderBasePath("/v2/models"))
 }

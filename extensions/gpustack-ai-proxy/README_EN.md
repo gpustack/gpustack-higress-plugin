@@ -91,6 +91,7 @@ Plugin execution priority: `100`
 | Name       | Data Type   | Requirement | Default | Description               |
 |------------|--------|------|-----|------------------|
 | `provider` | object | Required   | -   | Configures information for the target AI service provider |
+| `toolCallValidation` | string | Optional | `off` | Structural `tool` / `tool_calls` pairing validation on the Chat Completions request path. `off` (the default) disables it entirely; `strict` rejects a malformed request with 400. See [Tool / tool_calls pairing validation](#tool--tool_calls-pairing-validation). |
 
 **Details for the `provider` configuration fields:**
 
@@ -398,6 +399,89 @@ Its unique configuration fields are:
 | `awsSecretKey`            | string          | Either this or apiTokens | -       | AWS Secret Access Key for AWS Signature V4 authentication          |
 | `awsRegion`               | string          | Required                 | -       | AWS region, e.g., us-east-1                                        |
 | `bedrockAdditionalFields` | map             | Optional                 | -       | Additional inference parameters that the model supports            |
+
+## Tool / tool_calls pairing validation
+
+> GPUStack-local feature; upstream `ai-proxy` does not have it. See gpustack/gpustack#6210.
+
+When a Chat Completions request contains `tool` messages that are not properly paired
+with a preceding `assistant.tool_calls`, the behaviour depends entirely on the upstream
+provider: strict providers (vLLM and friends) return 400, permissive OpenAI-compatible
+providers answer 200. The dangerous case is **dangling `tool_calls`** — the assistant
+asked for a tool, no tool result was supplied, and a permissive provider returns 200
+with a **fabricated** tool result and `finish_reason: "stop"`. Nothing in the response
+tells the caller the model invented it.
+
+This plugin runs a purely structural check on the request path, positioned as a
+*reject-and-alert* safety net — no repair, no business-semantic judgement.
+
+### Validation rules
+
+1. Every `role: "tool"` message's `tool_call_id` must match an `id` in a *preceding*
+   `assistant.tool_calls[]`.
+2. An `assistant` message carrying `tool_calls` must be followed immediately by one
+   `tool` message per call; no other role may appear until all of them are answered.
+3. `tool_call_id` must not repeat within a request.
+4. `assistant.tool_calls[].id` must not repeat.
+5. Both `tool_calls[].id` and `tool_call_id` must be **non-empty JSON strings** -- a
+   missing field, a `null` or a number is malformed. (Otherwise gjson renders a missing
+   field and a `null` alike as `""`, and a number as its digits, on both sides of the
+   comparison -- so two "empty" ids would pair up and pass.)
+
+Rule 4 is enforced request-wide rather than per-array. That is stricter than the literal
+wording, but it is what rule 3 already implies: if two assistant turns issue the same
+`id`, the tool messages answering them necessarily repeat a `tool_call_id`, which rule 3
+rejects anyway. Reporting it where the `id` is *issued* gives the more actionable error.
+
+The plugin never repairs the message list (no synthesised tool results, no deduplicated
+ids). The gateway does not know the business semantics, and a wrong repair is worse than
+no repair.
+
+### Behaviour on failure
+
+**This is opt-in; the default is `off`.** Unconfigured, the plugin does not run the check
+at all — it does not even scan the body — so its behaviour is identical to a build without
+this feature. The plugin is a fork of upstream `ai-proxy` that ships to every GPUStack
+deployment, and defaulting to rejection would mean the fork unilaterally turns requests
+that work today into 400s; deployments that want the safety net set
+`toolCallValidation: strict` explicitly.
+
+In `strict` a malformed request is rejected with 400 and an OpenAI-style error envelope
+whose `message` is aligned with the upstream wording, so callers can reuse their existing
+error handling:
+
+```json
+{
+  "error": {
+    "message": "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+    "type": "invalid_request_error",
+    "code": "invalid_request_error"
+  }
+}
+```
+
+### Configuration example
+
+```yaml
+toolCallValidation: strict      # omit to leave the check off
+provider:
+  type: openai
+  apiTokens:
+    - "YOUR_API_TOKEN"
+```
+
+In a GPUStack deployment, put the field at the top level of the `gpustack-ai-proxy`
+WasmPlugin's `spec.defaultConfig`. GPUStack's reconciler only ever rewrites
+`defaultConfig.providers` and `matchRules`, so other `defaultConfig` keys survive; and a
+matchRule that does not mention the field inherits the global value, so setting it once in
+`defaultConfig` covers every route. To enforce it on a single route only, put it in that
+route's `matchRules[].config` instead.
+
+An unrecognised value is **not** a config error: it falls back to the `off` default and
+logs an ERROR. wasm-go swallows a global-config parse error and zeroes the global config, and
+GPUStack keeps `providers` only in `defaultConfig` — so a zeroed global would make the
+whole ai-proxy silently no-op. Taking the proxy down over a typo in one field costs far
+more than running the check in its default mode.
 
 ## Usage Examples
 

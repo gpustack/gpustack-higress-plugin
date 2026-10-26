@@ -315,6 +315,13 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		ctx.SetContext(provider.CtxRequestPath, ctx.Path())
 
 		err := handler.OnRequestHeaders(ctx, apiName)
+		if provider.HasQueuedLocalReply(ctx) {
+			// A local reply was already queued during header processing
+			// (e.g. the basePath traversal rejection); the stream must stop
+			// here. Checked before the error path so an error handler never
+			// queues a second reply on the same stream.
+			return types.ActionPause
+		}
 		if err != nil {
 			_ = util.ErrorHandler("ai-proxy.proc_req_headers_failed", fmt.Errorf("failed to process request headers: %v", err))
 			return types.ActionContinue

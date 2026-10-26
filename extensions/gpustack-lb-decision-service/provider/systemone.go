@@ -94,10 +94,19 @@ func (s *Systemone) DecisionHeaders(cluster string) [][2]string {
 		return nil
 	}
 	parts := strings.SplitN(cluster, "|", 4)
-	if len(parts) != 4 {
+	if len(parts) != 4 || parts[0] != "outbound" || parts[3] == "" {
+		// Only an Envoy outbound cluster name carries a service segment;
+		// anything else (a plain name, an inbound/internal form, or an empty
+		// segment) must not hand the shared entrypoint a made-up value.
 		return nil
 	}
-	return [][2]string{{s.cfg.ClusterNameHeader, parts[3]}}
+	// Allow the subset form outbound|<port>|<subset>||<service>: SplitN(4)
+	// leaves the last "|" glued to the service segment.
+	service := strings.TrimPrefix(parts[3], "|")
+	if service == "" {
+		return nil
+	}
+	return [][2]string{{s.cfg.ClusterNameHeader, service}}
 }
 
 // splitHostPort splits host[:port]; port defaults when absent.
