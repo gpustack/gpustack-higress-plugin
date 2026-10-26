@@ -190,11 +190,13 @@ func (t *tritonProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name A
 	responseBuilder := &strings.Builder{}
 	for _, event := range frameSSEEvents(ctx, ctxKeyTritonSSEFraming, chunk, isLastChunk) {
 		for _, data := range strings.Split(event, "\n") {
-			if len(data) < 6 {
-				// ignore blank line or wrong format
+			if !strings.HasPrefix(data, "data:") {
+				// ignore blank lines and non-data fields (event:, id:, comments):
+				// stripping a fixed prefix from those would feed garbage to
+				// json.Unmarshal and spam the error log.
 				continue
 			}
-			data = data[6:]
+			data = strings.TrimSpace(strings.TrimPrefix(data, "data:"))
 			var tritonRes TritonGenerateResponse
 			if err := json.Unmarshal([]byte(data), &tritonRes); err != nil {
 				log.Errorf("unable to unmarshal triton response: %v", err)

@@ -37,6 +37,16 @@ var ErrMalformedJSON = errors.New("jsonbody: malformed JSON document")
 // is left to the caller's existing body validation. Truncated or unbalanced
 // input yields ErrMalformedJSON rather than a verdict.
 func DuplicateTopLevelMember(body []byte, key string) (bool, error) {
+	// A top-level member only exists when the document itself is an object at
+	// the start of the body. Scanning from any other position would count
+	// members of a nested object instead -- e.g. a multipart form field whose
+	// text happens to contain JSON -- and reject bodies the caller never meant
+	// as JSON objects.
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false, nil
+	}
+
 	depth := 0
 	topLevelObject := false
 	// memberNext reports whether a string literal starting at the current

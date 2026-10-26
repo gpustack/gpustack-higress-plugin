@@ -183,11 +183,13 @@ func (m *minimaxProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name 
 	responseBuilder := &strings.Builder{}
 	for _, event := range frameSSEEvents(ctx, ctxKeyMinimaxSSEFraming, chunk, isLastChunk) {
 		for _, data := range strings.Split(event, "\n") {
-			if len(data) < 6 {
-				// Ignore blank line or improperly formatted lines.
+			if !strings.HasPrefix(data, "data:") {
+				// Ignore blank lines and non-data fields (event:, id:, comments):
+				// stripping a fixed prefix from those would feed garbage to
+				// json.Unmarshal and spam the error log.
 				continue
 			}
-			data = data[6:]
+			data = strings.TrimSpace(strings.TrimPrefix(data, "data:"))
 			var minimaxResp minimaxChatCompletionProResp
 			if err := json.Unmarshal([]byte(data), &minimaxResp); err != nil {
 				log.Errorf("unable to unmarshal minimax response: %v", err)

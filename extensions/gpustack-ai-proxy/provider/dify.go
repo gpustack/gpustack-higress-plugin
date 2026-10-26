@@ -179,11 +179,13 @@ func (d *difyProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name Api
 	responseBuilder := &strings.Builder{}
 	for _, event := range frameSSEEvents(ctx, ctxKeyDifySSEFraming, chunk, isLastChunk) {
 		for _, data := range strings.Split(event, "\n") {
-			if len(data) < 6 {
-				// ignore blank line or wrong format
+			if !strings.HasPrefix(data, "data:") {
+				// ignore blank lines and non-data fields (event:, id:, comments):
+				// stripping a fixed prefix from those would feed garbage to
+				// json.Unmarshal and spam the error log.
 				continue
 			}
-			data = data[6:]
+			data = strings.TrimSpace(strings.TrimPrefix(data, "data:"))
 			var difyResponse DifyChunkChatResponse
 			if err := json.Unmarshal([]byte(data), &difyResponse); err != nil {
 				log.Errorf("unable to unmarshal dify response: %v", err)
