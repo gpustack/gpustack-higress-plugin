@@ -7,9 +7,9 @@ description: Reference for configuring the AI Proxy plugin
 > **Fork notice**
 >
 > This plugin is forked from the Higress `ai-proxy` plugin:
-> https://github.com/alibaba/higress/tree/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy
+> https://github.com/alibaba/higress/tree/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy
 >
-> Copied at higress commit `aae6fbce36a2` and maintained independently in
+> Copied at higress commit `36f2f1ac5c73` and maintained independently in
 > gpustack/gpustack-higress-plugins. Every `.go` file keeps a header pointing at its
 > upstream source; local changes may diverge from upstream.
 >
@@ -79,7 +79,6 @@ Plugin execution priority: `100`
 | Name       | Data Type   | Requirement | Default | Description               |
 |------------|--------|------|-----|------------------|
 | `provider` | object | Required   | -   | Configures information for the target AI service provider |
-| `toolCallValidation` | string | Optional | `off` | Structural `tool` / `tool_calls` pairing validation on the Chat Completions request path. `off` (the default) disables it entirely; `strict` rejects a malformed request with 400. See [Tool / tool_calls pairing validation](#tool--tool_calls-pairing-validation). |
 
 **Details for the `provider` configuration fields:**
 
@@ -387,154 +386,6 @@ Its unique configuration fields are:
 | `awsSecretKey`            | string          | Either this or apiTokens | -       | AWS Secret Access Key for AWS Signature V4 authentication          |
 | `awsRegion`               | string          | Required                 | -       | AWS region, e.g., us-east-1                                        |
 | `bedrockAdditionalFields` | map             | Optional                 | -       | Additional inference parameters that the model supports            |
-
-## Tool / tool_calls pairing validation
-
-> GPUStack-local feature; upstream `ai-proxy` does not have it. See gpustack/gpustack#6210.
-
-When a Chat Completions request contains `tool` messages that are not properly paired
-with a preceding `assistant.tool_calls`, the behaviour depends entirely on the upstream
-provider: strict providers (vLLM and friends) return 400, permissive OpenAI-compatible
-providers answer 200. The dangerous case is **dangling `tool_calls`** — the assistant
-asked for a tool, no tool result was supplied, and a permissive provider returns 200
-with a **fabricated** tool result and `finish_reason: "stop"`. Nothing in the response
-tells the caller the model invented it.
-
-This plugin runs a purely structural check on the request path, positioned as a
-*reject-and-alert* safety net — no repair, no business-semantic judgement.
-
-### Validation rules
-
-1. Every `role: "tool"` message's `tool_call_id` must match an `id` in a *preceding*
-   `assistant.tool_calls[]`.
-2. An `assistant` message carrying `tool_calls` must be followed immediately by one
-   `tool` message per call; no other role may appear until all of them are answered.
-3. `tool_call_id` must not repeat within a request.
-4. `assistant.tool_calls[].id` must not repeat.
-5. Both `tool_calls[].id` and `tool_call_id` must be **non-empty JSON strings** -- a
-   missing field, a `null` or a number is malformed. (Otherwise gjson renders a missing
-   field and a `null` alike as `""`, and a number as its digits, on both sides of the
-   comparison -- so two "empty" ids would pair up and pass.)
-
-Rule 4 is enforced request-wide rather than per-array. That is stricter than the literal
-wording, but it is what rule 3 already implies: if two assistant turns issue the same
-`id`, the tool messages answering them necessarily repeat a `tool_call_id`, which rule 3
-rejects anyway. Reporting it where the `id` is *issued* gives the more actionable error.
-
-The plugin never repairs the message list (no synthesised tool results, no deduplicated
-ids). The gateway does not know the business semantics, and a wrong repair is worse than
-no repair.
-
-### Behaviour on failure
-
-**This is opt-in; the default is `off`.** Unconfigured, the plugin does not run the check
-at all — it does not even scan the body — so its behaviour is identical to a build without
-this feature. The plugin is a fork of upstream `ai-proxy` that ships to every GPUStack
-deployment, and defaulting to rejection would mean the fork unilaterally turns requests
-that work today into 400s; deployments that want the safety net set
-`toolCallValidation: strict` explicitly.
-
-In `strict` a malformed request is rejected with 400 and an OpenAI-style error envelope
-whose `message` is aligned with the upstream wording, so callers can reuse their existing
-error handling:
-
-```json
-{
-  "error": {
-    "message": "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
-    "type": "invalid_request_error",
-    "code": "invalid_request_error"
-  }
-}
-```
-
-Rules 1 and 3 map to the message above; rule 2 maps to
-`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'.`;
-rule 4 maps to `An assistant message with 'tool_calls' must not reuse a 'tool_calls[].id'.`
-
-### Logging and metrics
-
-Every rejection emits a WARN log line carrying the rule that was tripped, the `model`, the
-`x-mse-consumer` value, and the offending message index and `tool_call_id`.
-
-It also increments the counter `gpustack_ai_proxy_tool_call_pairing_rejected_total`, whose
-stat name follows the Higress AI-plugin convention:
-
-```text
-route.<route>.upstream.<cluster>.model.<model>.consumer.<consumer>.metric.gpustack_ai_proxy_tool_call_pairing_rejected_total.rule.<rule>
-```
-
-`ai_route` and `ai_cluster` are auto-extracted as Prometheus labels by the stats_tags
-Higress already ships; `rule` stays in the stat name and can be flattened into a label
-with `metric_relabel_configs` at scrape time.
-
-`rule` is one of: `orphan_tool_message`, `unanswered_tool_calls`,
-`duplicate_tool_call_id`, `duplicate_tool_calls_id`, `invalid_tool_call_id`,
-`invalid_tool_calls_id`.
-
-**Every label on the metric is bounded by configuration; none of them is
-request-controlled.** The `model.` / `consumer.` slots in the stat name carry the fixed
-`none` sentinel (the slots stay because Higress's stats_tags regexes match on those
-literal separators to extract `ai_route` / `ai_cluster`). A rejected request is cheap to
-send -- 400, no upstream call -- so making `model` (a body field) or `x-mse-consumer` (a
-header a client can set itself on a route with no key-auth in front) a label would let a
-caller grow Envoy's stat registry and the plugin's counter cache once per request. The
-API-key attribution lives on the WARN log line above, which is append-only.
-
-### Cost
-
-In `off` (the default) the cost is zero — the body is never looked at.
-
-With `strict` on, the check is a single gjson scan. It does **no `encoding/json`
-reflection decode and no re-marshal**, and it hands the body to gjson through
-`unsafe.String` so that `gjson.GetBytes` does not copy the whole `messages` array.
-Allocation scales with the number of messages, not with body size.
-
-Benchmarks (native Apple M4 Pro, not wasm — the ratio is the point, not the absolute
-numbers; see `tool_call_pairing_bench_test.go`):
-
-| Body | This check | `json.Unmarshal` of the same body |
-| --- | --- | --- |
-| 200 rounds / 1.2 MB | 0.62 ms, 233 allocs, 222 KB | 3.94 ms, 3422 allocs, 1.47 MB |
-| 400 rounds / 1.2 MB | 0.82 ms, 439 allocs, 560 KB | 5.01 ms, 6823 allocs, 1.50 MB |
-| 200 rounds / 2.4 MB | 1.17 ms, 233 allocs, 222 KB | 7.65 ms, 3422 allocs, 2.70 MB |
-
-For contrast, the Anthropic→OpenAI conversion's reflection decode plus re-marshal is in a
-different cost class entirely (see gpustack/gpustack#6217); this check does not run on
-that path.
-
-### Scope
-
-- Chat Completions (`/v1/chat/completions`) only, and it runs before any request-body
-  rewriting, so the error describes what the client actually sent.
-- The Anthropic Messages surface (`/v1/messages`) expresses the same relationship with
-  `tool_use` / `tool_result` content blocks and is out of scope — including a Claude
-  request that was auto-converted onto the chat-completions path.
-- A body that is not JSON, or that has no `messages` array, is forwarded untouched
-  (fail-open).
-
-### Configuration example
-
-```yaml
-toolCallValidation: strict      # omit to leave the check off
-provider:
-  type: openai
-  apiTokens:
-    - "YOUR_API_TOKEN"
-```
-
-In a GPUStack deployment, put the field at the top level of the `gpustack-ai-proxy`
-WasmPlugin's `spec.defaultConfig`. GPUStack's reconciler only ever rewrites
-`defaultConfig.providers` and `matchRules`, so other `defaultConfig` keys survive; and a
-matchRule that does not mention the field inherits the global value, so setting it once in
-`defaultConfig` covers every route. To enforce it on a single route only, put it in that
-route's `matchRules[].config` instead.
-
-An unrecognised value is **not** a config error: it falls back to the `off` default and
-logs an ERROR. wasm-go swallows a global-config parse error and zeroes the global config, and
-GPUStack keeps `providers` only in `defaultConfig` — so a zeroed global would make the
-whole ai-proxy silently no-op. Taking the proxy down over a typo in one field costs far
-more than running the check in its default mode.
 
 ## Usage Examples
 
@@ -2458,7 +2309,7 @@ providers:
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "I am a lagguage model."
+                "content": "I am a language model."
             },
             "finish_reason": "stop",
         }

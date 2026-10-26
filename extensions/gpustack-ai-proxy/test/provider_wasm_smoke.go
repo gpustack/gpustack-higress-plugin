@@ -2,8 +2,8 @@
 // "provider" JSON, plugin start, request headers, and minimal body where useful). This file
 // complements per-vendor files such as openai.go and deepseek.go.
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/test/provider_wasm_smoke.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
+// Upstream: https://github.com/alibaba/higress/blob/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy/test/provider_wasm_smoke.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit 36f2f1ac5c73.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package test

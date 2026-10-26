@@ -1,6 +1,6 @@
 // This file is forked from the Higress ai-proxy plugin.
-// Upstream: https://github.com/alibaba/higress/blob/aae6fbce36a2d1dd7afff007a265ecbebdd8a6f1/plugins/wasm-go/extensions/ai-proxy/provider/spark.go
-// Forked into gpustack/gpustack-higress-plugins at higress commit aae6fbce36a2.
+// Upstream: https://github.com/alibaba/higress/blob/36f2f1ac5c7305c5a46c296c617b45d1fbacb7d3/plugins/wasm-go/extensions/ai-proxy/provider/spark.go
+// Forked into gpustack/gpustack-higress-plugins at higress commit 36f2f1ac5c73.
 // Local modifications may diverge from upstream; keep this attribution when editing.
 
 package provider
@@ -105,36 +105,37 @@ func (p *sparkProvider) TransformResponseBody(ctx wrapper.HttpContext, apiName A
 }
 
 func (p *sparkProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name ApiName, chunk []byte, isLastChunk bool) ([]byte, error) {
-	if isLastChunk || len(chunk) == 0 {
-		return nil, nil
-	}
 	if name != ApiNameChatCompletion {
 		return chunk, nil
 	}
+	if len(chunk) == 0 && !isLastChunk {
+		return nil, nil
+	}
 	responseBuilder := &strings.Builder{}
-	lines := strings.Split(string(chunk), "\n")
-	for _, data := range lines {
-		if len(data) < 6 {
-			// ignore blank line or wrong format
-			continue
+	for _, event := range frameSSEEvents(ctx, ctxKeySparkSSEFraming, chunk, isLastChunk) {
+		for _, data := range strings.Split(event, "\n") {
+			if len(data) < 6 {
+				// ignore blank line or wrong format
+				continue
+			}
+			data = data[6:]
+			// The final response is `data: [DONE]`
+			if data == "[DONE]" {
+				continue
+			}
+			var sparkResponse sparkStreamResponse
+			if err := json.Unmarshal([]byte(data), &sparkResponse); err != nil {
+				log.Errorf("unable to unmarshal spark response: %v", err)
+				continue
+			}
+			response := p.streamResponseSpark2OpenAI(ctx, &sparkResponse)
+			responseBody, err := json.Marshal(response)
+			if err != nil {
+				log.Errorf("unable to marshal response: %v", err)
+				return nil, err
+			}
+			p.appendResponse(responseBuilder, string(responseBody))
 		}
-		data = data[6:]
-		// The final response is `data: [DONE]`
-		if data == "[DONE]" {
-			continue
-		}
-		var sparkResponse sparkStreamResponse
-		if err := json.Unmarshal([]byte(data), &sparkResponse); err != nil {
-			log.Errorf("unable to unmarshal spark response: %v", err)
-			continue
-		}
-		response := p.streamResponseSpark2OpenAI(ctx, &sparkResponse)
-		responseBody, err := json.Marshal(response)
-		if err != nil {
-			log.Errorf("unable to marshal response: %v", err)
-			return nil, err
-		}
-		p.appendResponse(responseBuilder, string(responseBody))
 	}
 	modifiedResponseChunk := responseBuilder.String()
 	log.Debugf("=== modified response chunk: %s", modifiedResponseChunk)
