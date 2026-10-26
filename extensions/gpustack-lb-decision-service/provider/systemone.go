@@ -83,6 +83,23 @@ func (s *Systemone) DecisionCluster() string {
 // field, server default).
 func (s *Systemone) DecisionModel() string { return s.cfg.Model }
 
+// DecisionHeaders derives the extra callout headers for one cluster: the
+// clusterNameHeader entry, whose value is the cluster's service name
+// (segment 4 of the outbound|<port>||<service> form — what the shared
+// entrypoint behind the cluster routes by). Derived per attempt, so with
+// several configured clusters the value follows the random pick; a
+// cluster not in the outbound form carries no header.
+func (s *Systemone) DecisionHeaders(cluster string) [][2]string {
+	if s.cfg.ClusterNameHeader == "" {
+		return nil
+	}
+	parts := strings.SplitN(cluster, "|", 4)
+	if len(parts) != 4 {
+		return nil
+	}
+	return [][2]string{{s.cfg.ClusterNameHeader, parts[3]}}
+}
+
 // splitHostPort splits host[:port]; port defaults when absent.
 func splitHostPort(hostport, defaultPort string) (string, string) {
 	if i := strings.LastIndexByte(hostport, ':'); i >= 0 && !strings.Contains(hostport[i:], "]") {

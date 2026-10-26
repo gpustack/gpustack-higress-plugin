@@ -366,6 +366,12 @@ func parseProviderConfig(pj gjson.Result) *provider.ProviderConfig {
 			}
 		}
 	}
+	// clusterNameHeader: carry the chosen cluster's service name under
+	// this header on every callout — for an entrypoint shared by several
+	// members (replicas behind one proxy routing by the header) this is
+	// what selects the member, and deriving the value per attempt is what
+	// lets it follow the random cluster pick.
+	pc.ClusterNameHeader = pj.Get("clusterNameHeader").String()
 	if ts := pj.Get("apiTokens"); ts.IsArray() {
 		// Always materialise the slice when the field is present —
 		// even empty — so EffectiveAPITokens can distinguish "explicit
@@ -565,9 +571,14 @@ func dispatchDecisionCallout(config PluginConfig, baseHeaders [][2]string, decis
 	if idx < len(tokens) {
 		token = tokens[idx]
 	}
-	// Copy the base headers: appending auth headers must not leak into the
-	// shared slice later retries also build on.
+	cluster := config.decision.DecisionCluster()
+	// Copy the base headers: appending per-attempt headers must not leak
+	// into the shared slice later retries also build on.
 	calloutHeaders := append([][2]string{}, baseHeaders...)
+	// Provider-configured headers (headersToAdd, plus the headers of the
+	// cluster this attempt picked) — e.g. the routing key a shared
+	// entrypoint needs to select the member behind the chosen cluster.
+	calloutHeaders = append(calloutHeaders, config.decision.DecisionHeaders(cluster)...)
 	if token != "" {
 		hs := http.Header{}
 		config.decision.AuthHeaders(hs, token)
@@ -578,7 +589,7 @@ func dispatchDecisionCallout(config PluginConfig, baseHeaders [][2]string, decis
 		}
 	}
 	_, err := proxywasm.DispatchHttpCall(
-		config.decision.DecisionCluster(),
+		cluster,
 		calloutHeaders,
 		decisionReq,
 		nil,
