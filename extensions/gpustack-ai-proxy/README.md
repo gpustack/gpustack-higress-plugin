@@ -27,6 +27,11 @@ description: AI 代理插件配置参考
 >   （GPUStack UI / llama-box / vLLM 所用的拼写）此前会在 `isSupportedAPI` 处被拒
 >   （`unsupported API name`）。DashScope 兼容模式 rerank 端点本身就是 Cohere/Jina 同构契约，
 >   路径重写 + 模型映射即可完成转换，body 与响应原样透传。
+> - 为 qwen provider 兼容模式的默认能力补充 `openai/v1/imagegeneration` →
+>   `/compatible-mode/v1/images/generations`：qwen-image 系列（生成与编辑）提供标准 OpenAI Images
+>   兼容端点，纯路径重写 + 模型映射即可。注意该端点仅部署在业务空间专属域名
+>   （`{WorkspaceId}.cn-beijing.maas.aliyuncs.com`），旧域名 `dashscope.aliyuncs.com` 返回 404，
+>   启用图像生成需将 `qwenDomain` 配置为业务空间域名。
 >
 > **已删除的上游文件**：本仓库的构建/发布流程不使用 Higress 官方 CLI `hgctl`，而是走
 > `extensions/Makefile`（直接 `go build` 生成 wasm）+ `scripts/generate_metadata.py`。因此以下随

@@ -33,6 +33,7 @@ const (
 	qwenTextEmbeddingPath                 = "/api/v1/services/embeddings/text-embedding/text-embedding"
 	qwenTextRerankPath                    = "/api/v1/services/rerank/text-rerank/text-rerank"
 	qwenCompatibleTextRerankPath          = "/compatible-api/v1/reranks"
+	qwenCompatibleImageGenerationPath     = "/compatible-mode/v1/images/generations"
 	qwenCompatibleChatCompletionPath      = "/compatible-mode/v1/chat/completions"
 	qwenCompatibleCompletionsPath         = "/compatible-mode/v1/completions"
 	qwenCompatibleTextEmbeddingPath       = "/compatible-mode/v1/embeddings"
@@ -98,7 +99,23 @@ func (m *qwenProviderInitializer) DefaultCapabilities(qwenEnableCompatible bool)
 			// "unsupported API name". Deliberately absent from the native branch
 			// below: /api/v1/services/rerank/... expects input.query/input.documents
 			// and cannot parse a Cohere body.
-			string(ApiNameCohereV1Rerank):      qwenCompatibleTextRerankPath,
+			string(ApiNameCohereV1Rerank): qwenCompatibleTextRerankPath,
+			// GPUStack-local: qwen-image-* generation/editing models are served
+			// through a plain OpenAI Images surface at /compatible-mode/v1/
+			// images/generations (T2I and I2I share it: the optional "image"
+			// extension field switches to editing), so an inbound
+			// /v1/images/generations needs nothing but a path rewrite and model
+			// mapping. Verified against the Qwen-Image generation-and-editing
+			// API reference plus a live call (flat OpenAI body in, standard
+			// {created,data[].url,usage} out). Deployment note: this endpoint
+			// is only deployed on the per-workspace maas.aliyuncs.com domains,
+			// NOT on the legacy dashscope.aliyuncs.com domain (404 there), so
+			// qwenDomain must point at the workspace domain for image
+			// generation to work. Deliberately absent from the native branch:
+			// the native surface (/api/v1/services/aigc/multimodal-generation/
+			// generation) speaks a nested input/parameters dialect a flat
+			// OpenAI Images body cannot satisfy.
+			string(ApiNameImageGeneration):     qwenCompatibleImageGenerationPath,
 			string(ApiNameQwenV1Conversations): qwenCompatibleConversationsPath,
 			string(ApiNameAnthropicMessages):   qwenAnthropicMessagesPath,
 		}

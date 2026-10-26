@@ -32,6 +32,12 @@ description: Reference for configuring the AI Proxy plugin
 >   llama-box and vLLM) used to be rejected at `isSupportedAPI` with
 >   `unsupported API name`. DashScope's compatible rerank endpoint speaks the same
 >   Cohere/Jina contract, so a path rewrite plus model mapping is the whole conversion.
+> - Added `openai/v1/imagegeneration` → `/compatible-mode/v1/images/generations` to the qwen
+>   provider's default capabilities in compatible mode: the Qwen-Image generation/editing
+>   models expose a standard OpenAI Images endpoint, so a path rewrite plus model mapping is
+>   the whole conversion. Note the endpoint is only deployed on the per-workspace
+>   `maas.aliyuncs.com` domains (the legacy `dashscope.aliyuncs.com` answers 404), so image
+>   generation requires `qwenDomain` to point at the workspace domain.
 >
 > **Upstream files removed**: this repository does not use the Higress official CLI
 > `hgctl` for building/releasing — it goes through `extensions/Makefile` (plain `go build`
