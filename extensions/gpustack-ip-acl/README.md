@@ -15,7 +15,9 @@ The **consumer** is the gateway's authenticated caller identity (the `x-mse-cons
 ## Configuration
 
 ```yaml
-realIPHeader: "x-forwarded-for"  # optional, trusted header holding the real client IP; falls back to the downstream source address
+realIPHeader: "x-forwarded-for"  # optional, header a trusted front proxy asserts the client IP in
+realIPFrom:                     # optional, CIDRs of proxies allowed to assert it (gate for realIPHeader)
+  - "10.0.0.0/8"
 consumers:
   alice: # per-consumer rules
     allowedCidrs:
@@ -46,11 +48,16 @@ A key may contain a single `*`:
 
 Resolution order: **exact names always win**, then wildcard rules in **declaration order** (first match wins) — put narrower patterns before broader ones, and `*` last. Keys with no `*` or with a `*` in the middle / multiple `*` are treated as literal exact names.
 
-**⚠️ Only set `realIPHeader` when a trusted proxy in front of the gateway OVERWRITES the header** (not appends to it). The first value of the list is used; with `X-Forwarded-For` and no trusted overwriting proxy, a client that reaches the gateway directly can spoof its source IP and bypass the ACL. When unset, the plugin uses Envoy's downstream source address, which cannot be spoofed.
+### Client IP resolution
+
+- **Default (no `realIPFrom`)**: the connection's source address — a proxy-wasm property the client can neither set nor influence. Header spoofing cannot reach the ACL.
+- **`realIPFrom` set**: a forwarding header is honored **only when the downstream connection arrives from one of these networks** — the peer is then a proxy the operator declared as asserting addresses correctly. `realIPHeader` names that header (e.g. `x-forwarded-for`); a comma-separated value is walked from the right, skipping entries inside `realIPFrom` (the addresses trusted proxies appended), and the **first entry outside them is the client**. This mirrors nginx's `real_ip_header`/`set_real_ip_from` and the server-side `client_ip_getter` walk. An unparseable entry, or a chain that stays inside the trusted set all the way through, falls back to the connection address.
+
+**⚠️ Every network in `realIPFrom` must belong to a proxy that appends `X-Forwarded-For` (or overwrites the header with the address it observed) itself.** A proxy that passes a client-supplied header through verbatim re-opens the spoof: the client's claim would be indistinguishable from the proxy's. Configuring `realIPHeader` without `realIPFrom` leaves the header unread (the gate never passes) — declare both or neither.
 
 ### Ingress / route-level overrides (matchRule)
 
-The plugin supports Higress `matchRules`. A matched rule inherits `defaultConfig` and then applies **per-key overrides**: a consumer (exact name or wildcard) redeclared in the rule replaces its global rule entirely on that route; consumers not mentioned keep their global rules. `realIPHeader` is likewise inherited unless overridden. Override parsing never mutates the global config.
+The plugin supports Higress `matchRules`. A matched rule inherits `defaultConfig` and then applies **per-key overrides**: a consumer (exact name or wildcard) redeclared in the rule replaces its global rule entirely on that route; consumers not mentioned keep their global rules. `realIPHeader` is likewise inherited unless overridden. `realIPFrom` is always inherited and **not** overridable per route — which proxies sit in front of the gateway is deployment-wide topology, not route policy. Override parsing never mutates the global config.
 
 ```yaml
 matchRules:

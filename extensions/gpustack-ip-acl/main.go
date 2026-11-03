@@ -42,9 +42,18 @@ const headerConsumer = "x-mse-consumer"
 // are evaluated in their declaration order (first match wins), so put
 // narrower patterns before broader ones.
 type IpAclConfig struct {
-	exact        map[string]*ConsumerAcl
-	patterns     []consumerPattern
-	realIPHeader string // optional trusted header (e.g. x-forwarded-for); falls back to the downstream source address
+	exact    map[string]*ConsumerAcl
+	patterns []consumerPattern
+	// realIPHeader optionally names the header a trusted front proxy asserts
+	// the client IP in (e.g. x-forwarded-for). It is only read when the
+	// downstream connection itself arrives from realIPFrom — without that
+	// gate the header would be whatever the client claims about itself.
+	realIPHeader string
+	// realIPFrom are the CIDR networks of the proxies whose address
+	// assertions are honored (and whose X-Forwarded-For entries the walk
+	// goes through). Empty means no proxy is trusted: the connection's
+	// source address is the client IP, which cannot be spoofed.
+	realIPFrom []*net.IPNet
 }
 
 type consumerPattern struct {
@@ -68,6 +77,11 @@ func parseConfig(json gjson.Result, config *IpAclConfig) error {
 		return errors.New("config must be a JSON object")
 	}
 	config.realIPHeader = json.Get("realIPHeader").String()
+	from, fromErr := parseCIDRList(json.Get("realIPFrom"))
+	if fromErr != nil {
+		return fmt.Errorf("realIPFrom: %w", fromErr)
+	}
+	config.realIPFrom = from
 
 	consumers := json.Get("consumers")
 	if !consumers.Exists() {
@@ -186,7 +200,13 @@ func parseOverrideRuleConfig(json gjson.Result, global IpAclConfig, rule *IpAclC
 		*rule = denyAllConfig()
 		return nil
 	}
-	temp := IpAclConfig{realIPHeader: global.realIPHeader}
+	// realIPFrom aliases the global slice on purpose: it is deployment-wide
+	// topology (which proxies sit in front), never per-route policy, and is
+	// only read — no rule-level copy is taken or allowed.
+	temp := IpAclConfig{
+		realIPHeader: global.realIPHeader,
+		realIPFrom:   global.realIPFrom,
+	}
 	if v := json.Get("realIPHeader").String(); v != "" {
 		temp.realIPHeader = v
 	}
@@ -359,7 +379,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config IpAclConfig) types.Act
 		return types.ActionContinue
 	}
 
-	clientIP, err := resolveClientIP(config.realIPHeader)
+	clientIP, err := resolveClientIP(config.realIPHeader, config.realIPFrom)
 	if err != nil {
 		proxywasm.LogWarnf("gpustack-ip-acl: failed to resolve client IP: %v", err)
 		// Fail closed: unable to determine the caller's IP means unable to
@@ -404,21 +424,38 @@ func enforce(clientIP string, allowed, denied []*net.IPNet) (bool, string) {
 	return false, ""
 }
 
-// resolveClientIP returns the caller IP, preferring the configured trusted
-// header (first value of a comma-separated list such as X-Forwarded-For) and
-// falling back to the downstream source address. A trailing port
-// (`1.2.3.4:5678`, `[2001:db8::1]:443`) is stripped — net.ParseIP would
-// otherwise reject the pair and enforcement would fail closed on a
-// well-formed value.
-func resolveClientIP(header string) (string, error) {
-	if header != "" {
-		value, err := proxywasm.GetHttpRequestHeader(header)
-		if err == nil && value != "" {
-			if ip, ok := parseForwardedIP(value); ok {
-				return ip, nil
+// resolveClientIP returns the caller IP.
+//
+// The default is the connection's source address — a proxy-wasm property
+// the client can neither set nor influence, so header spoofing cannot reach
+// the ACL. A forwarding header (realIPHeader) is consulted only when the
+// downstream connection itself arrives from realIPFrom: the peer is then a
+// proxy the operator declared as asserting the address correctly, and a
+// comma-separated value is walked from the right through realIPFrom entries
+// (the addresses trusted proxies appended) — the first entry outside them
+// is the client, the same walk the server-side client_ip_getter performs.
+// When the walk cannot resolve a client (unparseable entry, or every entry
+// a trusted proxy) the source address is returned rather than a guess.
+func resolveClientIP(header string, trusted []*net.IPNet) (string, error) {
+	source, err := sourceAddressHost()
+	if err != nil {
+		return "", err
+	}
+	if header != "" && ipInNetworks(source, trusted) {
+		if value, err := proxywasm.GetHttpRequestHeader(header); err == nil && value != "" {
+			if clientIP, ok := resolveTrustedClientIP(value, trusted); ok {
+				return clientIP, nil
 			}
 		}
 	}
+	return source, nil
+}
+
+// sourceAddressHost returns the downstream connection's peer address as a
+// bare host, with a trailing port (`1.2.3.4:5678`, `[2001:db8::1]:443`)
+// stripped — net.ParseIP would otherwise reject the pair and enforcement
+// would fail closed on a well-formed value.
+func sourceAddressHost() (string, error) {
 	data, err := proxywasm.GetProperty([]string{"source", "address"})
 	if err != nil {
 		return "", err
@@ -436,25 +473,70 @@ func resolveClientIP(header string) (string, error) {
 	return host, nil
 }
 
-// parseForwardedIP extracts the client IP from a forwarded-header value:
-// the first entry of a comma-separated list, with an optional `;params`
-// suffix and an optional trailing port (`1.2.3.4:5678`, `[2001:db8::1]:443`)
-// stripped. A bracketed IPv6 without a port (`[2001:db8::1]`) keeps only the
-// brackets stripped. Pure so it is unit-testable without a proxy-wasm host.
-func parseForwardedIP(value string) (string, bool) {
-	ip := strings.TrimSpace(strings.Split(value, ",")[0])
-	if ip == "" {
-		return "", false
+// ipInNetworks reports whether the address falls inside any of the
+// networks, normalizing IPv4 to its 4-byte representation so Contains never
+// compares mismatched lengths against parseCIDRList's normalized networks.
+// An unparseable address is never inside.
+func ipInNetworks(ipStr string, networks []*net.IPNet) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
 	}
-	ip = strings.TrimSpace(strings.Split(ip, ";")[0])
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+	for _, network := range networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTrustedClientIP walks a comma-separated forwarding header from the
+// right: entries inside the trusted networks are proxies that appended to
+// the list, and the first entry outside them is the client. A broken chain
+// (an entry that does not parse as an IP, or every entry trusted) yields
+// false so the caller falls back to the connection address — the same
+// fallback the server-side client_ip_getter walk performs. Pure so it is
+// unit-testable without a proxy-wasm host.
+func resolveTrustedClientIP(value string, trusted []*net.IPNet) (string, bool) {
+	entries := strings.Split(value, ",")
+	for i := len(entries) - 1; i >= 0; i-- {
+		ipStr, ok := parseForwardedIP(entries[i])
+		if !ok {
+			return "", false
+		}
+		if !ipInNetworks(ipStr, trusted) {
+			return ipStr, true
+		}
+	}
+	return "", false
+}
+
+// parseForwardedIP extracts one forwarding-header entry as an IP address:
+// an optional `;params` suffix and an optional trailing port
+// (`1.2.3.4:5678`, `[2001:db8::1]:443`) are stripped, and the remainder
+// must parse as an IP — a syntactically non-empty but non-IP entry returns
+// false, so the walk treats the chain as broken and the caller falls back
+// to the connection address (the same contract as the server-side
+// client_ip_getter walk). Pure so it is unit-testable without a proxy-wasm
+// host; list walking lives in resolveTrustedClientIP, which decides which
+// entry is the client.
+func parseForwardedIP(entry string) (string, bool) {
+	ip, _, _ := strings.Cut(entry, ";")
+	ip = strings.TrimSpace(ip)
 	if ip == "" {
 		return "", false
 	}
 	if host, _, err := net.SplitHostPort(ip); err == nil {
-		return host, true
+		ip = host
 	}
 	if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
-		return ip[1 : len(ip)-1], true
+		ip = ip[1 : len(ip)-1]
+	}
+	if net.ParseIP(ip) == nil {
+		return "", false
 	}
 	return ip, true
 }
