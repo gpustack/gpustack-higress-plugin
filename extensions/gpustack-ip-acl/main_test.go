@@ -123,26 +123,117 @@ func TestParseConfigInvalid(t *testing.T) {
 }
 
 func TestParseForwardedIP(t *testing.T) {
+	// One forwarding-header entry per call; which entry of a list is the
+	// client is resolveTrustedClientIP's decision, not this parser's.
 	cases := []struct {
 		value string
 		want  string
 		ok    bool
 	}{
 		{"1.2.3.4", "1.2.3.4", true},
-		{"1.2.3.4, 5.6.7.8, 9.10.11.12", "1.2.3.4", true}, // first of the list
-		{"1.2.3.4:5678", "1.2.3.4", true},                 // port stripped (IPv4)
-		{"[2001:db8::1]:443", "2001:db8::1", true},        // port stripped (IPv6)
-		{"[2001:db8::1]", "2001:db8::1", true},            // bracketed IPv6 without port
-		{"2001:db8::1", "2001:db8::1", true},              // bare IPv6 survives
-		{"  1.2.3.4 ;param=1", "1.2.3.4", true},           // params stripped
+		{"  1.2.3.4  ", "1.2.3.4", true},           // whitespace trimmed
+		{"1.2.3.4:5678", "1.2.3.4", true},          // port stripped (IPv4)
+		{"[2001:db8::1]:443", "2001:db8::1", true}, // port stripped (IPv6)
+		{"[2001:db8::1]", "2001:db8::1", true},     // bracketed IPv6 without port
+		{"2001:db8::1", "2001:db8::1", true},       // bare IPv6 survives
+		{"  1.2.3.4 ;param=1", "1.2.3.4", true},    // params stripped
 		{"", "", false},
-		{" , 5.6.7.8", "", false}, // first entry empty → fall back to source address
+		{"  ", "", false},
+		{";param=1", "", false},
+		// An entry that does not parse as an IP is a broken link, not a
+		// client address: the walk must fall back rather than pass it on.
+		{"not-an-ip", "", false},
+		{"example.com", "", false},
+		{"1.2.3.4.5", "", false},
 	}
 	for _, c := range cases {
 		got, ok := parseForwardedIP(c.value)
 		if ok != c.ok || got != c.want {
 			t.Errorf("parseForwardedIP(%q) = (%q, %v), want (%q, %v)", c.value, got, ok, c.want, c.ok)
 		}
+	}
+}
+
+func TestResolveTrustedClientIP(t *testing.T) {
+	global := mustParse(t, `{"realIPFrom": ["10.0.0.0/8"]}`)
+	trusted := global.realIPFrom
+
+	cases := []struct {
+		name   string
+		value  string
+		nets   []*net.IPNet
+		want   string
+		wantOK bool
+	}{
+		// Single untrusted entry: that entry is the client.
+		{"direct client", "5.6.7.8", trusted, "5.6.7.8", true},
+		// A trusted proxy appended the rightmost entry: keep walking left.
+		{"one trusted hop", "192.0.2.10, 10.0.0.5", trusted, "192.0.2.10", true},
+		{"two trusted hops", "192.0.2.10, 10.0.0.5, 10.0.0.6", trusted, "192.0.2.10", true},
+		// The chain never leaves the trusted set: unresolvable, fall back.
+		{"all hops trusted", "10.0.0.5, 10.0.0.6", trusted, "", false},
+		// A non-IP entry between the client and the gateway breaks the
+		// chain of assertions; the caller then evaluates the connection
+		// address (the trusted peer) instead — the same fallback the
+		// server-side walk performs, never a client-chosen value.
+		{"broken chain", "192.0.2.10, not-an-ip, 10.0.0.5", trusted, "", false},
+		{"garbage sole entry", "not-an-ip", trusted, "", false},
+		// Without trusted networks the rightmost entry wins by definition
+		// (the caller gates on the source address, so this only means the
+		// walk stops immediately).
+		{"no trusted networks", "192.0.2.10, 10.0.0.5", nil, "10.0.0.5", true},
+	}
+	for _, c := range cases {
+		got, ok := resolveTrustedClientIP(c.value, c.nets)
+		if ok != c.wantOK || got != c.want {
+			t.Errorf("%s: resolveTrustedClientIP(%q) = (%q, %v), want (%q, %v)",
+				c.name, c.value, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestParseConfigRealIPFrom(t *testing.T) {
+	config := mustParse(t, `{"realIPFrom": ["10.0.0.0/8", "203.0.113.7"]}`)
+	if len(config.realIPFrom) != 2 {
+		t.Fatalf("expected 2 trusted networks, got %d", len(config.realIPFrom))
+	}
+	if got := config.realIPFrom[1].String(); got != "203.0.113.7/32" {
+		t.Fatalf("bare host should be a /32, got %s", got)
+	}
+	if !ipInNetworks("10.1.2.3", config.realIPFrom) {
+		t.Error("10.1.2.3 should be inside the trusted set")
+	}
+	if ipInNetworks("192.0.2.10", config.realIPFrom) {
+		t.Error("192.0.2.10 should be outside the trusted set")
+	}
+	if ipInNetworks("not-an-ip", config.realIPFrom) {
+		t.Error("an unparseable address is never inside the trusted set")
+	}
+
+	// A typo'd list must fail loudly — silently dropping it would leave
+	// realIPHeader honored (or ignored) for the wrong reasons.
+	for _, raw := range []string{
+		`{"realIPFrom": "10.0.0.0/8"}`,       // not an array
+		`{"realIPFrom": ["not-an-ip"]}`,      // invalid entry
+		`{"realIPFrom": ["10.0.0.0/8", ""]}`, // empty entry
+	} {
+		var config IpAclConfig
+		if err := parseConfig(gjson.Parse(raw), &config); err == nil {
+			t.Errorf("%s should fail loudly", raw)
+		}
+	}
+}
+
+func TestOverrideRuleConfigInheritsRealIPFrom(t *testing.T) {
+	// realIPFrom is deployment topology, not per-route policy: a rule
+	// inherits it from the global config unchanged.
+	global := mustParse(t, `{"realIPFrom": ["10.0.0.0/8"], "consumers": {"a": {"deniedCidrs": ["10.0.0.0/8"]}}}`)
+	var rule IpAclConfig
+	if err := parseOverrideRuleConfig(gjson.Parse(`{}`), *global, &rule); err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.realIPFrom) != 1 || rule.realIPFrom[0].String() != "10.0.0.0/8" {
+		t.Error("realIPFrom should be inherited from the global config")
 	}
 }
 

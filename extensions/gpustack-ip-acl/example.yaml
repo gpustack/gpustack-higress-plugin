@@ -22,7 +22,7 @@ spec:
   #        400 token-usage → 100 ai-proxy
   phase: AUTHN
   priority: 350
-  url: oci://<your-registry>/<your-org>/gpustack-ip-acl:0.1.0
+  url: oci://<your-registry>/<your-org>/gpustack-ip-acl:0.2.0
   sha256: "<sha256-digest>"
   defaultConfigDisable: false
 
@@ -33,12 +33,23 @@ spec:
     # and each GPUStack API key maps to a consumer, so per-consumer rules
     # equal the enterprise per-API-key IP ACL granularity.
 
-    # ⚠️ Leave realIPHeader UNSET unless a trusted proxy in front of the
-    # gateway OVERWRITES (not appends to) the header. The first value of a
-    # comma-separated list is used; with X-Forwarded-For and no trusted
-    # overwriting proxy, a client reaching the gateway directly can spoof
-    # its source IP and bypass the ACL. When unset, the plugin uses Envoy's
-    # downstream source address, which cannot be spoofed.
+    # Client IP resolution:
+    #   - Default (no realIPFrom): the connection's source address — a
+    #     proxy-wasm property the client can neither set nor influence, so
+    #     header spoofing cannot reach the ACL.
+    #   - realIPFrom set: realIPHeader is honored ONLY when the downstream
+    #     connection arrives from one of these networks — the peer is then a
+    #     proxy the operator declared as asserting addresses correctly. A
+    #     comma-separated value is walked from the right through realIPFrom
+    #     entries (the addresses trusted proxies appended); the first entry
+    #     outside them is the client. Declare both or neither: realIPHeader
+    #     without realIPFrom is never read.
+    #     ⚠️ Every network in realIPFrom must belong to a proxy that appends
+    #     X-Forwarded-For (or overwrites it with the address it observed)
+    #     itself — one that passes a client-supplied header through verbatim
+    #     re-opens the spoof.
+    # realIPFrom:
+    #   - "10.0.0.0/8"
     # realIPHeader: "x-forwarded-for"
 
     # Per-consumer rule sets:
