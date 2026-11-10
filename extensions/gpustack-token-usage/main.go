@@ -83,6 +83,7 @@ const (
 
 	IncompleteChunk     = "gpustack_incomplete_chunk"
 	IncompleteChunkData = "gpustack_incomplete_chunk_data"
+	RawStreamBuffer     = "gpustack_raw_stream_buffer"
 	UsageExtraKey       = "gpustack_usage_extra"
 	SeenUsageChunk      = "gpustack_seen_usage_chunk"
 	ProcessedUsageChunk = "gpustack_processed_usage_chunk"
@@ -894,7 +895,7 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		return data
 	}
 
-	result := processTokenUsage(ctx, data, config.MaxResponseBodyBytes)
+	result := processTokenUsage(ctx, data, config.MaxResponseBodyBytes, endOfStream)
 	if endOfStream {
 		ctx.SetContext(ResponseCompletedKey, true)
 		if ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
@@ -1053,7 +1054,225 @@ func onHttpStreamDone(ctx wrapper.HttpContext, config PluginConfig) {
 	reportMetrics(ctx, config)
 }
 
-func processTokenUsage(ctx wrapper.HttpContext, data []byte, maxBufferBytes int) []byte {
+// sseEventBoundaryPatterns lists every raw encoding of the blank line that
+// terminates an SSE event: the previous line's terminator ("\n", "\r" or
+// "\r\n" are all legal per the SSE spec) followed by the blank line's own
+// terminator. Note "\r"+"\n" is absent on purpose: that concatenation is a
+// plain CRLF line ending, which per the SSE spec is one line break and can
+// never terminate an event. Detection must run on raw bytes — normalizing
+// first would turn a "\r" delivered alone at the end of a chunk into "\n"
+// and fabricate a boundary mid-event.
+var sseEventBoundaryPatterns = [][]byte{
+	[]byte("\n\n"),   // LF line + LF blank
+	[]byte("\n\r"),   // LF line + CR blank
+	[]byte("\n\r\n"), // LF line + CRLF blank
+	[]byte("\r\r"),   // CR line + CR blank
+	[]byte("\r\r\n"), // CR line + CRLF blank
+	[]byte("\r\n\n"), // CRLF line + LF blank
+	[]byte("\r\n\r"), // CRLF line + CR blank
+	[]byte("\r\n\r\n"),
+}
+
+// scanEventBoundary returns the end offset (exclusive) of the first (last
+// when last=true) event boundary in b, or -1 when none exists.
+func scanEventBoundary(b []byte, last bool) int {
+	best := -1
+	for _, p := range sseEventBoundaryPatterns {
+		var i int
+		if last {
+			i = bytes.LastIndex(b, p)
+		} else {
+			i = bytes.Index(b, p)
+		}
+		if i < 0 {
+			continue
+		}
+		if last {
+			if end := i + len(p); end > best {
+				best = end
+			}
+		} else if best < 0 || i < best {
+			best = i
+		}
+	}
+	if best < 0 {
+		return -1
+	}
+	if !last {
+		for _, p := range sseEventBoundaryPatterns {
+			if bytes.HasPrefix(b[best:], p) {
+				return best + len(p)
+			}
+		}
+	}
+	return best
+}
+
+// delimiterHoldbackLen returns the length (1–3) of the longest suffix of b
+// that is a strict prefix of some event-boundary pattern, or 0. While in
+// passthrough, such a suffix must be held for the next callback so a
+// delimiter split across callbacks ("\r\n\r" | "\n") is scanned whole.
+func delimiterHoldbackLen(b []byte) int {
+	for n := 3; n >= 1; n-- {
+		if len(b) < n {
+			continue
+		}
+		sfx := b[len(b)-n:]
+		for _, p := range sseEventBoundaryPatterns {
+			if len(p) > n && bytes.HasPrefix(p, sfx) {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// flushLeadingCommentLines splits raw held bytes with no event boundary into
+// a prefix of complete comment lines (": keep-alive", safe to forward
+// immediately — they are never rewritten; terminating blank lines likewise)
+// and the remainder to keep holding. Without this, a backend sending only
+// heartbeat comments during a long prefill would starve the client until
+// the next data event.
+func flushLeadingCommentLines(raw []byte) (emit, hold []byte) {
+	i := 0
+	for i < len(raw) {
+		nl := bytes.IndexByte(raw[i:], '\n')
+		cr := bytes.IndexByte(raw[i:], '\r')
+		var lineEnd int
+		switch {
+		case cr >= 0 && (nl < 0 || cr < nl):
+			if i+cr == len(raw)-1 {
+				// Trailing lone "\r": could be half of a CRLF; hold it.
+				return raw[:i], raw[i:]
+			}
+			if raw[i+cr+1] == '\n' {
+				lineEnd = i + cr + 1
+			} else {
+				lineEnd = i + cr
+			}
+		case nl >= 0:
+			lineEnd = i + nl
+		default:
+			return raw[:i], raw[i:]
+		}
+		line := raw[i:lineEnd]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		// Empty lines are flushable too: in this no-boundary branch they can
+		// only be the blank line terminating an event whose preceding line
+		// was flushed in an earlier callback (any blank line contiguous with
+		// its predecessor is caught by the boundary scan instead), so
+		// forwarding it verbatim preserves both bytes and framing and keeps
+		// later heartbeat comments from piling up behind it.
+		if len(line) > 0 && line[0] != ':' {
+			return raw[:i], raw[i:]
+		}
+		i = lineEnd + 1
+	}
+	return raw, nil
+}
+
+// sseStreamBufferer is the raw-byte reassembly state for processTokenUsage.
+// Pure (no host calls) so it is unit-testable; one instance lives in the
+// request ctx under RawStreamBuffer.
+type sseStreamBufferer struct {
+	// raw holds the un-normalized trailing bytes after the last complete
+	// event boundary, prepended to the next chunk verbatim.
+	raw []byte
+	// pass is set when an oversized event gave up on reassembly: everything
+	// is forwarded verbatim until the next event boundary is seen, since the
+	// rewrite loop must never touch a partially-delivered event.
+	pass bool
+}
+
+// feed incorporates one streaming-body callback and returns what to emit, in
+// order: pre (bytes to forward untouched before the events), complete (the
+// normalized run of complete events to feed the rewrite loop), post (bytes
+// to forward untouched after them). Nil means "nothing" for each.
+func (s *sseStreamBufferer) feed(chunk []byte, endOfStream bool, maxBytes int) (pre, complete, post []byte) {
+	if s.pass {
+		if len(s.raw) > 0 {
+			carried := make([]byte, len(s.raw)+len(chunk))
+			copy(carried, s.raw)
+			copy(carried[len(s.raw):], chunk)
+			chunk = carried
+			s.raw = nil
+		}
+		end := scanEventBoundary(chunk, false)
+		if end < 0 {
+			if endOfStream {
+				s.pass = false
+				return chunk, nil, nil
+			}
+			// Hold back any trailing bytes that could begin a delimiter, so
+			// one split across callbacks is detected on the next call.
+			if n := delimiterHoldbackLen(chunk); n > 0 {
+				s.raw = bytes.Clone(chunk[len(chunk)-n:])
+				return chunk[:len(chunk)-n], nil, nil
+			}
+			return chunk, nil, nil
+		}
+		// Boundary reached: the oversized event is fully delivered; resume
+		// normal handling for the bytes that follow it (endOfStream included:
+		// a final usage event after the terminator still gets accounted).
+		s.pass = false
+		v, c, v2 := s.feed(chunk[end:], endOfStream, maxBytes)
+		pre = chunk[:end]
+		if v != nil {
+			merged := make([]byte, len(pre)+len(v))
+			copy(merged, pre)
+			copy(merged[len(pre):], v)
+			pre = merged
+		}
+		return pre, c, v2
+	}
+
+	raw := make([]byte, len(s.raw)+len(chunk))
+	copy(raw, s.raw)
+	copy(raw[len(s.raw):], chunk)
+	s.raw = nil
+
+	if endOfStream {
+		return nil, wrapper.UnifySSEChunk(raw), nil
+	}
+	if end := scanEventBoundary(raw, true); end >= 0 {
+		tail := raw[end:]
+		if maxBytes > 0 && len(tail) > maxBytes {
+			// Single pending event too large to buffer: forward it verbatim
+			// (fail-open, its usage goes unprocessed) and keep forwarding
+			// verbatim until its terminator arrives. The tail is emitted as
+			// post so stream order is preserved, and any delimiter-prefix
+			// suffix it ends with is held back for the next callback.
+			s.pass = true
+			post = tail
+			if n := delimiterHoldbackLen(tail); n > 0 {
+				s.raw = bytes.Clone(tail[len(tail)-n:])
+				post = tail[:len(tail)-n]
+			}
+			return nil, wrapper.UnifySSEChunk(raw[:end]), post
+		}
+		s.raw = bytes.Clone(tail)
+		return nil, wrapper.UnifySSEChunk(raw[:end]), nil
+	}
+	if maxBytes > 0 && len(raw) > maxBytes {
+		// No boundary at all and already oversized: same fail-open passthrough.
+		s.pass = true
+		if n := delimiterHoldbackLen(raw); n > 0 {
+			s.raw = bytes.Clone(raw[len(raw)-n:])
+			return nil, nil, raw[:len(raw)-n]
+		}
+		return nil, nil, raw
+	}
+	emit, hold := flushLeadingCommentLines(raw)
+	s.raw = hold
+	if len(emit) == 0 {
+		return nil, nil, nil
+	}
+	return emit, nil, nil
+}
+
+func processTokenUsage(ctx wrapper.HttpContext, data []byte, maxBufferBytes int, endOfStream bool) []byte {
 	requestStartTime, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
 		return data
@@ -1064,7 +1283,50 @@ func processTokenUsage(ctx wrapper.HttpContext, data []byte, maxBufferBytes int)
 		ctx.SetContext(TimeToFirstTokenDuration, firstTokenTime-requestStartTime)
 		proxywasm.LogDebugf("processTokenUsage: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
 	}
-	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
+
+	// Raw-byte level buffering BEFORE any "\n\n" splitting (gpustack#6748).
+	// A TCP/TLS delivery boundary landing inside the event separator used to
+	// hand the loop below a "chunk" that was really the tail of one event
+	// plus a 1–4 byte fragment of the next; splitSSEEvent then classified the
+	// fragment as a reorderable prefix line, re-emitted it ahead of the usage
+	// event, and dropped the terminator — gluing two SSE events into one line
+	// on the wire. sseStreamBufferer holds back everything after the last
+	// complete event boundary (raw, un-normalized, so a CRLF split across
+	// callbacks cannot fabricate a false boundary) and prepends it to the
+	// next chunk, so bytes are never reordered and no terminator is ever
+	// synthesized or dropped.
+	buf, _ := ctx.GetContext(RawStreamBuffer).(*sseStreamBufferer)
+	if buf == nil {
+		buf = &sseStreamBufferer{}
+	}
+	pre, complete, post := buf.feed(data, endOfStream, maxBufferBytes)
+	if endOfStream {
+		ctx.SetContext(RawStreamBuffer, nil)
+	} else {
+		ctx.SetContext(RawStreamBuffer, buf)
+	}
+	if pre == nil && complete == nil && post == nil {
+		return []byte{}
+	}
+	var out []byte
+	if complete != nil {
+		out = rewriteCompleteSSEEvents(ctx, complete, maxBufferBytes)
+	}
+	// Emit in stream order: verbatim prefix, rewritten events, verbatim tail.
+	total := len(pre) + len(out) + len(post)
+	merged := make([]byte, 0, total)
+	merged = append(merged, pre...)
+	merged = append(merged, out...)
+	merged = append(merged, post...)
+	return merged
+}
+
+// rewriteCompleteSSEEvents is the per-event loop of processTokenUsage:
+// observation (delta counting, usage capture) plus the usage-rewrite path,
+// applied to a byte range known to contain only complete, "\n\n"-terminated
+// events (or, at end of stream, a final event that may lack its terminator).
+func rewriteCompleteSSEEvents(ctx wrapper.HttpContext, combined []byte, maxBufferBytes int) []byte {
+	chunks := bytes.SplitSeq(combined, []byte("\n\n"))
 	var rtn = [][]byte{}
 	for chunk := range chunks {
 		chunk = mergeLargeUsageChunks(ctx, chunk, maxBufferBytes)
