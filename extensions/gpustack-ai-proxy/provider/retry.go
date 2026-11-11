@@ -138,11 +138,20 @@ func (c *ProviderConfig) sendRetryRequest(
 	ctx.SetContext(c.failover.ctxApiTokenInUse, apiTokenInUse)
 	requestBody := ctx.GetByteSliceContext(CtxRequestBody, []byte(""))
 	log.Debugf("get original requestBody:%s", requestBody)
-	modifiedHeaders, modifiedBody, err := c.transformRequestHeadersAndBody(ctx, activeProvider, [][2]string{
+	retryHeaders := [][2]string{
 		{"content-type", "application/json"},
 		{":authority", ctx.GetStringContext(CtxRequestHost, "")},
 		{":path", ctx.GetStringContext(CtxRequestPath, "")},
-	}, requestBody)
+	}
+	// GPUStack-local: carry over the gpustack-lb chosen cluster so that a
+	// retried request still routes via cluster_header to the selected worker
+	// and keeps the cluster-based Host attribution. Without this the rebuilt
+	// headers lose x-higress-target-cluster and the retry would fall back to
+	// api.openai.com.
+	if cluster, err := proxywasm.GetHttpRequestHeader(TargetClusterHeader); err == nil && cluster != "" {
+		retryHeaders = append(retryHeaders, [2]string{TargetClusterHeader, cluster})
+	}
+	modifiedHeaders, modifiedBody, err := c.transformRequestHeadersAndBody(ctx, activeProvider, retryHeaders, requestBody)
 	if err != nil {
 		return fmt.Errorf("sendRetryRequest failed to transform request headers and body: %v", err)
 	}

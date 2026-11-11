@@ -199,6 +199,8 @@ func RunOpenAIOnHttpRequestHeadersTests(t *testing.T) {
 			// 验证Host是否被改为OpenAI默认域名
 			hostValue, hasHost := test.GetHeaderValue(requestHeaders, ":authority")
 			require.True(t, hasHost, "Host header should exist")
+			// GPUStack-local: without openaiCustomUrl or a gpustack-lb target
+			// cluster, the default OpenAI domain is used, as upstream does.
 			require.Equal(t, "api.openai.com", hostValue, "Host should be changed to OpenAI default domain")
 
 			// 验证Authorization是否被设置
