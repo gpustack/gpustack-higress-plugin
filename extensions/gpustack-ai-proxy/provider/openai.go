@@ -22,6 +22,11 @@ import (
 
 const (
 	defaultOpenaiDomain = "api.openai.com"
+
+	// TargetClusterHeader mirrors gpustack-lb's targetClusterHeader
+	// (extensions/gpustack-lb/finisher.go), which selects the upstream via
+	// Envoy cluster_header routing. Keep the two in sync.
+	TargetClusterHeader = "x-higress-target-cluster"
 )
 
 type openaiProviderInitializer struct{}
@@ -143,6 +148,14 @@ func (m *openaiProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiNam
 
 	if m.customDomain != "" {
 		util.OverwriteRequestHostHeader(headers, m.customDomain)
+	} else if cluster := headers.Get(TargetClusterHeader); cluster != "" {
+		// GPUStack-local: gpustack-lb selects the upstream via Envoy
+		// cluster_header (x-higress-target-cluster), so the Host header plays no
+		// role in routing here. Attributing the request to the chosen cluster
+		// keeps worker-side traffic attribution accurate.
+		sanitizedCluster := strings.ReplaceAll(cluster, "|", "-")
+		util.OverwriteRequestHostHeader(headers, sanitizedCluster)
+		log.Debugf("[openaiProvider.TransformRequestHeaders] Set host to target cluster: %s", sanitizedCluster)
 	} else {
 		util.OverwriteRequestHostHeader(headers, defaultOpenaiDomain)
 	}
