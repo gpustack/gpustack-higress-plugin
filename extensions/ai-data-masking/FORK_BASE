@@ -1,0 +1,10 @@
+# Upstream base for this vendored fork. Update only via a full re-sync.
+repo=https://github.com/higress-group/higress
+# latest commit touching plugins/wasm-rust/extensions/ai-data-masking at fork time
+commit=27debc8b
+path=plugins/wasm-rust/extensions/ai-data-masking
+upstream_version=2.0.3
+# higress-wasm-rust SDK crate is vendored under ./higress-wasm-rust
+# (upstream path plugins/wasm-rust, dep path changed from "../../" to "./higress-wasm-rust")
+sdk_repo=https://github.com/higress-group/higress
+sdk_path=plugins/wasm-rust
