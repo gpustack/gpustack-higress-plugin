@@ -63,6 +63,9 @@ struct AiDataMasking {
     mask_map: HashMap<String, Option<String>>,
     is_openai: bool,
     is_openai_stream: Option<bool>,
+    // latched once a mid-stream deny terminated the response; subsequent
+    // body callbacks must be suppressed so buffered text cannot leak
+    denied: bool,
     stream: bool,
     log: Log,
     msg_window: MsgWindow,
@@ -220,6 +223,11 @@ struct Message {
     content: String,
     #[serde(default)]
     reasoning_content: String,
+    // vLLM >= 0.30 style chain-of-thought field. Option so that an explicit
+    // "reasoning": null (sent by some clients) does not fail deserialization
+    // of the whole request/response and silently bypass deny checks/masking.
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 #[derive(Debug, Deserialize, Clone)]
 struct Req {
@@ -357,6 +365,7 @@ impl RootContextWrapper<AiDataMaskingConfig> for AiDataMaskingRoot {
             config: None,
             is_openai: false,
             is_openai_stream: None,
+            denied: false,
             stream: false,
             msg_window: MsgWindow::default(),
             log: Log::new(PLUGIN_NAME.to_string()),
@@ -379,9 +388,12 @@ impl AiDataMasking {
             (raw_msg.to_string(), content_type.to_string())
         } else if self.stream {
             (
+                // emit the deny message as a chunk with finish_reason set, then
+                // terminate the SSE stream properly with [DONE]
                 format!(
-                    "data:{}\n\n",
-                    json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": msg}}], "usage": {}})
+                    "data: {0}\n\ndata: {1}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"index": 0, "delta": {"role": "assistant", "content": msg}}], "usage": {}}),
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {}})
                 ),
                 "text/event-stream;charset=UTF-8".to_string(),
             )
@@ -394,7 +406,20 @@ impl AiDataMasking {
     }
     fn deny(&mut self, in_response: bool) -> DataAction {
         if in_response && self.stream {
-            self.replace_http_response_body(&[]);
+            // latch the denied state so subsequent body callbacks (including
+            // the end-of-stream flush) cannot emit buffered text after the
+            // terminator we send here
+            self.denied = true;
+            // mid-stream deny: emit a proper SSE termination (finish_reason +
+            if self.is_openai_stream == Some(true) {
+                let body = format!(
+                    "data: {0}\n\ndata: [DONE]\n\n",
+                    json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": {}})
+                );
+                self.replace_http_response_body(body.as_bytes());
+            } else {
+                self.replace_http_response_body(&[]);
+            }
             return DataAction::Continue;
         }
         let (deny_code, (deny_message, content_type)) = if let Some(config) = &self.config {
@@ -514,6 +539,13 @@ impl HttpContext for AiDataMasking {
         if !self.stream {
             return DataAction::Continue;
         }
+        if self.denied {
+            // stream already terminated by deny; drop everything else,
+            // including the end-of-stream flush, so no buffered text can
+            // be emitted after the terminator
+            self.replace_http_response_body(&[]);
+            return DataAction::Continue;
+        }
         if body_size > 0 {
             if let Some(body) = self.get_http_response_body(0, body_size) {
                 if self.is_openai && self.is_openai_stream.is_none() {
@@ -547,13 +579,14 @@ impl HttpContext for AiDataMasking {
                 }
             }
         }
+        let is_openai_stream = self.is_openai_stream.unwrap_or(false);
         let new_body = if end_of_stream {
-            self.msg_window.finish(self.is_openai_stream.unwrap())
+            self.msg_window.finish(is_openai_stream)
         } else {
             self.msg_window.pop(
                 self.char_window_size * 2,
                 self.byte_window_size * 2,
-                self.is_openai_stream.unwrap(),
+                is_openai_stream,
             )
         };
         self.replace_http_response_body(&new_body);
@@ -600,13 +633,16 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
                 self.is_openai = true;
                 self.stream = req.stream;
                 for msg in req.messages {
+                    let reasoning = msg.reasoning.as_deref().unwrap_or("");
                     if self.check_message(&msg.content)
                         || self.check_message(&msg.reasoning_content)
+                        || self.check_message(reasoning)
                     {
                         return self.deny(false);
                     }
                     let new_content = self.replace_request_msg(&msg.content);
                     let new_reasoning_content = self.replace_request_msg(&msg.reasoning_content);
+                    let new_reasoning = self.replace_request_msg(reasoning);
                     if new_content != msg.content {
                         req_body = req_body.replace(
                             &Value::String(msg.content).to_string(),
@@ -617,6 +653,12 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
                         req_body = req_body.replace(
                             &Value::String(msg.reasoning_content).to_string(),
                             &Value::String(new_reasoning_content).to_string(),
+                        );
+                    }
+                    if new_reasoning != reasoning {
+                        req_body = req_body.replace(
+                            &Value::String(reasoning.to_string()).to_string(),
+                            &Value::String(new_reasoning).to_string(),
                         );
                     }
                 }
@@ -680,8 +722,10 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
             if let Ok(res) = serde_json::from_str::<Res>(res_body.as_str()) {
                 for msg in res.choices {
                     if let Some(message) = msg.message {
+                        let reasoning = message.reasoning.as_deref().unwrap_or("");
                         if self.check_message(&message.content)
                             || self.check_message(&message.reasoning_content)
+                            || self.check_message(reasoning)
                         {
                             return self.deny(true);
                         }
@@ -691,11 +735,13 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
                         }
                         let mut new_content = message.content.clone();
                         let mut new_reasoning_content = message.reasoning_content.clone();
+                        let mut new_reasoning = reasoning.to_string();
                         for (from_word, to_word) in self.mask_map.iter() {
                             if let Some(to) = to_word {
                                 new_content = new_content.replace(from_word, to);
                                 new_reasoning_content =
                                     new_reasoning_content.replace(from_word, to);
+                                new_reasoning = new_reasoning.replace(from_word, to);
                             }
                         }
                         if new_content != message.content {
@@ -708,6 +754,12 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
                             res_body = res_body.replace(
                                 &Value::String(message.reasoning_content).to_string(),
                                 &Value::String(new_reasoning_content).to_string(),
+                            );
+                        }
+                        if new_reasoning != reasoning {
+                            res_body = res_body.replace(
+                                &Value::String(reasoning.to_string()).to_string(),
+                                &Value::String(new_reasoning).to_string(),
                             );
                         }
                     }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use higress_wasm_rust::event_stream::EventStream;
 use serde::Deserialize;
@@ -26,6 +26,7 @@ enum MsgFlag {
     None,
     Content,
     ReasoningContent,
+    Reasoning,
 }
 impl Default for MsgFlag {
     fn default() -> Self {
@@ -38,6 +39,9 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    // vLLM >= 0.30 exposes chain-of-thought in delta.reasoning
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 #[derive(Deserialize)]
 struct Choices {
@@ -50,18 +54,27 @@ struct Choices {
 }
 
 impl Delta {
-    fn get_flag_msg(&self, default_flag: &MsgFlag) -> (MsgFlag, &[u8]) {
+    /// Iterate over every populated text field in this delta. A chunk may
+    /// carry both content and reasoning (e.g. at the reasoning-to-content
+    /// transition), so callers must process each one instead of picking one.
+    fn fields(&self) -> Vec<(MsgFlag, &str)> {
+        let mut ret = Vec::new();
         if let Some(msg) = &self.content {
             if !msg.is_empty() {
-                return (MsgFlag::Content, msg.as_bytes());
+                ret.push((MsgFlag::Content, msg.as_str()));
             }
         }
         if let Some(msg) = &self.reasoning_content {
             if !msg.is_empty() {
-                return (MsgFlag::ReasoningContent, msg.as_bytes());
+                ret.push((MsgFlag::ReasoningContent, msg.as_str()));
             }
         }
-        (*default_flag, &[])
+        if let Some(msg) = &self.reasoning {
+            if !msg.is_empty() {
+                ret.push((MsgFlag::Reasoning, msg.as_str()));
+            }
+        }
+        ret
     }
 }
 const USAGE_PATH: &str = "usage";
@@ -76,17 +89,31 @@ struct MessageWindowOpenAi {
     flag: MsgFlag,
     last_value: Value,
     finish_reason: Option<String>,
+    // raw chunks carrying structured payloads (tool_calls / function_call /
+    // audio) queued for re-emission untouched, in arrival order
+    passthrough: VecDeque<Value>,
+}
+
+/// Structured delta payloads are not text: masking rules must not apply and
+/// fragments must be re-emitted as-is, or function calling breaks.
+fn is_passthrough_delta(delta: &Value) -> bool {
+    delta.as_object().is_some_and(|o| {
+        o.contains_key("tool_calls") || o.contains_key("function_call") || o.contains_key("audio")
+    })
 }
 
 impl MessageWindowOpenAi {
-    fn update(
-        &mut self,
-        data: &[u8],
-        flag: MsgFlag,
-        value: &Value,
-        finish_reason: &Option<String>,
-    ) {
+    /// Capture per-choice metadata. Called for every choice chunk, even
+    /// terminal ones (`delta: null` or empty) that carry no text, so that
+    /// finish_reason (stop/length/tool_calls/...) is never lost.
+    fn capture(&mut self, value: &Value, finish_reason: &Option<String>) {
         self.last_value = value.clone();
+        if let Some(fr) = finish_reason {
+            self.finish_reason = Some(fr.clone());
+        }
+    }
+
+    fn update(&mut self, data: &[u8], flag: MsgFlag) {
         if data.is_empty() {
             return;
         }
@@ -99,9 +126,10 @@ impl MessageWindowOpenAi {
             self.ret_messages.push((last_flag, msg));
         }
         self.message_window.update(data);
-        if let Some(fr) = finish_reason {
-            self.finish_reason = Some(fr.clone());
-        }
+    }
+
+    fn push_passthrough(&mut self, choice_value: Value) {
+        self.passthrough.push_back(choice_value);
     }
 
     fn gen_value(&self, flag: &MsgFlag, msg: &[u8], finish: bool) -> Value {
@@ -111,12 +139,24 @@ impl MessageWindowOpenAi {
                 ret["delta"]["content"] = Value::String(String::from_utf8_lossy(msg).to_string());
                 if let Some(m) = ret["delta"].as_object_mut() {
                     m.remove("reasoning_content");
+                    m.remove("reasoning");
                 }
             }
             MsgFlag::ReasoningContent => {
                 ret["delta"]["reasoning_content"] =
                     Value::String(String::from_utf8_lossy(msg).to_string());
                 ret["delta"]["content"] = Value::String(String::new());
+                if let Some(m) = ret["delta"].as_object_mut() {
+                    m.remove("reasoning");
+                }
+            }
+            MsgFlag::Reasoning => {
+                ret["delta"]["reasoning"] =
+                    Value::String(String::from_utf8_lossy(msg).to_string());
+                ret["delta"]["content"] = Value::String(String::new());
+                if let Some(m) = ret["delta"].as_object_mut() {
+                    m.remove("reasoning_content");
+                }
             }
             _ => {}
         }
@@ -141,6 +181,9 @@ impl MessageWindowOpenAi {
 
     fn pop(&mut self, char_window_size: usize, byte_window_size: usize) -> Vec<Value> {
         let mut ret = self.messages_to_value();
+        // re-emit queued structured payloads (tool_calls fragments etc.)
+        // untouched, preserving arrival order among themselves
+        ret.extend(self.passthrough.drain(..));
 
         let msg = self.message_window.pop(char_window_size, byte_window_size);
         if !msg.is_empty() {
@@ -151,6 +194,9 @@ impl MessageWindowOpenAi {
     }
     fn finish(&mut self) -> Vec<Value> {
         let mut ret = self.messages_to_value();
+        // structured payloads first, then the terminal chunk carrying
+        // finish_reason (stop/length/tool_calls/...)
+        ret.extend(self.passthrough.drain(..));
         let msg = self.message_window.finish();
         let flag = core::mem::replace(&mut self.flag, MsgFlag::None);
         ret.push(self.gen_value(&flag, &msg, true));
@@ -188,10 +234,20 @@ impl MsgWindow {
                     if let Some(a) = v.as_array() {
                         for item in a {
                             if let Ok(c) = serde_json::from_value::<Choices>(item.clone()) {
+                                let mw = self.message_windows.entry(c.index).or_default();
+                                // capture terminal metadata even when the
+                                // choice carries no text (delta null/empty)
+                                mw.capture(item, &c.finish_reason);
+                                // structured payloads are queued for
+                                // untouched re-emission instead of being fed
+                                // into the masking text window
+                                if item.get("delta").is_some_and(is_passthrough_delta) {
+                                    mw.push_passthrough(item.clone());
+                                }
                                 if let Some(d) = &c.delta {
-                                    let mw = self.message_windows.entry(c.index).or_default();
-                                    let (flag, msg) = d.get_flag_msg(&mw.flag);
-                                    mw.update(msg, flag, item, &c.finish_reason);
+                                    for (flag, msg) in d.fields() {
+                                        mw.update(msg.as_bytes(), flag);
+                                    }
                                 }
                             }
                         }
@@ -199,7 +255,7 @@ impl MsgWindow {
                 }
             }
             None
-        } else if event.starts_with(b"data: [DONE]") {
+        } else if event.starts_with(b"data: [DONE]") || event.starts_with(b"data:[DONE]") {
             None
         } else {
             Some(event)
@@ -261,6 +317,9 @@ impl MsgWindow {
                 ret.extend(format!("data: {}\n\n", ret_value).as_bytes())
             }
         }
+        // upstream [DONE] events are consumed (and dropped) in update_event,
+        // so terminate the reconstructed stream explicitly
+        ret.extend(b"data: [DONE]\n\n");
         ret
     }
     pub(crate) fn messages_iter_mut(&mut self) -> impl Iterator<Item = &mut Vec<u8>> {
@@ -287,9 +346,10 @@ mod tests {
     }
 
     impl Res {
-        fn get_text(&self) -> (String, String) {
+        fn get_text(&self) -> (String, String, String) {
             let mut content = String::new();
             let mut reasoning_content = String::new();
+            let mut reasoning = String::new();
             for choice in self.choices.iter() {
                 if let Some(delta) = &choice.delta {
                     if let Some(c) = &delta.content {
@@ -298,16 +358,18 @@ mod tests {
                     if let Some(rc) = &delta.reasoning_content {
                         reasoning_content += rc;
                     }
+                    if let Some(r) = &delta.reasoning {
+                        reasoning += r;
+                    }
                 }
             }
-            (content, reasoning_content)
+            (content, reasoning_content, reasoning)
         }
     }
 
-    #[test]
-    fn test_msg() {
+    fn run_masking_roundtrip(file_name: &str, use_reasoning_field: bool) {
         let mut msg_win = MsgWindow::default();
-        let data = raw_message("raw_message.txt");
+        let data = raw_message(file_name);
         let mut buffer = Vec::new();
         for line in data.split("\n") {
             msg_win.push(line.as_bytes(), true);
@@ -325,24 +387,136 @@ mod tests {
         buffer.extend(msg_win.finish(true));
         let mut message = String::new();
         let mut reasoning_message = String::new();
+        let mut reasoning_field_message = String::new();
+        let mut saw_done = false;
         for line in buffer.split(|&x| x == b'\n') {
             if line.is_empty() {
                 continue;
             }
             assert!(line.starts_with(b"data:"));
             if line.starts_with(b"data: [DONE]") {
+                saw_done = true;
                 continue;
             }
             let des = serde_json::from_slice::<Res>(&line[b"data:".len()..]);
             assert!(des.is_ok());
             let res = des.unwrap();
-            let (c, rc) = res.get_text();
+            let (c, rc, r) = res.get_text();
             message.push_str(&c);
             reasoning_message.push_str(&rc);
+            reasoning_field_message.push_str(&r);
         }
+        assert!(saw_done, "stream must be terminated with [DONE]");
         let res = "***higress*** 是一个基于 Istio 的高性能服务网格数据平面项目，旨在提供高吞吐量、低延迟和可扩展的服务通信管理。它为企业级应用提供了丰富的流量治理功能，如负载均衡、熔断、限流等，并支持多协议代理（包括 HTTP/1.1, HTTP/2, gRPC）。***higress*** 的设计目标是优化 Istio 在大规模集群中的性能表现，满足高并发场景下的需求。";
         assert_eq!(message, res);
-        assert_eq!(reasoning_message, res);
+        // the chain-of-thought roundtrips through whichever field the upstream
+        // uses (reasoning_content for qwen2.5/ollama, reasoning for vLLM >= 0.30)
+        if use_reasoning_field {
+            assert_eq!(reasoning_field_message, res);
+            assert_eq!(reasoning_message, "");
+        } else {
+            assert_eq!(reasoning_message, res);
+            assert_eq!(reasoning_field_message, "");
+        }
+    }
+
+    #[test]
+    fn test_msg() {
+        // qwen2.5 / ollama style: delta.reasoning_content
+        run_masking_roundtrip("raw_message.txt", false);
+    }
+
+    #[test]
+    fn test_msg_reasoning_field() {
+        // vLLM >= 0.30 style: delta.reasoning
+        run_masking_roundtrip("raw_message_reasoning.txt", true);
+    }
+
+    #[test]
+    fn test_msg_tool_calls() {
+        // function calling: delta.tool_calls fragments must be re-emitted
+        // untouched (id/name/arguments pieces in order) and the terminal
+        // empty-delta chunk must keep finish_reason = "tool_calls"
+        let mut msg_win = MsgWindow::default();
+        let data = raw_message("raw_message_tool_calls.txt");
+        let mut buffer = Vec::new();
+        for line in data.split("\n") {
+            msg_win.push(line.as_bytes(), true);
+            msg_win.push(b"\n\n", true);
+            buffer.extend(msg_win.pop(7, 7, true));
+        }
+        buffer.extend(msg_win.finish(true));
+
+        let mut tool_call_ids = Vec::new();
+        let mut function_names = Vec::new();
+        let mut arguments = String::new();
+        let mut finish_reasons = Vec::new();
+        let mut saw_done = false;
+        for line in buffer.split(|&x| x == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            assert!(line.starts_with(b"data:"));
+            if line.starts_with(b"data: [DONE]") {
+                saw_done = true;
+                continue;
+            }
+            let value: Value =
+                serde_json::from_slice(&line[b"data:".len()..]).expect("valid json chunk");
+            if let Some(choices) = value.get("choices").and_then(|c| c.as_array()) {
+                for choice in choices {
+                    if let Some(fr) = choice.get("finish_reason") {
+                        if !fr.is_null() {
+                            finish_reasons.push(fr.as_str().unwrap_or("").to_string());
+                        }
+                    }
+                    if let Some(tcs) = choice
+                        .get("delta")
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(|t| t.as_array())
+                    {
+                        for tc in tcs {
+                            if let Some(id) =
+                                tc.get("id").and_then(|v| v.as_str())
+                            {
+                                tool_call_ids.push(id.to_string());
+                            }
+                            if let Some(name) = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                function_names.push(name.to_string());
+                            }
+                            if let Some(args) = tc
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|v| v.as_str())
+                            {
+                                arguments.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_done, "stream must be terminated with [DONE]");
+        assert_eq!(
+            tool_call_ids,
+            vec!["call_abc123".to_string()],
+            "tool call id must survive"
+        );
+        assert_eq!(
+            function_names,
+            vec!["get_weather".to_string()],
+            "function name must survive"
+        );
+        assert_eq!(arguments, "{\"city\": \"北京\"}");
+        assert!(
+            finish_reasons.contains(&"tool_calls".to_string()),
+            "finish_reason tool_calls must be preserved, got {:?}",
+            finish_reasons
+        );
     }
 
     fn raw_message(file_name: &str) -> String {
