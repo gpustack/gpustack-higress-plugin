@@ -44,15 +44,16 @@ remote_plugins:
   # are drop-in replacements covering both their behaviour and the missing
   # multipart/form-data support.
 
+  # ai-data-masking is no longer fetched from upstream — it is forked and built
+  # locally under extensions/ai-data-masking (wasm-rust) to support vLLM 0.30's
+  # streaming delta.reasoning field and to fix the deny-word streaming response
+  # missing [DONE]/finish_reason.
+  # Upstream base commit is recorded in extensions/ai-data-masking/FORK_BASE.
+
   - source: transformer:2.0.0
     name: transformer
     version: 2.0.0
     digest: sha256:40ff2e000dcfd94da76c36593bdfd50f4d0f094309c013732da8e1c35171f321
-
-  - source: ai-data-masking:2.0.3
-    name: ai-data-masking
-    version: 2.0.3
-    digest: sha256:f792b1a0a16c69fff36fcc199df47739fc0d4054f182e9e2b6d45e89ead1c8ee
 
   # Use full OCI URL to override default registry
   # - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0

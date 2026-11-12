@@ -1,0 +1,43 @@
+# Generic Dockerfile for building wasm-rust plugins (no local Rust toolchain
+# needed). Used by extensions/Makefile; the build CONTEXT is the plugin
+# directory (e.g. extensions/ai-data-masking):
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.rust \
+#       --platform linux/amd64 --output dist extensions/ai-data-masking
+#
+# Toolchain: rust:1.82 + wasm32-wasip1; the C toolchain needed by native deps
+# (e.g. onig_sys via grok) comes from apt only (clang/llvm/lld from bookworm,
+# wasi-libc headers from trixie -- arch:all, no deps, safe to mix).
+# Note: for wasm targets clang does NOT search <sysroot>/usr/include, so the
+# wasi headers are passed explicitly via -isystem below.
+FROM rust:1.82 AS builder
+WORKDIR /workspace
+# Optional proxy injection (empty by default, no effect). Normally NOT needed.
+ARG PROXY
+ENV http_proxy=${PROXY} https_proxy=${PROXY} \
+    HTTP_PROXY=${PROXY} HTTPS_PROXY=${PROXY}
+RUN rustup target add wasm32-wasip1 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang llvm lld \
+    && echo 'deb http://deb.debian.org/debian trixie main' > /etc/apt/sources.list.d/trixie.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends -t trixie wasi-libc \
+    && rm /etc/apt/sources.list.d/trixie.list \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+ENV CC_wasm32_wasip1=clang \
+    AR_wasm32_wasip1=llvm-ar \
+    CFLAGS_wasm32_wasip1="--target=wasm32-wasi -isystem /usr/include/wasm32-wasi"
+
+FROM builder AS test
+# cargo test runs on the host (linux/amd64) target
+RUN cargo test
+
+FROM builder AS release
+RUN cargo build --target wasm32-wasip1 --release \
+    && cp target/wasm32-wasip1/release/*.wasm /main.wasm \
+    && cargo clean
+
+FROM scratch AS output
+COPY --from=release /main.wasm plugin.wasm

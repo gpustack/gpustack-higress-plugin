@@ -17,8 +17,31 @@ WORKDIR /project
 COPY extensions/ extensions/
 
 # Build all local Go plugins (PYTHON=true skips metadata generation — done in whl-builder)
-RUN cd extensions && make build-all PYTHON=true && \
+RUN cd extensions && make build-all RUNTIME=go PYTHON=true && \
     rm -rf */*.go */go.mod */go.sum
+
+# Stage 1b: Build Rust plugins (wasm-rust; no Docker daemon available here,
+# so cargo runs directly via CARGO_DIRECT=1)
+FROM rust:1.82 AS rust-builder
+RUN rustup target add wasm32-wasip1 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang llvm lld \
+    && echo 'deb http://deb.debian.org/debian trixie main' > /etc/apt/sources.list.d/trixie.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends -t trixie wasi-libc \
+    && rm /etc/apt/sources.list.d/trixie.list \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC_wasm32_wasip1=clang \
+    AR_wasm32_wasip1=llvm-ar \
+    CFLAGS_wasm32_wasip1="--target=wasm32-wasi -isystem /usr/include/wasm32-wasi"
+
+WORKDIR /project
+
+COPY extensions/ extensions/
+
+# Build all local Rust plugins (PYTHON=true skips metadata generation)
+RUN cd extensions && make build-all RUNTIME=rust PYTHON=true CARGO_DIRECT=1 && \
+    rm -rf */target
 
 # Stage 2: Build Python wheel package
 FROM python:3.11-slim AS whl-builder
@@ -41,6 +64,9 @@ COPY --from=go-builder /project/extensions/ ./extensions/
 
 # Copy built Go plugins from builder stage
 COPY --from=go-builder /project/gpustack_higress_plugins/plugins ./gpustack_higress_plugins/plugins
+
+# Copy built Rust plugins from rust-builder stage (merged into the same dir)
+COPY --from=rust-builder /project/gpustack_higress_plugins/plugins ./gpustack_higress_plugins/plugins
 
 # Build wheel package
 # Fetch remote OCI plugins using oras (mounted from official image)

@@ -18,6 +18,20 @@ SCRIPTS_DIR := $(abspath $(EXTENSIONS_DIR)/../scripts)
 # Remote plugins configuration file
 REMOTE_PLUGINS_CONFIG := remote_plugins.yaml
 
+# Generic wasm-rust build Dockerfile (build context = plugin dir)
+RUST_DOCKERFILE := $(abspath $(EXTENSIONS_DIR)/../Dockerfile.rust)
+
+# ---- plugin context (set by .prepare, detected once at parse time) ----
+# A plugin's runtime is decided by its manifest file:
+#   Cargo.toml -> rust (Docker + Dockerfile.rust, no local toolchain needed)
+#   go.mod     -> go   (local Go toolchain, GOOS=wasip1)
+PLUGIN_RUNTIME := $(shell \
+	if [ -n "$(PLUGIN_NAME)" ] && [ -f "$(PLUGIN_NAME)/Cargo.toml" ]; then echo rust; \
+	elif [ -n "$(PLUGIN_NAME)" ] && [ -f "$(PLUGIN_NAME)/go.mod" ]; then echo go; \
+	fi)
+PLUGIN_VERSION := $(strip $(shell cat $(PLUGIN_NAME)/VERSION 2>/dev/null))
+PLUGIN_OUTPUT_DIR = $(OUTPUT_DIR)/$(PLUGIN_NAME)/$(PLUGIN_VERSION)
+
 # ORAS binary for fetching OCI artifacts
 ORAS ?= oras
 
@@ -69,13 +83,18 @@ COLOR_BLUE := \033[34m
 list:
 	@echo "$(COLOR_BOLD)Local plugins:$(COLOR_RESET)"
 	@for dir in */; do \
-		if [ -f "$$dir/go.mod" ]; then \
+		if [ -f "$$dir/go.mod" ] || [ -f "$$dir/Cargo.toml" ]; then \
 			name=$$(basename "$$dir"); \
 			version=$$(cat "$$dir/VERSION" 2>/dev/null || echo "unknown"); \
-			if [ -f "$$dir/.nopackage" ]; then \
-				echo "  - $$name (version: $$version) $(COLOR_YELLOW)[not packaged]$(COLOR_RESET)"; \
+			if [ -f "$$dir/Cargo.toml" ]; then \
+				runtime="rust"; \
 			else \
-				echo "  - $$name (version: $$version)"; \
+				runtime="go"; \
+			fi; \
+			if [ -f "$$dir/.nopackage" ]; then \
+				echo "  - $$name (version: $$version, runtime: $$runtime) $(COLOR_YELLOW)[not packaged]$(COLOR_RESET)"; \
+			else \
+				echo "  - $$name (version: $$version, runtime: $$runtime)"; \
 			fi; \
 		fi; \
 	done
@@ -96,11 +115,12 @@ list-remote:
 		done; \
 	fi
 
-# Build a single plugin
-build:
+# Validate PLUGIN_NAME and set up the plugin context. Runs before build/test.
+# Hidden target (leading dot): always executes, never shows as a file.
+.prepare:
 	@if [ -z "$(PLUGIN_NAME)" ]; then \
 		echo "$(COLOR_YELLOW)Error: PLUGIN_NAME is required$(COLOR_RESET)"; \
-		echo "Usage: make build PLUGIN_NAME=gpustack-token-usage"; \
+		echo "Usage: make $(MAKECMDGOALS) PLUGIN_NAME=gpustack-token-usage"; \
 		exit 1; \
 	fi
 	@if [ ! -d "$(PLUGIN_NAME)" ]; then \
@@ -108,16 +128,70 @@ build:
 		echo "Run 'make list' to see available plugins"; \
 		exit 1; \
 	fi
-	@echo "$(COLOR_GREEN)Building $(PLUGIN_NAME)...$(COLOR_RESET)"
+	@if [ -z "$(PLUGIN_RUNTIME)" ]; then \
+		echo "$(COLOR_YELLOW)Error: '$(PLUGIN_NAME)' has neither go.mod nor Cargo.toml$(COLOR_RESET)"; \
+		exit 1; \
+	fi
+	@echo "$(COLOR_BLUE)Context: plugin=$(PLUGIN_NAME) runtime=$(PLUGIN_RUNTIME) version=$(PLUGIN_VERSION) output=$(PLUGIN_OUTPUT_DIR)$(COLOR_RESET)"
+
+.PHONY: .prepare
+
+# ---- dispatch: pure routing, all logic lives in the *-go / *-rust targets ----
+ifeq ($(PLUGIN_RUNTIME),rust)
+build: .prepare build-rust
+test: .prepare test-rust
+else
+build: .prepare build-go
+test: .prepare test-go
+endif
+
+# Build a wasm-rust plugin in Docker (see Dockerfile.rust at repo root).
+# Set CARGO_DIRECT=1 to run cargo directly (used inside container builds
+# where no Docker daemon is available, e.g. the rust-builder image stage).
+build-rust:
+	@if [ "$(CARGO_DIRECT)" = "1" ]; then \
+		cd $(PLUGIN_NAME) && \
+			cargo build --target wasm32-wasip1 --release && \
+			mkdir -p $(PLUGIN_OUTPUT_DIR) && \
+			cp target/wasm32-wasip1/release/*.wasm $(PLUGIN_OUTPUT_DIR)/plugin.wasm && \
+			cargo clean; \
+	else \
+		cd $(PLUGIN_NAME) && \
+			rm -rf dist && \
+			DOCKER_BUILDKIT=1 docker build \
+				-f $(RUST_DOCKERFILE) \
+				--platform linux/amd64 \
+				--build-arg PROXY=$(PROXY) \
+				--output dist . && \
+			mkdir -p $(PLUGIN_OUTPUT_DIR) && \
+			mv dist/plugin.wasm $(PLUGIN_OUTPUT_DIR)/ && \
+			rm -rf dist; \
+	fi && \
+		$(PYTHON) $(SCRIPTS_DIR)/generate_metadata.py $(PLUGIN_OUTPUT_DIR)/plugin.wasm $(PLUGIN_NAME) && \
+		echo "$(COLOR_GREEN)✓ Built: $(PLUGIN_OUTPUT_DIR)/plugin.wasm$(COLOR_RESET)"
+
+# Build a wasm-go plugin with the local Go toolchain
+build-go:
 	@cd $(PLUGIN_NAME) && \
-		version=$$(cat VERSION) && \
 		go mod download && \
 		GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(BUILD_FLAGS) -o plugin.wasm . && \
-		output_dir="$(OUTPUT_DIR)/$(PLUGIN_NAME)/$$version" && \
-		mkdir -p "$$output_dir" && \
-		mv plugin.wasm "$$output_dir/" && \
-		$(PYTHON) $(SCRIPTS_DIR)/generate_metadata.py "$$output_dir/plugin.wasm" "$(PLUGIN_NAME)" && \
-		echo "$(COLOR_GREEN)✓ Built: $$output_dir/plugin.wasm$(COLOR_RESET)"
+		mkdir -p $(PLUGIN_OUTPUT_DIR) && \
+		mv plugin.wasm $(PLUGIN_OUTPUT_DIR)/ && \
+		$(PYTHON) $(SCRIPTS_DIR)/generate_metadata.py $(PLUGIN_OUTPUT_DIR)/plugin.wasm $(PLUGIN_NAME) && \
+		echo "$(COLOR_GREEN)✓ Built: $(PLUGIN_OUTPUT_DIR)/plugin.wasm$(COLOR_RESET)"
+
+# Test a wasm-rust plugin in Docker (Dockerfile.rust test stage)
+test-rust:
+	@cd $(PLUGIN_NAME) && \
+		DOCKER_BUILDKIT=1 docker build \
+			-f $(RUST_DOCKERFILE) \
+			--platform linux/amd64 \
+			--build-arg PROXY=$(PROXY) \
+			--target test .
+
+# Test a wasm-go plugin with the local Go toolchain
+test-go:
+	@cd $(PLUGIN_NAME) && go test -v ./...
 
 # Build all local plugins
 #
@@ -137,11 +211,23 @@ build:
 #
 # `make build PLUGIN_NAME=<name>` ignores the marker on purpose: naming a plugin
 # explicitly is the escape hatch.
+# Build all local plugins. Set RUNTIME=go or RUNTIME=rust to build only
+# plugins of that runtime (used by the split go-builder/rust-builder stages
+# in the root Dockerfile, where no Docker daemon is available).
 build-all:
 	@echo "$(COLOR_BOLD)Building all local plugins...$(COLOR_RESET)"
 	@for dir in */; do \
-		if [ -f "$$dir/go.mod" ]; then \
+		if [ -f "$$dir/go.mod" ] || [ -f "$$dir/Cargo.toml" ]; then \
 			name=$$(basename "$$dir"); \
+			if [ -f "$$dir/Cargo.toml" ]; then \
+				runtime=rust; \
+			else \
+				runtime=go; \
+			fi; \
+			if [ -n "$(RUNTIME)" ] && [ "$$runtime" != "$(RUNTIME)" ]; then \
+				echo "$(COLOR_YELLOW)Skipping $$name (runtime $$runtime != $(RUNTIME))$(COLOR_RESET)"; \
+				continue; \
+			fi; \
 			if [ -f "$$dir/.nopackage" ]; then \
 				echo "$(COLOR_YELLOW)Skipping $$name (.nopackage)$(COLOR_RESET)"; \
 				if [ -d "$(OUTPUT_DIR)/$$name" ]; then \
@@ -150,17 +236,7 @@ build-all:
 				fi; \
 				continue; \
 			fi; \
-			echo "$(COLOR_GREEN)Building $$name...$(COLOR_RESET)"; \
-			cd "$$dir" && \
-				version=$$(cat VERSION) && \
-				go mod download && \
-				GOOS=$(GOOS) GOARCH=$(GOARCH) go build $(BUILD_FLAGS) -o plugin.wasm . && \
-				output_dir="$(OUTPUT_DIR)/$$name/$$version" && \
-				mkdir -p "$$output_dir" && \
-				mv plugin.wasm "$$output_dir/" && \
-				$(PYTHON) $(SCRIPTS_DIR)/generate_metadata.py "$$output_dir/plugin.wasm" "$$name" && \
-				echo "$(COLOR_GREEN)✓ Built: $$output_dir/plugin.wasm$(COLOR_RESET)" && \
-				cd ..; \
+			$(MAKE) build PLUGIN_NAME=$$name || exit 1; \
 		fi; \
 	done
 	@echo "$(COLOR_GREEN)All local plugins built successfully!$(COLOR_RESET)"
@@ -204,28 +280,16 @@ build-all-with-remote: build-all
 		$(MAKE) fetch-all-remote; \
 	fi
 
-# Test a plugin
-test:
-	@if [ -z "$(PLUGIN_NAME)" ]; then \
-		echo "$(COLOR_YELLOW)Error: PLUGIN_NAME is required$(COLOR_RESET)"; \
-		exit 1; \
-	fi
-	@echo "$(COLOR_GREEN)Testing $(PLUGIN_NAME)...$(COLOR_RESET)"
-	@cd $(PLUGIN_NAME) && go test -v ./...
-
 # Test all local plugins
 test-all:
 	@echo "$(COLOR_BOLD)Testing all local plugins...$(COLOR_RESET)"
 	@failed=0; \
 	for dir in */; do \
-		if [ -f "$$dir/go.mod" ]; then \
+		if [ -f "$$dir/go.mod" ] || [ -f "$$dir/Cargo.toml" ]; then \
 			name=$$(basename "$$dir"); \
-			echo "$(COLOR_GREEN)Testing $$name...$(COLOR_RESET)"; \
-			cd "$$dir" && \
-			if go test -v ./...; then \
-				cd ..; \
+			if $(MAKE) test PLUGIN_NAME=$$name; then \
+				:; \
 			else \
-				cd ..; \
 				failed=1; \
 			fi; \
 		fi; \
@@ -322,4 +386,4 @@ help:
 	@echo "  make fetch-remote PLUGIN='oci://ghcr.io/higress-extensions/ai-proxy:1.2.3|ai-proxy|1.2.3'"
 	@echo "  make build-all-with-remote"
 
-.PHONY: list list-remote build build-all fetch-remote fetch-all-remote build-all-with-remote test test-all clean generate-manifest watch build-oci-image push-oci-image help
+.PHONY: list list-remote build build-go build-rust build-all fetch-remote fetch-all-remote build-all-with-remote test test-go test-rust test-all clean generate-manifest watch build-oci-image push-oci-image help
