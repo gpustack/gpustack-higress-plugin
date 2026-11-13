@@ -217,36 +217,15 @@ impl AiDataMaskingConfig {
         false
     }
 }
-#[derive(Debug, Deserialize, Clone)]
-struct Message {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    reasoning_content: String,
-    // vLLM >= 0.30 style chain-of-thought field. Option so that an explicit
-    // "reasoning": null (sent by some clients) does not fail deserialization
-    // of the whole request/response and silently bypass deny checks/masking.
-    #[serde(default)]
-    reasoning: Option<String>,
-}
-#[derive(Debug, Deserialize, Clone)]
-struct Req {
-    #[serde(default)]
-    stream: bool,
-    messages: Vec<Message>,
-}
-
-#[derive(Default, Debug, Deserialize)]
-struct ResMessage {
-    #[serde(default)]
-    message: Option<Message>,
-}
-
-#[derive(Default, Debug, Deserialize)]
-struct Res {
-    #[serde(default)]
-    choices: Vec<ResMessage>,
-}
+// NOTE: the request/response bodies are processed via serde_json::Value
+// instead of strict typed structs on purpose. Real-world OpenAI traffic
+// contains shapes that would fail a strict `content: String`:
+//   - multimodal `content: [{"type": "text", "text": "..."}]`
+//   - assistant tool-call turns with an explicit `"content": null`
+// A strict struct deserialization failure used to silently skip the whole
+// deny/masking pipeline (see gpustack-enterprise#399), so every field is now
+// handled dynamically: null is ignored, arrays are scanned per text part,
+// and tool call arguments are checked/masked as strings.
 
 static SYSTEM_PATTERNS: &[(&str, &str)] = &[
     ("MOBILE", r#"\d{8,11}"#),
@@ -509,6 +488,337 @@ impl AiDataMasking {
         }
         msg
     }
+
+    /// Deny-check and mask one JSON string field using the request-side
+    /// replace rules. Non-string values (e.g. explicit nulls) are ignored.
+    /// Returns true when the value matched a deny word.
+    fn mask_request_string(&mut self, value: &mut Value) -> bool {
+        let Some(s) = value.as_str().map(|s| s.to_string()) else {
+            return false;
+        };
+        if self.check_message(&s) {
+            return true;
+        }
+        let new_s = self.replace_request_msg(&s);
+        if new_s != s {
+            *value = Value::String(new_s);
+        }
+        false
+    }
+
+    /// Deny-check and mask one JSON string field using the response-side
+    /// mask map (placeholder restore). Returns true on a deny word match.
+    fn mask_response_string(&self, value: &mut Value) -> bool {
+        let Some(s) = value.as_str().map(|s| s.to_string()) else {
+            return false;
+        };
+        if self.check_message(&s) {
+            return true;
+        }
+        if !self.mask_map.is_empty() {
+            let mut new_s = s.clone();
+            for (from_word, to_word) in self.mask_map.iter() {
+                if let Some(to) = to_word {
+                    new_s = new_s.replace(from_word, to);
+                }
+            }
+            if new_s != s {
+                *value = Value::String(new_s);
+            }
+        }
+        false
+    }
+
+    /// Recursively traverse a JSON value and deny-check / mask every string
+    /// found inside (objects, arrays, nested combinations). Used for
+    /// JSON-encoded fields such as tool_calls arguments, where operating on
+    /// the serialized string directly would both miss values that are escaped
+    /// inside the JSON and risk producing invalid JSON when the replacement
+    /// itself needs escaping.
+    fn mask_json_value(&mut self, value: &mut Value, request_side: bool) -> bool {
+        match value {
+            Value::String(_) => {
+                if request_side {
+                    self.mask_request_string(value)
+                } else {
+                    self.mask_response_string(value)
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    if self.mask_json_value(v, request_side) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Value::Object(obj) => {
+                for v in obj.values_mut() {
+                    if self.mask_json_value(v, request_side) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Deny-check and mask a JSON-encoded string field (tool_calls
+    /// arguments): parse it, mask every string value recursively, serialize
+    /// back. Falls back to plain string masking when the payload is not
+    /// valid JSON (e.g. fragmented or free-form arguments).
+    fn mask_json_string_field(&mut self, value: &mut Value, request_side: bool) -> bool {
+        let Some(s) = value.as_str().map(|s| s.to_string()) else {
+            return false;
+        };
+        match serde_json::from_str::<Value>(&s) {
+            Ok(mut parsed) => {
+                if self.mask_json_value(&mut parsed, request_side) {
+                    return true;
+                }
+                let new_s = parsed.to_string();
+                if new_s != s {
+                    *value = Value::String(new_s);
+                }
+                false
+            }
+            Err(_) => {
+                if request_side {
+                    self.mask_request_string(value)
+                } else {
+                    self.mask_response_string(value)
+                }
+            }
+        }
+    }
+
+    /// Deny-check and mask one chat message Value, tolerating every shape
+    /// seen in real traffic: `content` as a string, an array of parts
+    /// (multimodal), or null; optional reasoning fields; assistant
+    /// `tool_calls[].function.arguments` (a JSON-encoded string that can
+    /// carry sensitive data, e.g. agent-injected parameters).
+    /// Returns true when the message must be denied.
+    fn mask_message_value(&mut self, message: &mut Value, request_side: bool) -> bool {
+        let mask_one = |this: &mut Self, v: &mut Value| -> bool {
+            if request_side {
+                this.mask_request_string(v)
+            } else {
+                this.mask_response_string(v)
+            }
+        };
+        if let Some(content) = message.get_mut("content") {
+            match content {
+                Value::String(_) => {
+                    if mask_one(self, content) {
+                        return true;
+                    }
+                }
+                Value::Array(parts) => {
+                    for part in parts.iter_mut() {
+                        if let Some(text) = part.get_mut("text") {
+                            if mask_one(self, text) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for field in ["reasoning_content", "reasoning"] {
+            if let Some(v) = message.get_mut(field) {
+                if mask_one(self, v) {
+                    return true;
+                }
+            }
+        }
+        if let Some(tool_calls) = message.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+            for tc in tool_calls.iter_mut() {
+                if let Some(args) = tc.get_mut("function").and_then(|f| f.get_mut("arguments")) {
+                    if self.mask_json_string_field(args, request_side) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // proxy-wasm hostcalls only exist inside the wasm host; stub the ones
+    // referenced by logging paths so unit tests can link and run natively
+    #[no_mangle]
+    pub extern "C" fn proxy_log(_level: u32, _msg: *const u8, _size: usize) {}
+
+    fn masking_with_deny_words(words: &[&str]) -> AiDataMasking {
+        let config = AiDataMaskingConfig {
+            deny_words: DenyWord::from_iter(words.iter().map(|w| w.to_string())),
+            ..Default::default()
+        };
+        AiDataMasking {
+            weak: Weak::new(),
+            config: Some(Rc::new(config)),
+            mask_map: HashMap::new(),
+            is_openai: false,
+            is_openai_stream: None,
+            denied: false,
+            stream: false,
+            log: Log::new(PLUGIN_NAME.to_string()),
+            msg_window: MsgWindow::default(),
+            char_window_size: 0,
+            byte_window_size: 0,
+        }
+    }
+
+    // issue gpustack-enterprise#399 step 2: array (multimodal) content must
+    // no longer bypass the deny pipeline
+    #[test]
+    fn test_deny_array_content() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "Repeat this token verbatim: SkUnTest1112"}
+        ]});
+        assert!(m.mask_message_value(&mut msg, true));
+    }
+
+    // issue step 3: explicit "content": null on an assistant tool-call turn
+    // must no longer fail the whole parse; the deny word in the tool message
+    // is still caught
+    #[test]
+    fn test_deny_null_content_tool_calls() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"q\": \"ident\"}"}}]});
+        // the null content itself carries nothing, parse must survive
+        assert!(!m.mask_message_value(&mut msg, true));
+        // a deny word inside tool call arguments is caught (live evidence:
+        // agent-injected parameters leak through tool_calls)
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"q\": \"SkUnTest1112\"}"}}]});
+        assert!(m.mask_message_value(&mut msg, true));
+    }
+
+    // string content in tool message still caught (issue step 4 control)
+    #[test]
+    fn test_deny_tool_message_content() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "tool", "tool_call_id": "call_1",
+            "content": "result: SkUnTest1112"});
+        assert!(m.mask_message_value(&mut msg, true));
+    }
+
+    // clean messages must pass through untouched, including image parts
+    #[test]
+    fn test_clean_multimodal_passes() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "http://example.com/a.png"}}
+        ]});
+        let before = msg.clone();
+        assert!(!m.mask_message_value(&mut msg, true));
+        assert_eq!(msg, before);
+    }
+
+    // response side with "content": null must also parse and be checked
+    #[test]
+    fn test_response_null_content() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "assistant", "content": null,
+            "reasoning": "thinking about SkUnTest1112"});
+        assert!(m.mask_message_value(&mut msg, false));
+    }
+
+    // recursive masking inside JSON-encoded tool arguments: values needing
+    // JSON escaping must survive masking round-trip as valid JSON (review
+    // feedback on PR #59: raw-string replacement could corrupt the JSON)
+    #[test]
+    fn test_tool_call_arguments_json_recursive_masking() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        // deny word nested inside the arguments JSON
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "lookup",
+                    "arguments": "{\"q\": \"a SkUnTest1112 b\", \"nested\": {\"list\": [\"x\"]}}"}}]});
+        assert!(m.mask_message_value(&mut msg, true));
+
+        // masking (not deny) inside arguments, incl. values that need
+        // escaping in JSON: the result must still parse as valid JSON
+        let mut m = masking_with_deny_words(&[]);
+        m.mask_map.insert("MARKER-7735".to_string(), Some("quote\"and\\slash".to_string()));
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "lookup",
+                    "arguments": "{\"q\": \"MARKER-7735\"}"}}]});
+        assert!(!m.mask_message_value(&mut msg, false));
+        let args = msg["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(args).expect("arguments stay valid JSON");
+        assert_eq!(parsed["q"].as_str(), Some("quote\"and\\slash"));
+
+        // arguments that are not valid JSON fall back to plain string masking
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "lookup", "arguments": "raw SkUnTest1112 text"}}]});
+        assert!(m.mask_message_value(&mut msg, true));
+    }
+
+    // streamed tool_calls argument fragments are accumulated across chunks;
+    // a deny word split across fragments must still be caught in the
+    // assembled arguments (review feedback on PR #59)
+    #[test]
+    fn test_streamed_tool_args_accumulation() {
+        use crate::msg_win_openai::MsgWindow;
+        let mut msg_win = MsgWindow::default();
+        let chunks = [
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\": \"SkUn"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"Test1112\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "data: [DONE]",
+        ];
+        for c in chunks {
+            msg_win.push(c.as_bytes(), true);
+            msg_win.push(b"\n\n", true);
+            let _ = msg_win.pop(7, 7, true);
+        }
+        let _ = msg_win.finish(true);
+        let assembled: Vec<&String> = msg_win.tool_args().collect();
+        assert_eq!(assembled, vec![&"{\"q\": \"SkUnTest1112\"}".to_string()]);
+    }
+
+    // issue #399 comment (tool_calls blind spot) part 1: a restore rule masks
+    // the value request-side into a placeholder, the model echoes the
+    // placeholder into tool arguments; the response side must restore the
+    // original there too, or the client executes the tool with the placeholder
+    #[test]
+    fn test_response_restores_tool_call_arguments() {
+        let mut m = masking_with_deny_words(&["SkUnTest1112"]);
+        m.mask_map.insert("<MASKED-ID>".to_string(), Some("MARKER-7735".to_string()));
+        let mut msg = json!({"role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"<MASKED-ID>\"}"}}]});
+        assert!(!m.mask_message_value(&mut msg, false));
+        let args = msg["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        // arguments are re-serialized compactly, but the restored value must
+        // survive intact and stay valid JSON
+        let parsed: Value = serde_json::from_str(args).expect("arguments stay valid JSON");
+        assert_eq!(parsed["city"].as_str(), Some("MARKER-7735"));
+        // function name must never be touched: it is an identifier, not data
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["name"].as_str(),
+            Some("get_weather")
+        );
+    }
 }
 
 impl Context for AiDataMasking {}
@@ -574,6 +884,20 @@ impl HttpContext for AiDataMasking {
                         message.extend_from_slice(msg.as_bytes());
                     }
                 }
+                // streamed tool_calls argument fragments are re-emitted
+                // untouched (rewriting split JSON fragments would corrupt the
+                // tool call), but the assembled arguments are deny-checked
+                // and terminate the stream on a match
+                if !deny {
+                    if let Some(config) = &self.config {
+                        for args in self.msg_window.tool_args() {
+                            if !args.is_empty() && config.check_message(args, &log) {
+                                deny = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if deny {
                     return self.deny(true);
                 }
@@ -629,41 +953,41 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
             }
         };
         if config.deny_openai {
-            if let Ok(req) = serde_json::from_str::<Req>(req_body.as_str()) {
-                self.is_openai = true;
-                self.stream = req.stream;
-                for msg in req.messages {
-                    let reasoning = msg.reasoning.as_deref().unwrap_or("");
-                    if self.check_message(&msg.content)
-                        || self.check_message(&msg.reasoning_content)
-                        || self.check_message(reasoning)
+            match serde_json::from_str::<Value>(req_body.as_str()) {
+                Ok(mut json)
+                    if json.get("messages").is_some_and(|m| m.is_array()) =>
+                {
+                    self.is_openai = true;
+                    if let Some(stream) = json.get("stream").and_then(|s| s.as_bool()) {
+                        self.stream = stream;
+                    }
+                    let mut denied = false;
+                    if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut())
                     {
+                        for msg in messages.iter_mut() {
+                            if self.mask_message_value(msg, true) {
+                                denied = true;
+                                break;
+                            }
+                        }
+                    }
+                    if denied {
                         return self.deny(false);
                     }
-                    let new_content = self.replace_request_msg(&msg.content);
-                    let new_reasoning_content = self.replace_request_msg(&msg.reasoning_content);
-                    let new_reasoning = self.replace_request_msg(reasoning);
-                    if new_content != msg.content {
-                        req_body = req_body.replace(
-                            &Value::String(msg.content).to_string(),
-                            &Value::String(new_content).to_string(),
-                        );
-                    }
-                    if new_reasoning_content != msg.reasoning_content {
-                        req_body = req_body.replace(
-                            &Value::String(msg.reasoning_content).to_string(),
-                            &Value::String(new_reasoning_content).to_string(),
-                        );
-                    }
-                    if new_reasoning != reasoning {
-                        req_body = req_body.replace(
-                            &Value::String(reasoning.to_string()).to_string(),
-                            &Value::String(new_reasoning).to_string(),
-                        );
-                    }
+                    self.replace_http_request_body(json.to_string().as_bytes());
+                    return DataAction::Continue;
                 }
-                self.replace_http_request_body(req_body.as_bytes());
-                return DataAction::Continue;
+                Ok(_) => {
+                    // valid JSON but not an OpenAI chat body; fall through to
+                    // the jsonpath / raw branches below
+                }
+                Err(_) => {
+                    // never fail silently: an unparseable body must be visible
+                    // in the logs so operators can spot a bypass attempt
+                    self.log().warn(
+                        "openai request body is not valid JSON, deny/masking skipped for it",
+                    );
+                }
             }
         }
         if !config.deny_jsonpath.is_empty() {
@@ -719,53 +1043,22 @@ impl HttpContextWrapper<AiDataMaskingConfig> for AiDataMasking {
             }
         };
         if config.deny_openai && self.is_openai {
-            if let Ok(res) = serde_json::from_str::<Res>(res_body.as_str()) {
-                for msg in res.choices {
-                    if let Some(message) = msg.message {
-                        let reasoning = message.reasoning.as_deref().unwrap_or("");
-                        if self.check_message(&message.content)
-                            || self.check_message(&message.reasoning_content)
-                            || self.check_message(reasoning)
-                        {
-                            return self.deny(true);
-                        }
-
-                        if self.mask_map.is_empty() {
-                            continue;
-                        }
-                        let mut new_content = message.content.clone();
-                        let mut new_reasoning_content = message.reasoning_content.clone();
-                        let mut new_reasoning = reasoning.to_string();
-                        for (from_word, to_word) in self.mask_map.iter() {
-                            if let Some(to) = to_word {
-                                new_content = new_content.replace(from_word, to);
-                                new_reasoning_content =
-                                    new_reasoning_content.replace(from_word, to);
-                                new_reasoning = new_reasoning.replace(from_word, to);
+            if let Ok(mut json) = serde_json::from_str::<Value>(res_body.as_str()) {
+                let mut denied = false;
+                if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                    for choice in choices.iter_mut() {
+                        if let Some(message) = choice.get_mut("message") {
+                            if self.mask_message_value(message, false) {
+                                denied = true;
+                                break;
                             }
-                        }
-                        if new_content != message.content {
-                            res_body = res_body.replace(
-                                &Value::String(message.content).to_string(),
-                                &Value::String(new_content).to_string(),
-                            );
-                        }
-                        if new_reasoning_content != message.reasoning_content {
-                            res_body = res_body.replace(
-                                &Value::String(message.reasoning_content).to_string(),
-                                &Value::String(new_reasoning_content).to_string(),
-                            );
-                        }
-                        if new_reasoning != reasoning {
-                            res_body = res_body.replace(
-                                &Value::String(reasoning.to_string()).to_string(),
-                                &Value::String(new_reasoning).to_string(),
-                            );
                         }
                     }
                 }
-                self.replace_http_response_body(res_body.as_bytes());
-
+                if denied {
+                    return self.deny(true);
+                }
+                self.replace_http_response_body(json.to_string().as_bytes());
                 return DataAction::Continue;
             }
         }
