@@ -420,6 +420,10 @@ func TestCooldown(t *testing.T) {
 	test.RunCooldownRecoveryTests(t)
 }
 
+func TestUpstreamAuthStatusRemap(t *testing.T) {
+	test.RunUpstreamAuthStatusRemapTests(t)
+}
+
 func TestDeepSeek(t *testing.T) {
 	test.RunDeepSeekParseConfigTests(t)
 	test.RunDeepSeekOnHttpRequestHeadersTests(t)

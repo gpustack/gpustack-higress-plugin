@@ -470,6 +470,20 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 			log.Errorf("unable to load :status header from response: %v", err)
 		}
 		action := providerConfig.OnRequestFailed(activeProvider, ctx, apiTokenInUse, apiTokens, status)
+		// GPUStack-local: remap auth errors received from the upstream inference
+		// provider to 502 Bad Gateway. A pass-through 401/403 collides with the
+		// meaning those statuses already have on the console API ("your
+		// management session is invalid") and logs console clients out of a
+		// valid session. The upstream response body is preserved verbatim so the
+		// original cause (e.g. invalid provider credentials) stays diagnosable.
+		// Only upstream-generated statuses are remapped: gateway-generated
+		// 401/403 never reach this response phase (they are rejected earlier in
+		// the request phase at a higher plugin priority). Statuses that do not
+		// conflict with session semantics (400, 429, 5xx, ...) pass through
+		// unchanged. See gpustack/gpustack#6646.
+		if action == types.ActionContinue {
+			remapUpstreamAuthErrorStatus(activeProvider, status)
+		}
 		if action == types.ActionContinue &&
 			providerConfig.GetLogUpstreamErrorResponseBody() &&
 			shouldLogUpstreamErrorResponse(status) {
@@ -673,6 +687,27 @@ func onHttpResponseBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfi
 		_ = util.ErrorHandler("ai-proxy.replace_resp_body_failed", fmt.Errorf("failed to replace response body: %v", err))
 	}
 	return types.ActionContinue
+}
+
+// remapUpstreamAuthErrorStatus rewrites a 401/403 response that is about to be
+// passed through from the upstream inference provider into 502 Bad Gateway.
+// The response body is left untouched so the upstream error detail stays
+// visible; only the status (and the now-meaningless WWW-Authenticate
+// challenge of the upstream) is replaced. Other statuses are returned as-is.
+func remapUpstreamAuthErrorStatus(activeProvider provider.Provider, status string) {
+	switch status {
+	case "401", "403":
+	default:
+		return
+	}
+	if err := proxywasm.ReplaceHttpResponseHeader(":status", "502"); err != nil {
+		log.Errorf("[upstream_auth_error_remapped] failed to replace :status %s with 502: %v", status, err)
+		return
+	}
+	_ = proxywasm.RemoveHttpResponseHeader("WWW-Authenticate")
+	_ = proxywasm.RemoveHttpResponseHeader("www-authenticate")
+	log.Warnf("[upstream_auth_error_remapped] provider=%s original_status=%s remapped_status=502 body_preserved=true",
+		activeProvider.GetProviderType(), status)
 }
 
 func shouldLogUpstreamErrorResponse(status string) bool {
