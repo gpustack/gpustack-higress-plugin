@@ -92,6 +92,12 @@ struct MessageWindowOpenAi {
     // raw chunks carrying structured payloads (tool_calls / function_call /
     // audio) queued for re-emission untouched, in arrival order
     passthrough: VecDeque<Value>,
+    // tool_calls argument fragments are NOT plain text: they are pieces of a
+    // JSON string and must be re-emitted untouched or function calling
+    // breaks. They are accumulated here so the caller can deny-check the
+    // assembled arguments for sensitive data (masking/restore is deliberately
+    // not applied: rewriting split fragments would corrupt the JSON).
+    tool_args: Vec<String>,
 }
 
 /// Structured delta payloads are not text: masking rules must not apply and
@@ -129,6 +135,26 @@ impl MessageWindowOpenAi {
     }
 
     fn push_passthrough(&mut self, choice_value: Value) {
+        // accumulate tool_calls argument fragments for deny-checking by the
+        // caller; fragments for the same tool call arrive across chunks and
+        // are appended per tool call index
+        if let Some(delta) = choice_value.get("delta") {
+            if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                    if let Some(args) = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
+                        if self.tool_args.len() <= index {
+                            self.tool_args.resize(index + 1, String::new());
+                        }
+                        self.tool_args[index].push_str(args);
+                    }
+                }
+            }
+        }
         self.passthrough.push_back(choice_value);
     }
 
@@ -208,6 +234,17 @@ impl MessageWindowOpenAi {
             .iter_mut()
             .map(|(_, msg)| msg)
             .chain(self.message_window.iter_mut())
+    }
+}
+
+impl MsgWindow {
+    /// Assembled tool_calls arguments per tool call, accumulated across
+    /// streaming chunks. Callers deny-check these; the fragments themselves
+    /// are re-emitted untouched.
+    pub(crate) fn tool_args(&self) -> impl Iterator<Item = &String> {
+        self.message_windows
+            .values()
+            .flat_map(|mw| mw.tool_args.iter())
     }
 }
 

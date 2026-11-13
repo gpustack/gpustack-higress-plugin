@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use proxy_wasm::{hostcalls, types};
+#[cfg(target_family = "wasm")]
+use proxy_wasm::hostcalls;
+use proxy_wasm::types;
 use std::fmt::Arguments;
 
 pub enum LogLevel {
@@ -35,8 +37,18 @@ impl Log {
 
     fn log(&self, level: LogLevel, msg: &str) {
         let msg = format!("[{}] {}", self.plugin_name, msg);
-        let level = types::LogLevel::from(level);
-        hostcalls::log(level, msg.as_str()).unwrap();
+        #[cfg(target_family = "wasm")]
+        {
+            let level = types::LogLevel::from(level);
+            hostcalls::log(level, msg.as_str()).unwrap();
+        }
+        // outside the wasm host (e.g. cargo test running natively) there is
+        // no host to log into; fall back to stderr instead of panicking
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let _ = level;
+            eprintln!("{}", msg);
+        }
     }
 
     pub fn trace(&self, msg: &str) {
@@ -64,16 +76,25 @@ impl Log {
     }
 
     fn logf(&self, level: LogLevel, format_args: Arguments) {
-        let level = types::LogLevel::from(level);
-        if let Ok(log_level) = hostcalls::get_log_level() {
-            if (level as i32) < (log_level as i32) {
-                return;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // no wasm host available (e.g. native unit tests): log to stderr
+            let _ = level;
+            eprintln!("[{}] {}", self.plugin_name, format_args);
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let level = types::LogLevel::from(level);
+            if let Ok(log_level) = hostcalls::get_log_level() {
+                if (level as i32) < (log_level as i32) {
+                    return;
+                }
+                hostcalls::log(
+                    level,
+                    format!("[{}] {}", self.plugin_name, format_args).as_str(),
+                )
+                .unwrap();
             }
-            hostcalls::log(
-                level,
-                format!("[{}] {}", self.plugin_name, format_args).as_str(),
-            )
-            .unwrap();
         }
     }
 
