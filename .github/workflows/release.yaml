@@ -1,10 +1,11 @@
-# This workflow runs for releasing the package to PyPI and Docker Hub.
+# This workflow runs for releasing the package to PyPI.
 # It triggers on workflow dispatch or when a tag matching 'v*.*.*' is pushed.
 #
 # Build strategy:
 #   - whl/sdist: Built via Dockerfile (includes remote OCI plugins via oras mount)
-#   - Docker image: Built via Dockerfile with versioned tags
-#   Both builds share GHA cache; the second build reuses layers from the first.
+#
+# Docker images are NOT built here. They are built manually via image.yaml,
+# which downloads the released whl and installs it into the image.
 
 name: release
 
@@ -28,7 +29,6 @@ on:
 env:
   INPUT_PYTHON_VERSION: '3.11'
   INPUT_PROJECT: gpustack-higress-plugins
-  DOCKER_IMAGE: ${{ vars.DOCKER_REPO || 'gpustack' }}/higress-plugins
 
 jobs:
   release:
@@ -53,20 +53,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.CI_DOCKERHUB_USERNAME }}
-          password: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
-
       # uv.lock is required by the Dockerfile COPY step.
       # Generate it here since it is not committed to git.
       - name: Generate uv.lock
         run: pip install uv && uv lock
 
-      # Build whl via Dockerfile whl-output stage.
+      # Build whl via Dockerfile whl-output stage (amd64 only — WASM is
+      # arch-independent, so amd64 keeps the build fast).
       # This includes remote OCI plugins fetched via oras mount.
-      # GHA cache is primed here for the image build below.
       - name: Build wheel via Docker
         uses: docker/build-push-action@v6
         with:
@@ -74,49 +68,6 @@ jobs:
           target: whl-output
           outputs: type=local,dest=./dist
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Strip leading 'v' from the tag name for use as a Docker image tag.
-      # Used as the always-on raw fallback for PEP 440 versions that are not
-      # valid SemVer 2.0 (e.g. v1.0.0rc1, v0.2.1.post3, v1.0.0.dev1) and would
-      # otherwise be silently dropped by docker/metadata-action's semver parser.
-      - name: Extract image version
-        id: image-version
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      # Compute Docker image tags:
-      #   v1.2.3            → gpustack/higress-plugins:1.2.3, :1.2, :latest
-      #   v1.2.3-rc1        → gpustack/higress-plugins:1.2.3-rc1  (no :latest)
-      #   v1.2.3rc1         → gpustack/higress-plugins:1.2.3rc1   (PEP 440, no :latest)
-      #   v0.2.1.post3      → gpustack/higress-plugins:0.2.1.post3 (PEP 440, no :latest)
-      #
-      # The raw `<version>` tag is always emitted so PEP 440 versions that
-      # SemVer can't parse (rc / post / dev) still get a versioned image.
-      # `:latest` and `:{{major}}.{{minor}}` are gated to pure-stable releases only.
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, 'rc') && !contains(github.ref_name, '.post') && !contains(github.ref_name, '.dev') }}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'rc') && !contains(github.ref_name, '.post') && !contains(github.ref_name, '.dev') }}
-            type=raw,value=${{ steps.image-version.outputs.value }}
-
-      # Build and push multi-platform Docker image with version tags.
-      # Reuses layers cached by the whl build above.
-      - name: Build and push Docker image
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

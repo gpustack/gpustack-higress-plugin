@@ -1,0 +1,115 @@
+# Manual Docker image build workflow.
+#
+# The image is NOT built by CI on push/release. Because all plugins are WASM
+# (arch-independent), the wheel published to a tagged GitHub Release is the
+# single build artifact; this workflow downloads that whl and installs it into
+# the runtime image (Dockerfile.whl).
+#
+# Only tagged releases (v*.*.* or *.*.*) can be built; a matching GitHub
+# Release with a .whl asset is required.
+
+name: image
+
+permissions:
+  actions: read
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build the image from (e.g. v0.2.0)'
+        required: true
+        type: string
+
+env:
+  DOCKER_IMAGE: ${{ vars.DOCKER_REPO || 'gpustack' }}/higress-plugins
+
+jobs:
+  build-image:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Only allow building images from version tags.
+      # The tag is passed via env so it is treated as data, not shell syntax.
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          # Accepts PEP 440 forms, incl. separatorless rc/post/dev (e.g. v0.2.0rc1)
+          if [[ ! "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-]?[0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a version tag (expected v*.*.*)"
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag '$TAG' does not exist in the repository"
+            exit 1
+          fi
+
+      # Download the wheel published on the tag's GitHub Release
+      - name: Download wheel from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          rm -rf dist && mkdir dist
+          gh release download "$TAG" --repo "$REPO" --pattern '*.whl' --dir dist/
+          echo "Downloaded wheels:"
+          ls -lh dist/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.CI_DOCKERHUB_USERNAME }}
+          password: ${{ secrets.CI_DOCKERHUB_PASSWORD }}
+
+      # Strip leading 'v' from the tag name for use as a Docker image tag.
+      # Used as the always-on raw fallback for PEP 440 versions that are not
+      # valid SemVer 2.0 (e.g. v1.0.0rc1) and would otherwise be silently
+      # dropped by docker/metadata-action's semver parser.
+      - name: Extract image version
+        id: image-version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # Compute Docker image tags:
+      #   v1.2.3     → :1.2.3, :1.2, :latest
+      #   v1.2.3-rc1 → :1.2.3-rc1  (no :latest)
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }},enable=${{ !contains(inputs.tag, 'rc') && !contains(inputs.tag, '.post') && !contains(inputs.tag, '.dev') }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag, 'rc') && !contains(inputs.tag, '.post') && !contains(inputs.tag, '.dev') }}
+            type=raw,value=${{ steps.image-version.outputs.value }}
+
+      # Build and push image by installing the released wheel.
+      # The whl is pure Python (py3-none-any, WASM is arch-independent),
+      # so multi-platform builds are cheap.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.whl
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
