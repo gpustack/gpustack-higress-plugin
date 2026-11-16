@@ -7,6 +7,7 @@ package provider
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -175,6 +176,10 @@ func TestFrameSSEEvents(t *testing.T) {
 	})
 }
 
+// createdFieldPattern matches the OpenAI chunk "created" field, which the
+// claude provider derives from time.Now() per callback.
+var createdFieldPattern = regexp.MustCompile(`"created":\d+`)
+
 func TestFrameSSEEventsClaudeUsageSurvivesSplitMessageStart(t *testing.T) {
 	// End-to-end at the provider level: message_start split across callbacks
 	// must still land its input_tokens in the final usage chunk.
@@ -194,7 +199,11 @@ func TestFrameSSEEventsClaudeUsageSurvivesSplitMessageStart(t *testing.T) {
 			require.NoError(t, err)
 			out.Write(b)
 		}
-		return out.String()
+		// The provider stamps each chunk with time.Now()-derived "created"
+		// seconds. Comparing a baseline render against re-renders at every
+		// split offset crosses wall-clock second boundaries, so normalize the
+		// field before comparing.
+		return createdFieldPattern.ReplaceAllString(out.String(), `"created":0`)
 	}
 
 	baseline := render(t, intact)
