@@ -34,12 +34,32 @@ Generated wheel files are located in `dist/`, containing:
 
 ### Build Docker Image
 
-```bash
-# Build complete image (with runtime)
-make image
+Docker images are **not** built by CI on push or release. They are built
+manually via the `image` workflow (`.github/workflows/image.yaml`), which:
 
-# Or
-DOCKER_HOST=unix:///var/run/docker.sock docker build -t gpustack-higress-plugins .
+1. Takes a release tag (e.g. `v0.2.0`) as input — only version tags are allowed.
+2. Downloads the `.whl` from that tag's GitHub Release.
+3. Builds the runtime image with `Dockerfile.whl`, which simply installs the
+   downloaded wheel (WASM plugins are arch-independent, so the pure-Python whl
+   is the single build artifact).
+
+Trigger it from GitHub: Actions → image → Run workflow → enter the tag.
+
+Locally, you can reproduce the image build:
+
+```bash
+# 1. Clean dist/ and download the released wheel
+rm -rf dist/ && gh release download v0.2.0 --pattern '*.whl' --dir dist/
+
+# 2. Build the image
+docker build -f Dockerfile.whl -t gpustack/higress-plugins:v0.2.0 .
+```
+
+The source `Dockerfile` (runtime stage) is still available for local
+source-based builds:
+
+```bash
+docker build -t gpustack-higress-plugins .
 ```
 
 ## Architecture
@@ -90,12 +110,11 @@ twine upload dist/*.whl
 
 ### Docker Image Release
 
-```bash
-# 1. Build image
-make image
+Images are released manually from a tagged release wheel via the `image`
+workflow (see "Build Docker Image" above):
 
-# 2. Push to registry
-make push
+```bash
+# From GitHub: Actions → image → Run workflow → enter the tag
 ```
 
 ## Environment Variables
