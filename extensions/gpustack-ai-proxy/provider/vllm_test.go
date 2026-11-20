@@ -26,6 +26,7 @@ func TestVllmProviderInitializer_DefaultCapabilities(t *testing.T) {
 		string(ApiNameResponses):            PathOpenAIResponses,
 		string(ApiNameAudioTranscription):   PathOpenAIAudioTranscriptions,
 		string(ApiNameAudioTranslation):     PathOpenAIAudioTranslations,
+		string(ApiNameSystemone):            PathSystemone,
 	}
 
 	assert.Equal(t, expected, capabilities)
