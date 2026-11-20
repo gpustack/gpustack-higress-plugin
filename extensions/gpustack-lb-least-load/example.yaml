@@ -5,9 +5,10 @@
 # change how much say this plugin has, change its `weight`, not its priority.
 # The conventional ordering is simply:
 #
-#   335  session-affinity
+#   336  session-affinity
 #   333  prefix (enterprise edition)
 #   330  least-load
+#   328  decision-service (when deployed)
 #
 # Prerequisite: this route already carries the two gpustack-lb CRs, mode:
 # context (340) and mode: finisher (325), and the context one has candidates

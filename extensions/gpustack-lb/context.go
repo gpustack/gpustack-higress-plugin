@@ -38,7 +38,7 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// model-router (priority 900) sets from the body's model field -- so it is
 	// available here **without reading the body**. (This route's
 	// exact-match-header-x-higress-llm-model annotation is itself proof the
-	// header exists before 795, otherwise the route would not match at all.)
+	// header exists before 340, otherwise the route would not match at all.)
 	clientModel, _ := proxywasm.GetHttpRequestHeader("x-higress-llm-model")
 
 	// **Do not call ctx.DisableReroute()**: it stops the route from being

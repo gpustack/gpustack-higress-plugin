@@ -1,10 +1,10 @@
 // gpustack-lb-session-affinity is a **capability plugin** of the LB framework:
 // it sends the requests of one session consistently to the same instance.
 //
-//	795 gpustack-lb (context)   publishes the candidate set into filter state
-//	780 this plugin             reads the set -> rendezvous ranking -> appends
+//	340 gpustack-lb (context)   publishes the candidate set into filter state
+//	336 this plugin             reads the set -> rendezvous ranking -> appends
 //	                            one scored opinion
-//	700 gpustack-lb (finisher)  L1-normalises, sums the weighted opinions,
+//	325 gpustack-lb (finisher)  L1-normalises, sums the weighted opinions,
 //	                            picks a candidate, writes the cluster header
 //
 // It **only states an opinion, it does not decide**: it scores every candidate
@@ -108,7 +108,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 	}
 	// The buffer limit has to be raised **here**, not left to the finisher.
 	//
-	// This plugin stops iteration at 780 and the finisher only calls
+	// This plugin stops iteration at 336 and the finisher only calls
 	// SetRequestBodyBufferLimit at 700, so by the time the finisher raises it
 	// Envoy has already buffered this body under whatever the route default is
 	// -- 1 MiB in stock Envoy, and Higress deployments run values as low as

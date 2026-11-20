@@ -7,7 +7,8 @@ which role it plays:
 mode: context   AUTHN/340  read config -> filter -> publish the candidate set
                            into filter state; on non-LB routes it degrades to
                            model-mapper's existing behaviour
-  ↓ the capability band (session-affinity 335 / prefix 333 / least-load 330)
+  ↓ the capability band (session-affinity 336 / prefix 333 (enterprise) /
+    least-load 330 / decision-service 328)
     each append a ranking opinion
 mode: finisher  AUTHN/325  read the rankings -> pick a candidate -> write
                            x-higress-target-cluster -> buffer the body to

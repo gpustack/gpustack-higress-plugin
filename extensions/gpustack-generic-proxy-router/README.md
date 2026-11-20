@@ -32,7 +32,57 @@ against the original headers. Buffered restores the `ActionPause` /
 > active**, otherwise both will write `x-higress-llm-model` and the result
 > depends on relative `priority`.
 
+## Position in the filter chain
+
+Deployed as `AUTHN/900` — the **first** filter of the GPUStack chain
+(model-router's original slot, per gpustack core `gateway/__init__.py`).
+The request-side order (Higress sorts by phase bucket, then descending
+priority within the bucket):
+
+```text
+AUTHN        900  this plugin (gpustack-model-router CR)  writes x-higress-llm-model
+AUTHN        810  gpustack-header-transformer             strips untrusted identity headers
+UNSPECIFIED  400  gpustack-token-usage                    usage reporting
+AUTHN        360  gpustack-ext-auth                       authn, injects x-mse-consumer
+AUTHN        350  gpustack-ip-acl                         per-consumer IP ACL
+AUTHN        340  gpustack-lb (context)                   publishes the candidate set
+AUTHN        336  gpustack-lb-session-affinity            ┐
+AUTHN        333  gpustack-lb-prefix (enterprise)         │ capability band: each
+AUTHN        330  gpustack-lb-least-load                  │ appends a scored opinion
+AUTHN        328  gpustack-lb-decision-service            ┘
+AUTHN        325  gpustack-lb (finisher)                  writes x-higress-target-cluster
+UNSPECIFIED  100  gpustack-ai-proxy                       provider protocol adaptation
+AUTHN         90  gpustack-set-header-pre-route           last AUTHN hop, pre-route headers
+```
+
+(AUTHN as a bucket runs before the router; UNSPECIFIED after it. Cross-bucket
+order therefore does not follow the raw priority numbers.)
+
+## Request tagging (planned)
+
+This plugin is the **entry-classification point** of the chain, and is where
+request tagging lives. Tagging turns "what is this request" into a shared
+filter-state contract so downstream plugins stop re-implementing matchers:
+
+- rules evaluate request attributes (headers, model name, and — because this
+  plugin already buffers the body on `enableOnPathSuffix` paths — exact body
+  length) and set tags into the filter state key `gpustack_request_tags`
+  (`map[string]string`);
+- when a rule needs the body, the tag is set in this plugin's body phase —
+  which is safe for every consumer below, because this plugin pauses header
+  iteration while buffering, so nothing downstream (810 and below) has run
+  its header callback yet;
+- consumers reference tags, not raw headers: LB `routeRules` match on
+  `tags` for deterministic routing (#9/#10), `gpustack-token-usage`
+  attributes usage by tag (#6738, gpustack issue "header-based usage
+  attribution");
+- tags are plugin-private filter state, **not** request headers: headers can
+  be forged by clients and leak to upstreams;
+- fail-open: a rule that does not match sets no tag, and every consumer
+  behaves exactly as it does today.
+
 ## Configuration
+
 
 | Name | Type | Required | Default | Description |
 | ---- | ---- | -------- | ------- | ----------- |

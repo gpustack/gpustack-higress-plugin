@@ -1,13 +1,14 @@
 // gpustack-lb-least-load is a **capability plugin** of the LB framework: it
 // sends each request to the instance with the lowest current load.
 //
-//	795 gpustack-lb (context)          publishes the candidate set (inflight /
+//	340 gpustack-lb (context)          publishes the candidate set (inflight /
 //	                                   penalty already included)
-//	780 gpustack-lb-session-affinity   session stickiness (when deployed)
-//	760 gpustack-lb-prefix             prefix affinity (enterprise edition)
-//	740 this plugin                    reads the set -> scores load -> appends
+//	336 gpustack-lb-session-affinity   session stickiness (when deployed)
+//	333 gpustack-lb-prefix             prefix affinity (enterprise edition)
+//	330 this plugin                    reads the set -> scores load -> appends
 //	                                   one ranking opinion
-//	700 gpustack-lb (finisher)         L1-normalises, sums the weighted
+//	328 gpustack-lb-decision-service   model-selection verdict (when deployed)
+//	325 gpustack-lb (finisher)         L1-normalises, sums the weighted
 //	                                   opinions, picks a candidate, writes the
 //	                                   cluster header
 //
