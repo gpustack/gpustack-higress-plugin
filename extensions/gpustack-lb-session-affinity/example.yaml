@@ -18,7 +18,7 @@ spec:
   # Within that range the exact value carries no meaning: the opinions are
   # combined by weighted sum, so ordering does not affect the outcome. Use
   # `weight` to change how much say this plugin has.
-  priority: 335
+  priority: 336
   url: oci://<registry>/<org>/gpustack-lb-session-affinity:0.1.0
 
   # ⚠️ sessionKeys has no safe default (omitting it makes parseConfig fail) and

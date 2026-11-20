@@ -2,12 +2,12 @@
 // setting decides which role an instance plays. Both roles are deployed (one
 // WasmPlugin CR each, same url):
 //
-//	mode: context   AUTHN/795  read config -> filter -> publish the candidate
+//	mode: context   AUTHN/340  read config -> filter -> publish the candidate
 //	                           set into filter state. On non-LB routes it
 //	                           degrades to model-mapper's existing behaviour.
-//	  ↓ capability band (session-affinity 780 / prefix 760 / least-load 740)
-//	    each appends a scored opinion
-//	mode: finisher  AUTHN/700  weighted sum -> pick a candidate -> write the
+//	  ↓ capability band (session-affinity 336 / prefix 333 (enterprise) /
+//	    least-load 330 / decision-service 328) each appends a scored opinion
+//	mode: finisher  AUTHN/325  weighted sum -> pick a candidate -> write the
 //	                           cluster header -> buffer the body to rewrite the
 //	                           model name -> book-keeping in onStreamDone
 //

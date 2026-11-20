@@ -319,7 +319,7 @@ func TestDefaultSuffixesAreNotShared(t *testing.T) {
 	}
 }
 
-// This plugin stops iteration to buffer a body source at 780, before the
+// This plugin stops iteration to buffer a body source at 336, before the
 // finisher raises the decoder buffer limit at 700. Without its own limit,
 // Envoy buffers under the route default (1 MiB stock, as low as 32 KiB in some
 // Higress deployments) and a large /v1/messages body gets a 413 -- meaning
