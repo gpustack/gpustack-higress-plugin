@@ -140,3 +140,14 @@ func TestOnRequestFailed_offlineBranches(t *testing.T) {
 		assert.Equal(t, types.ActionContinue, act)
 	})
 }
+
+// Async video creation must never enter provider retries, even when enabled.
+func TestAsyncVideoRequestsNeverReplayOnProviderFailure(t *testing.T) {
+	for _, apiName := range []ApiName{ApiNameVideos, ApiNameRetrieveVideo, ApiNameRetrieveVideoContent} {
+		var c ProviderConfig
+		c.FromJson(gjson.Parse(`{"type":"openai","apiTokens":["a","b"],"retryOnFailure":{"enabled":true,"retryOnStatus":["503"]}}`))
+		ctx := newMapCtx()
+		ctx.SetContext(CtxKeyApiName, apiName)
+		assert.Equal(t, types.ActionContinue, c.OnRequestFailed(nil, ctx, "a", []string{"a", "b"}, "503"))
+	}
+}

@@ -24,6 +24,8 @@ pip install gpustack-higress-plugins
 
 - **gpustack-lb** - The single binary of the LB plugin framework (`mode: context` / `mode: finisher`), replacing model-mapper: publishes candidate instances, then picks one by weighted-sum ranking and steers the route via `x-higress-target-cluster`.
 
+- **gpustack-video** - Registers opaque async video task identities with GPUStack, adapts MiniMax H3 inputs, and pins status/content requests to the original instance. Supports one gateway or an edge and cluster gateway, with custom LB enabled or disabled. See [async video jobs](extensions/gpustack-video/README.md).
+
 - **gpustack-lb-session-affinity** - LB capability plugin: keeps one session's requests on the same instance.
 
 - **gpustack-lb-least-load** - LB capability plugin: sends each request to the least-loaded instance.
@@ -38,11 +40,13 @@ Plugins are positioned by `phase` (bucket order: AUTHN → … → UNSPECIFIED; 
 
 ```text
 AUTHN       900 model-router → 810 transformer (strips spoofed identity headers)
+            → 805 gpustack-video resolve (video task routes only)
             → 360 gpustack-ext-auth (injects trusted x-mse-consumer; 401)
             → 350 gpustack-ip-acl (403)
             → 340-325 LB band (context → session-affinity / prefix / least-load → decision-service (328) → finisher)
 UNSPECIFIED 600 gpustack-rate-limit (429) → 400 gpustack-token-usage
-            → 100 ai-proxy → router
+            → 100 ai-proxy → 90 set-header-pre-route
+            → 50 gpustack-video transport (video task routes only) → router
 ```
 
 When changing any plugin's position, re-check its ordering constraints (documented in each plugin's README) and verify the live filter chain via Envoy `config_dump` after rollout.

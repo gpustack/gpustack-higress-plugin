@@ -701,6 +701,14 @@ func (c *ProviderConfig) resetSharedData() {
 }
 
 func (c *ProviderConfig) OnRequestFailed(activeProvider Provider, ctx wrapper.HttpContext, apiTokenInUse string, apiTokens []string, status string) types.Action {
+	// Async creation may have been accepted even when the response is lost.
+	// Replaying it through another key or target could submit a second job.
+	// Task reads also retain their native path and fixed endpoint; provider
+	// retries must not reconstruct a request with the public ID.
+	apiName, _ := ctx.GetContext(CtxKeyApiName).(ApiName)
+	if apiName == ApiNameVideos || apiName == ApiNameRetrieveVideo || apiName == ApiNameRetrieveVideoContent {
+		return types.ActionContinue
+	}
 	if c.isFailoverEnabled() && util.MatchStatus(status, c.failover.failoverOnStatus) {
 		log.Warnf("apiToken:%s need failover, error status:%s", apiTokenInUse, status)
 		c.handleUnavailableApiToken(ctx, apiTokenInUse)

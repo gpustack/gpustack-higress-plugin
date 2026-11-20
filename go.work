@@ -1,6 +1,7 @@
 go 1.24.4
 
 use (
+	./extensions/gpustack-video
 	./extensions/gpustack-ai-proxy
 	./extensions/gpustack-lb
 	./extensions/gpustack-lb-least-load
