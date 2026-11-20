@@ -68,6 +68,9 @@ func (m *openaiProviderInitializer) DefaultCapabilities() map[string]string {
 		string(ApiNameRetrieveVideo):                        PathOpenAIRetrieveVideo,
 		string(ApiNameVideoRemix):                           PathOpenAIVideoRemix,
 		string(ApiNameRetrieveVideoContent):                 PathOpenAIRetrieveVideoContent,
+		// The Jev decision contract, for vLLM-style engines riding an
+		// openai-compatible entry with a custom base url.
+		string(ApiNameSystemone): PathSystemone,
 	}
 }
 
@@ -86,7 +89,8 @@ func isDirectPath(path string) bool {
 		strings.HasSuffix(path, "/fine_tuning/jobs") ||
 		strings.HasSuffix(path, "/fine_tuning/checkpoints") ||
 		strings.HasSuffix(path, "/realtime") ||
-		strings.HasSuffix(path, "/videos")
+		strings.HasSuffix(path, "/videos") ||
+		strings.HasSuffix(path, "/systemone")
 }
 
 func (m *openaiProviderInitializer) CreateProvider(config ProviderConfig) (Provider, error) {
@@ -220,7 +224,45 @@ func (m *openaiProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiNam
 	headers.Del("Content-Length")
 }
 
+// GetApiName claims the Jev decision contract's own path on behalf of
+// openai-compatible entries: a vLLM/llama.cpp deployment serving
+// /v1/systemone rides an openai-type entry, and without a claimed API name
+// the framework treats the path as unrecognized and never reads the body,
+// which would disable the dialect normalization in OnRequestBody. Every
+// other path stays unclaimed (""), preserving today's behavior.
+func (m *openaiProvider) GetApiName(path string) ApiName {
+	if strings.HasSuffix(path, PathSystemone) {
+		return ApiNameSystemone
+	}
+	// Preserve the shared, deterministic inbound classification for every
+	// other path. Under protocol original this handler's result replaces
+	// the shared one outright, so re-implementing the lookup against
+	// capability paths would diverge for custom base urls and templated
+	// routes, and an empty claim would disable body processing
+	// (duplicate-model rejection, strict tool-call validation) for
+	// openai-compatible entries.
+	return ClassifyPath(path)
+}
+
 func (m *openaiProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, error) {
+	if apiName == ApiNameSystemone {
+		// vLLM-style engines behind openai-compatible entries read images
+		// only from the top-level array and their extra=forbid schema
+		// rejects the assets field; keep the array, drop the redundant map.
+		newBody, err := dropRedundantSystemoneAssets(body)
+		if err != nil {
+			return types.ActionContinue, err
+		}
+		// Apply the default model mapping for non-original entries, matching
+		// the vLLM path: without this a public alias would be forwarded
+		// verbatim instead of being remapped to the backend's model.
+		if !m.config.IsOriginal() {
+			if newBody, err = m.config.defaultTransformRequestBody(ctx, apiName, newBody); err != nil {
+				return types.ActionContinue, err
+			}
+		}
+		return types.ActionContinue, replaceRequestBody(newBody)
+	}
 	if !m.config.needToProcessRequestBody(apiName) {
 		// We don't need to process the request body for other APIs.
 		return types.ActionContinue, nil

@@ -32,7 +32,8 @@ func isVllmDirectPath(path string) bool {
 		strings.HasSuffix(path, "/messages") ||
 		strings.HasSuffix(path, "/count_tokens") ||
 		strings.HasSuffix(path, "/transcriptions") ||
-		strings.HasSuffix(path, "/translations")
+		strings.HasSuffix(path, "/translations") ||
+		strings.HasSuffix(path, "/systemone")
 }
 
 type vllmProviderInitializer struct{}
@@ -58,6 +59,8 @@ func (m *vllmProviderInitializer) DefaultCapabilities() map[string]string {
 		string(ApiNameResponses):            PathOpenAIResponses,
 		string(ApiNameAudioTranscription):   PathOpenAIAudioTranscriptions,
 		string(ApiNameAudioTranslation):     PathOpenAIAudioTranslations,
+		// The Jev decision contract, served natively by vLLM >= 0.32.
+		string(ApiNameSystemone): PathSystemone,
 	}
 }
 
@@ -118,6 +121,16 @@ func (m *vllmProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, b
 	if !m.config.isSupportedAPI(apiName) {
 		return types.ActionContinue, errUnsupportedApiName
 	}
+	// Under protocol original handleRequestBody returns before invoking
+	// TransformRequestBody, so the decision-contract normalization would
+	// never run; apply it directly instead.
+	if apiName == ApiNameSystemone && m.config.IsOriginal() {
+		newBody, err := dropRedundantSystemoneAssets(body)
+		if err != nil {
+			return types.ActionContinue, err
+		}
+		return types.ActionContinue, replaceRequestBody(newBody)
+	}
 	return m.config.handleRequestBody(m, m.contextCache, ctx, apiName, body)
 }
 
@@ -156,11 +169,24 @@ func (m *vllmProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName 
 }
 
 func (m *vllmProvider) TransformRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) ([]byte, error) {
+	if apiName == ApiNameSystemone {
+		// The decision contract's images spelling is the top-level array;
+		// the vLLM schema forbids the assets field, so a both-fields request
+		// has the redundant map removed before the default transformation.
+		newBody, err := dropRedundantSystemoneAssets(body)
+		if err != nil {
+			return nil, err
+		}
+		body = newBody
+	}
 	// For vLLM, we can use the default transformation which handles model mapping
 	return m.config.defaultTransformRequestBody(ctx, apiName, body)
 }
 
 func (m *vllmProvider) GetApiName(path string) ApiName {
+	if strings.HasSuffix(path, PathSystemone) {
+		return ApiNameSystemone
+	}
 	if strings.Contains(path, PathOpenAIChatCompletions) {
 		return ApiNameChatCompletion
 	}

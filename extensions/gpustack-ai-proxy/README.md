@@ -246,6 +246,16 @@ Fireworks AI 所对应的 `type` 为 `fireworks`。它并无特有的配置字�
 
 Galadriel 所对应的 `type` 为 `galadriel`。它并无特有的配置字段。
 
+#### Systemone（Jev 决策服务）
+
+Systemone 所对应的 `type` 为 `systemone`，用于将 Jev 决策契约（jevcompat SPEC 0.1，`POST /v1/systemone`）作为推理上游。请求路径不做改写（`/v1/systemone` 与 `/v1/models` 直通），Host 头固定为配置的 endpoint 的 authority（缺省为托管 `api.typesafe.ai`）。
+
+特有配置字段：
+
+- `systemoneEndpoint`：Jev 决策服务的 base url；缺省使用托管 TypeSafe API（`https://api.typesafe.ai`）。
+- `systemoneModel`：请求未携带 `model` 字段时使用的默认决策引擎模型。
+- `typesafeDangerZoneHeader`：`TypeSafe-Danger-Zone-Images` opt-in 头的注入策略，取值 `auto`（默认，请求携带图片且客户端未显式发送该头时注入）、`true`（无条件确保该头存在，不覆盖客户端显式发送的值）、`false`（完全不注入）。
+
 #### 文心一言（Baidu）
 
 文心一言所对应的 `type` 为 `baidu`。它并无特有的配置字段。

@@ -56,6 +56,7 @@ const (
 	ApiNameRetrieveBatch                        ApiName = "openai/v1/retrievebatch"
 	ApiNameCancelBatch                          ApiName = "openai/v1/cancelbatch"
 	ApiNameModels                               ApiName = "openai/v1/models"
+	ApiNameSystemone                            ApiName = "systemone/v1/systemone"
 	ApiNameResponses                            ApiName = "openai/v1/responses"
 	ApiNameFineTuningJobs                       ApiName = "openai/v1/fine-tuningjobs"
 	ApiNameRetrieveFineTuningJob                ApiName = "openai/v1/retrievefine-tuningjob"
@@ -98,6 +99,9 @@ const (
 	PathOpenAIRetrieveBatch                        = "/v1/batches/{batch_id}"
 	PathOpenAICancelBatch                          = "/v1/batches/{batch_id}/cancel"
 	PathOpenAIModels                               = "/v1/models"
+
+	// Systemone (Jev decision contract)
+	PathSystemone = "/v1/systemone"
 	PathOpenAIImageGeneration                      = "/v1/images/generations"
 	PathOpenAIImageEdit                            = "/v1/images/edits"
 	PathOpenAIImageVariation                       = "/v1/images/variations"
@@ -168,6 +172,7 @@ const (
 	providerTypeFireworks  = "fireworks"
 	providerTypeGaladriel  = "galadriel"
 	providerTypeVllm       = "vllm"
+	providerTypeSystemone  = "systemone"
 	providerTypeGeneric    = "generic"
 	providerTypeKling      = "kling"
 
@@ -276,6 +281,7 @@ var (
 		providerTypeFireworks:  &fireworksProviderInitializer{},
 		providerTypeGaladriel:  &galadrielProviderInitializer{},
 		providerTypeVllm:       &vllmProviderInitializer{},
+		providerTypeSystemone:  &systemoneProviderInitializer{},
 		providerTypeGeneric:    &genericProviderInitializer{},
 		providerTypeKling:      &klingProviderInitializer{},
 	}
@@ -337,6 +343,15 @@ type ProviderConfig struct {
 	// @Title zh-CN API Tokens
 	// @Description zh-CN 在请求AI服务时用于认证的API Token列表。不同的AI服务提供商可能有不同的名称。部分供应商只支持配置一个API Token（如Azure OpenAI）。
 	apiTokens []string `required:"false" yaml:"apiTokens" json:"apiTokens"`
+	// @Title zh-CN Systemone Endpoint
+	// @Description zh-CN Jev 决策服务（systemone 类型）的 base url；缺省使用托管 TypeSafe API（https://api.typesafe.ai）
+	systemoneEndpoint string `required:"false" yaml:"systemoneEndpoint" json:"systemoneEndpoint"`
+	// @Title zh-CN Systemone 默认决策模型
+	// @Description zh-CN systemone 请求未携带 model 字段时使用的默认决策引擎模型
+	systemoneModel string `required:"false" yaml:"systemoneModel" json:"systemoneModel"`
+	// @Title zh-CN TypeSafe Danger Zone Images Header
+	// @Description zh-CN TypeSafe-Danger-Zone-Images opt-in 头的注入策略：auto（默认，请求携带图片且客户端未显式发送时注入）、true（无条件确保该头存在，客户端显式发送的值不被覆盖）、false（完全不注入）
+	systemoneDangerZoneHeader string `required:"false" yaml:"typesafeDangerZoneHeader" json:"typesafeDangerZoneHeader"`
 	// @Title zh-CN 请求超时
 	// @Description zh-CN 请求AI服务的超时时间，单位为毫秒。默认值为120000，即2分钟。此项配置目前仅用于获取上下文信息，并不影响实际转发大模型请求。
 	timeout uint32 `required:"false" yaml:"timeout" json:"timeout"`
@@ -595,6 +610,9 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	// first byte timeout
 	c.firstByteTimeout = uint32(json.Get("firstByteTimeout").Uint())
 	c.openaiCustomUrl = json.Get("openaiCustomUrl").String()
+	c.systemoneEndpoint = json.Get("systemoneEndpoint").String()
+	c.systemoneModel = json.Get("systemoneModel").String()
+	c.systemoneDangerZoneHeader = json.Get("typesafeDangerZoneHeader").String()
 	c.moonshotFileId = json.Get("moonshotFileId").String()
 	c.azureServiceUrl = json.Get("azureServiceUrl").String()
 	c.qwenFileIds = make([]string, 0)
