@@ -116,6 +116,31 @@ spec:
         # health but failOpen -- the windows all live in the finisher.
         # health:
         #   failOpen: false
+        #
+        # routeRules (optional): deterministic request->pool narrowing.
+        # First matching rule narrows `candidates` to its targets before the
+        # candidate set is built; health filtering, failOpen, the capability
+        # band and the finisher then all operate within the narrowed subset.
+        # No rule matching (or no routeRules at all) = the full pool,
+        # behaviour identical to before. Headers are read live at 340 -- the
+        # post-authn view (810 strip + 360 ext-auth injection already done).
+        # contextLength prefers the gpustack_request_context.lengthBytes
+        # filter-state measurement (written by generic-proxy-router after a
+        # body rewrite, which drops Content-Length) and falls back to the
+        # Content-Length header. A length rule with no measurement available
+        # does not match -- safe degradation, never a wrong pool.
+        # routeRules:
+        #   - name: vip-fixed
+        #     match:
+        #       headers:
+        #         - {name: x-gpustack-tier, exact: vip}    # ext-auth-injected
+        #         - {name: x-api-key, prefix: "sk-vip-*"}
+        #       model: "deepseek-r1*"                      # modelMappers syntax
+        #     targets: ["2"]
+        #   - name: long-context
+        #     match:
+        #       contextLength: {min: 65536}                # bytes, per-rule threshold
+        #     targets: ["3"]
 ---
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin

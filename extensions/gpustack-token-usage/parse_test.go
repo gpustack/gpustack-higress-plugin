@@ -12,9 +12,9 @@ func strPtr(v string) *string { return &v }
 
 func TestParseConsumerHeader(t *testing.T) {
 	cases := []struct {
-		input     string
-		wantUID   *int64
-		wantAK    *string
+		input   string
+		wantUID *int64
+		wantAK  *string
 	}{
 		{"", nil, nil},
 		{"none", nil, nil},
@@ -79,24 +79,24 @@ func TestParseClusterName(t *testing.T) {
 
 func TestParseRouteName(t *testing.T) {
 	cases := []struct {
-		input    string
-		wantID   *int64
+		input  string
+		wantID *int64
 	}{
 		{"ai-route-route-1.internal", int64Ptr(1)},
 		{"ai-route-route-42.internal", int64Ptr(42)},
 		{"ai-route-route-7.fallback.internal", int64Ptr(7)},
 		{"ai-route-route-100.fallback.internal", int64Ptr(100)},
-		{"ai-route-route-1", int64Ptr(1)},        // suffix is optional
+		{"ai-route-route-1", int64Ptr(1)}, // suffix is optional
 		// Namespace-qualified names
 		{"gpustack-system/ai-route-route-2.internal", int64Ptr(2)},
 		{"gpustack-system/ai-route-route-7.fallback.internal", int64Ptr(7)},
 		{"gpustack-system/ai-route-route-3", int64Ptr(3)},
 		// Invalid / unrelated
 		{"", nil},
-		{"ai-route-route-.internal", nil},        // empty id
-		{"ai-route-route-abc.internal", nil},     // non-numeric id
-		{"ai-route-route-", nil},                 // empty id, no suffix
-		{"other-route-1.internal", nil},          // wrong prefix
+		{"ai-route-route-.internal", nil},               // empty id
+		{"ai-route-route-abc.internal", nil},            // non-numeric id
+		{"ai-route-route-", nil},                        // empty id, no suffix
+		{"other-route-1.internal", nil},                 // wrong prefix
 		{"gpustack-system/other-route-1.internal", nil}, // wrong prefix after namespace
 		{"gpustack-system/", nil},                       // namespace only
 	}
@@ -126,9 +126,9 @@ func buildMultipartBody(t *testing.T, fields map[string]string) ([]byte, string)
 
 func TestExtractModelFromMultipart(t *testing.T) {
 	cases := []struct {
-		name        string
-		buildBody   func(t *testing.T) ([]byte, string)
-		wantModel   string
+		name      string
+		buildBody func(t *testing.T) ([]byte, string)
+		wantModel string
 	}{
 		{
 			name: "model field present",

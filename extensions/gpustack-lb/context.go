@@ -23,15 +23,51 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 
 // handleLBMode does exactly three things: filter, publish, continue. It stays
 // in the header phase throughout and never touches the body.
+//
+// Ordering on a fallback (redirect re-entry) pass, each stage narrowing the
+// next: exclude every ATTEMPTED cluster (the accumulated x-gpustack-lb-tried
+// header — excluding only the last one would let two failing main clusters
+// alternate until the redirect budget expires); then routeRules (a rule
+// narrowing to [A,F] must keep F eligible even when the main-tier survivor B
+// exists — the rule's verdict outranks the tier); then the tier split (main
+// tier while it has survivors in the narrowed set, the fallback tier only
+// when it does not). A normal pass runs the same chain minus the exclusion.
+// Only when the marker is present but no target header survived does the
+// legacy behaviour (publish nothing, let the fallback ingress own the pass)
+// apply.
 func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	ctx.DontReadRequestBody()
 
-	// A fallback is an internal redirect that re-runs the whole filter chain.
-	// The point of that pass is to go somewhere else, so no candidate set is
-	// published -- the finisher finds nothing and skips LB.
-	if v, err := proxywasm.GetHttpRequestHeader("x-higress-fallback-from"); err == nil && v != "" {
-		proxywasm.LogDebugf("%s: fallback pass (%s), skip publishing candidates", pluginName, v)
-		return types.ActionContinue
+	// The untouched configured pool, PRE-exclusion: the degenerate guard's
+	// last resort re-runs the rule narrowing over it (the post-exclusion
+	// pool is empty precisely when everything allowed was tried, so it
+	// cannot serve as its own rescue source).
+	originalPool := config.candidates
+
+	if v, err := proxywasm.GetHttpRequestHeader(fallbackFromHeader); err == nil && v != "" {
+		if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr != nil || prev == "" {
+			// No LB-written target header: either a legacy fallback deployment
+			// (its fallback ingress steers by this very marker) or a forged
+			// marker on a request LB never touched. Publish nothing either way.
+			proxywasm.LogDebugf("%s: fallback pass (%s) without a target header, skip publishing candidates", pluginName, v)
+			return types.ActionContinue
+		}
+		tried := triedClusters()
+		if len(tried) == 0 {
+			// The accumulator header did not survive (very first pass of a
+			// deployment that predates it, or stripped mid-chain): fall back
+			// to excluding the last target header only.
+			if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr == nil && prev != "" {
+				tried = []string{prev}
+			}
+		}
+		narrowed := excludeClusters(config.candidates, tried)
+		if len(narrowed) == len(config.candidates) {
+			proxywasm.LogDebugf("%s: fallback pass (%s): no candidate excluded, keeping the full set", pluginName, v)
+		} else {
+			proxywasm.LogDebugf("%s: fallback pass (%s): excluding %d tried cluster(s), %d/%d candidates remain", pluginName, v, len(tried), len(narrowed), len(config.candidates))
+		}
+		config.candidates = narrowed
 	}
 
 	// The client's model name comes from the x-higress-llm-model header, which
@@ -40,6 +76,61 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// exact-match-header-x-higress-llm-model annotation is itself proof the
 	// header exists before 340, otherwise the route would not match at all.)
 	clientModel, _ := proxywasm.GetHttpRequestHeader("x-higress-llm-model")
+
+	// routeRules narrow the pool first (deterministic routing): state is
+	// then loaded only for the surviving candidates, and every later stage
+	// -- health filtering, failOpen, the capability band's scoring -- sees
+	// only the narrowed subset, so a matched request can never silently
+	// fall back to a candidate its rule excluded. applyRouteRules returns
+	// config.candidates itself when no rule matches, so an unmatched
+	// request is literally the same code path as before this feature.
+	if len(config.routeRules) > 0 {
+		config.candidates = applyRouteRules(config, clientModel)
+	}
+
+	// The tier split runs AFTER the rule narrowing: a rule's verdict
+	// outranks the tier (a rule narrowing to [A, F] must keep the fallback
+	// F eligible even when a main-tier survivor exists outside the rule).
+	// A normal pass publishes the main tier only — the fallback tier takes
+	// no share of healthy traffic. On a fallback pass the main tier serves
+	// while it has survivors in the narrowed set; the fallback tier only
+	// when it does not. The tier split narrows ONLY the published set:
+	// config.candidates keeps the full (main+fallback) narrowed pool so
+	// the health-aware drain inside LoadStates can still reach the
+	// fallback tier when every main survivor turns out to be ejected.
+	publishPool := config.candidates
+	if main := mainTier(config.candidates); len(main) > 0 {
+		config.candidates = main
+	}
+
+	// Degenerate guard: if every stage together emptied the set — all
+	// rule-allowed candidates sit on tried clusters — writing nothing
+	// under cluster_header is the 503 that does not flush. Re-run the
+	// rule narrowing over the ORIGINAL pool (not the post-exclusion
+	// rulePool, which is empty in exactly this situation) and restore
+	// its tier split into BOTH the published set and the state-loading
+	// pool (restoring only config.candidates would leave publishPool
+	// empty and the rescued candidates stateless). The redirect budget
+	// bounds the loop and health marking meanwhile drives the dead
+	// instances out.
+	if len(config.candidates) == 0 && len(originalPool) > 0 {
+		rescueCfg := config
+		rescueCfg.candidates = originalPool
+		rescuePool := originalPool
+		if len(rescueCfg.routeRules) > 0 {
+			rescuePool = applyRouteRules(rescueCfg, clientModel)
+		}
+		if rescue := tieredFallback(rescuePool); len(rescue) > 0 {
+			proxywasm.LogDebugf("%s: all-tried dead end, rescuing %d rule-allowed candidate(s)", pluginName, len(rescue))
+			// config.candidates takes the tier-restricted pool (the
+			// published set), publishPool keeps the FULL rule pool —
+			// the same shape as the normal path, so the state load and
+			// the healthy-fallback drain can still reach a fallback
+			// candidate when the rescued main tier turns out ejected.
+			config.candidates = rescue
+			publishPool = rescuePool
+		}
+	}
 
 	// **Do not call ctx.DisableReroute()**: it stops the route from being
 	// re-evaluated after the headers change, which is exactly what the
@@ -52,13 +143,27 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// redis pauses under watermark and resumes from the callback. Everything
 	// below the load is identical either way, which is what keeps the two
 	// backends from drifting apart.
+	//
+	// States are loaded for the FULL narrowed pool (main + fallback tier):
+	// loading only the main tier would leave the drain below stateless.
 	nowMs := nowMillis()
-	return config.stateBackend().LoadStates(candidateRefs(config.candidates), nowMs, config.maxInflightAgeMs,
+	return config.stateBackend().LoadStates(candidateRefs(publishPool), nowMs, config.maxInflightAgeMs,
 		func(states map[string]clusterState) {
+			// Prefer the healthy main tier, then drain to the healthy
+			// fallback tier, and only as the last resort let failOpen
+			// re-admit condemned instances (buildCandidateSet's own
+			// fail-open logic). buildFailClosed enforces that preference
+			// order without ever handing an ejected candidate back.
+			if set := buildFailClosed(config, publishPool, nowMs, clientModel, states); len(set.Candidates) > 0 {
+				publishCandidates(set)
+				proxywasm.LogDebugf("%s: published %d/%d candidates (weighted=%t)",
+					pluginName, len(set.Candidates), len(publishPool), isWeighted(set.Candidates))
+				return
+			}
 			set := buildCandidateSet(config, nowMs, clientModel, states)
 			publishCandidates(set)
-			proxywasm.LogDebugf("%s: published %d/%d candidates (weighted=%t)",
-				pluginName, len(set.Candidates), len(config.candidates), isWeighted(set.Candidates))
+			proxywasm.LogDebugf("%s: fail-open published %d/%d candidates (weighted=%t)",
+				pluginName, len(set.Candidates), len(publishPool), isWeighted(set.Candidates))
 		})
 }
 
@@ -230,6 +335,115 @@ func buildCandidateSet(config Config, nowMs int64, clientModel string, states ma
 
 	out.Candidates = alive
 	return out
+}
+
+// triedClusters reads the accumulated attempted-clusters header written by
+// the finisher on every pass (comma-separated). Empty when the header is
+// absent (first pass, or a chain that stripped it).
+func triedClusters() []string {
+	v, err := proxywasm.GetHttpRequestHeader(triedClustersHeader)
+	if err != nil || v == "" {
+		return nil
+	}
+	var out []string
+	for _, c := range strings.Split(v, ",") {
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// excludeClusters removes every candidate of the given clusters — the
+// fallback re-selection primitive over the ATTEMPTED set. Pure function so
+// it is directly unit-testable; the host calls stay in handleLBMode.
+func excludeClusters(cands []candidateSpec, clusters []string) []candidateSpec {
+	if len(clusters) == 0 {
+		return cands
+	}
+	exclude := make(map[string]struct{}, len(clusters))
+	for _, c := range clusters {
+		exclude[c] = struct{}{}
+	}
+	out := make([]candidateSpec, 0, len(cands))
+	for _, c := range cands {
+		if _, bad := exclude[c.Cluster]; !bad {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// mainTier keeps only the non-fallback candidates. The inverse filter is
+// the fallback tier: those candidates join the published set only on a
+// re-selection pass whose main tier is exhausted.
+func mainTier(cands []candidateSpec) []candidateSpec {
+	out := make([]candidateSpec, 0, len(cands))
+	for _, c := range cands {
+		if !c.Fallback {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// fallbackTierOnly returns the fallback-tier candidates of a narrowed set
+// that are not ejected — the health-aware drain target when the main tier
+// produced nothing publishable. nil when there is no healthy fallback
+// candidate. Pure over the loaded state, so it is unit-testable.
+func fallbackTierOnly(cands []candidateSpec, states map[string]clusterState) []candidateSpec {
+	var out []candidateSpec
+	now := nowMillis()
+	for _, c := range cands {
+		if !c.Fallback {
+			continue
+		}
+		if h := states[c.Key()].Health; now < h.EjectedUntil {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// tieredFallback restores a tier split over an emptied pool: the main tier
+// of the full (post-rule) pool when it has any candidate, otherwise the
+// fallback tier. Used by the degenerate all-tried guard, which must
+// republish SOMETHING (an empty cluster_header set is a non-flushing 503)
+// without letting the escape hatch bypass the matched route rule or the
+// tier discipline.
+func tieredFallback(fullPool []candidateSpec) []candidateSpec {
+	if main := mainTier(fullPool); len(main) > 0 {
+		return main
+	}
+	return fullPool
+}
+
+// buildFailClosed is the strict preference order over the narrowed pool
+// with fail-open OFF: healthy main tier first, then the healthy fallback
+// tier. It bypasses buildCandidateSet's fail-open re-admission entirely
+// (that path hands back the very instances the health verdict condemned);
+// an empty result tells the caller the pool has nothing left and the
+// fail-open build is the last resort. Pure over the loaded state, so it
+// is unit-testable.
+var noFailOpen = false
+
+func buildFailClosed(config Config, publishPool []candidateSpec, nowMs int64, clientModel string, states map[string]clusterState) CandidateSet {
+	// The published set is the main tier when it has survivors in the
+	// narrowed pool (set by handleLBMode); the fallback tier of the FULL
+	// narrowed pool (publishPool, main + fallback) is the drain target --
+	// the main-tier config alone no longer contains it.
+	fc := config
+	fc.failOpen = &noFailOpen
+	if set := buildCandidateSet(fc, nowMs, clientModel, states); len(set.Candidates) > 0 {
+		return set
+	}
+	fbc := fc
+	fbc.candidates = fallbackTierOnly(publishPool, states)
+	if fbc.candidates == nil {
+		return CandidateSet{}
+	}
+	return buildCandidateSet(fbc, nowMs, clientModel, states)
 }
 
 func publishCandidates(set CandidateSet) {

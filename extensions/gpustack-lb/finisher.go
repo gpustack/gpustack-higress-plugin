@@ -16,6 +16,10 @@ import (
 const (
 	targetClusterHeader = "x-higress-target-cluster"
 	fallbackFromHeader  = "x-higress-fallback-from"
+	// triedClustersHeader accumulates every cluster this request was
+	// dispatched to, across internal-redirect passes, so a re-selection
+	// pass can exclude them all (see recordTriedCluster).
+	triedClustersHeader = "x-gpustack-lb-tried"
 
 	ctxKeyChosen        = "gpustack_lb_chosen"
 	ctxKeyInflightToken = "gpustack_lb_inflight_token"
@@ -32,27 +36,33 @@ type chosen struct {
 
 func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 	// A fallback is an internal redirect that re-runs the whole filter chain.
-	// The whole point of that pass is to go somewhere else, so it must not be
-	// pinned back to the cluster that just failed: skip LB and strip any
-	// header that may have survived.
+	// With the context role re-publishing an exclusion-filtered candidate set
+	// on that pass, selection proceeds normally here and the header it writes
+	// simply points at a different cluster. The header only has to be handled
+	// explicitly when **no** candidate set came down: a legacy fallback
+	// deployment (its fallback ingress steers by this marker) or a non-LB
+	// route, where any surviving x-higress-target-cluster is client-supplied
+	// or stale and must not reach cluster_header routing.
 	//
-	// ⚠️ This header is **trusted, and it is an ordinary request header**, so a
-	// client that sets it gets LB skipped -- and with cluster_header in place
-	// that means no cluster at all, i.e. the 503 that does not flush. Nothing
-	// here can tell it apart from one Envoy set (that is precisely what makes
-	// it usable as a redirect marker), so the listener has to strip it:
-	// internal_only_headers. The README records this as a prerequisite next to
-	// the cluster_header patch.
+	// ⚠️ The marker is **trusted, and it is an ordinary request header**, so a
+	// client that sets it on a non-LB route gets the header stripped here --
+	// and with cluster_header in place that means no cluster at all, i.e. the
+	// 503 that does not flush. Nothing here can tell it apart from one Envoy
+	// set (that is precisely what makes it usable as a redirect marker), so
+	// the listener has to strip it: internal_only_headers. The README records
+	// this as a prerequisite next to the cluster_header patch.
+	isFallback := false
 	if v, err := proxywasm.GetHttpRequestHeader(fallbackFromHeader); err == nil && v != "" {
-		_ = proxywasm.RemoveHttpRequestHeader(targetClusterHeader)
-		ctx.DontReadRequestBody()
-		return types.ActionContinue
+		isFallback = true
 	}
 
 	set, ok := readCandidateSet()
 	if !ok {
-		// No candidate set means LB is not enabled on this route. Pass through
-		// untouched.
+		if isFallback {
+			_ = proxywasm.RemoveHttpRequestHeader(targetClusterHeader)
+		}
+		// No candidate set means LB is not enabled on this route (or this is a
+		// legacy fallback pass). Pass through untouched.
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
@@ -158,6 +168,16 @@ func finalizeSelection(ctx wrapper.HttpContext, config Config, ordered []Candida
 	if err := proxywasm.ReplaceHttpRequestHeader(targetClusterHeader, c.Cluster); err != nil {
 		proxywasm.LogErrorf("%s: write %s failed: %v", pluginName, targetClusterHeader, err)
 	}
+	// Accumulate the attempt on the tried-clusters header so a redirect
+	// re-entry pass can exclude EVERY attempted cluster, not just the
+	// last one: two main clusters returning application-level 503s would
+	// otherwise alternate A -> B -> A -> B until the redirect budget
+	// expires without ever draining to the fallback tier (application
+	// errors do not trigger passive-health ejection, so nothing else
+	// breaks the cycle). An ordinary request header, same trust caveat as
+	// x-higress-fallback-from: strip it at the listener if clients must
+	// not influence the exclusion set.
+	recordTriedCluster(c.Cluster)
 
 	// The token identifies this request's in-flight entry; the store hands it
 	// back at onHttpStreamDone so exactly this entry is released. An empty
@@ -269,6 +289,29 @@ func finisherOnStreamDone(ctx wrapper.HttpContext, config Config) {
 		CooldownMs:  config.cooldownMs,
 		RampMs:      config.rampMs,
 	})
+	// One line per filter-chain run. An internal-redirect re-selection runs
+	// this once per pass (verified on a live gateway), so the pair
+	// "selected ... / stream done ..." repeats per attempt and the in-flight
+	// accounting stays per-attempt without compensation.
+	proxywasm.LogDebugf("%s: stream done: cluster=%s outcome=%d", pluginName, pick.cluster, oc)
+}
+
+// recordTriedCluster appends the cluster to the tried-clusters header,
+// comma-separated, deduplicated. The header survives internal redirects
+// (Envoy replays the request headers), which is exactly what makes the
+// accumulated set readable on every later pass.
+func recordTriedCluster(cluster string) {
+	existing, _ := proxywasm.GetHttpRequestHeader(triedClustersHeader)
+	for _, c := range strings.Split(existing, ",") {
+		if c == cluster {
+			return
+		}
+	}
+	v := cluster
+	if existing != "" {
+		v = existing + "," + cluster
+	}
+	_ = proxywasm.ReplaceHttpRequestHeader(triedClustersHeader, v)
 }
 
 func readCandidateSet() (CandidateSet, bool) {

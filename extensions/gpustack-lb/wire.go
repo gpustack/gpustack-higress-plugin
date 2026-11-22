@@ -28,9 +28,16 @@ const (
 	FilterStateCandidates = wire.FilterStateCandidates
 	FilterStateRanks      = wire.FilterStateRanks
 
+	// FilterStateRequestContext: request measurements (body length) written
+	// by generic-proxy-router upstream in the chain; see wire.go.
+	FilterStateRequestContext = wire.FilterStateRequestContext
+
 	KindInstance = wire.KindInstance
 	KindProvider = wire.KindProvider
 )
+
+// RequestContext is the value stored under FilterStateRequestContext.
+type RequestContext = wire.RequestContext
 
 // SharedInflightPrefix / SharedHealthPrefix + <full cluster name>.
 //
