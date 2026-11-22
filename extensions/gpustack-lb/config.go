@@ -98,6 +98,12 @@ type Config struct {
 	// -- Specific to mode: context.
 	lbMode     bool
 	candidates []candidateSpec
+	// routeRules narrows the candidate pool per request (deterministic
+	// routing: header / model / body-length match -> a fixed subset of
+	// targets). Parsed and validated against candidates at config time;
+	// evaluated per request in applyRouteRules before the candidate set is
+	// built. Empty means the feature is off and behaviour is unchanged.
+	routeRules []routeRule
 	// modelMappers holds model-name mappings grouped by targetId. The keys use
 	// model-mapper's existing syntax (exact / "prefix*" / "*"). The publisher
 	// resolves the model name the client sent into the rewrite target and
@@ -702,11 +708,22 @@ func parseLB(j gjson.Result, config *Config) error {
 			}
 			maxRunning = v
 		}
+		// The fallback tier mark. Strict bool: a typo coerced to false would
+		// silently move a fallback target into the main tier, handing it a
+		// share of healthy traffic -- the exact semantics this field guards.
+		var fallback bool
+		if fb := c.Get("fallback"); fb.Exists() && fb.Type != gjson.Null {
+			if fb.Type != gjson.True && fb.Type != gjson.False {
+				return fmt.Errorf("candidates[].fallback must be a boolean, got %s (cluster %q)", fb.Raw, cluster)
+			}
+			fallback = fb.Type == gjson.True
+		}
 		cand := candidateSpec{
 			Candidate: Candidate{
 				Cluster:  cluster,
 				TargetID: c.Get("targetId").String(),
 				Kind:     kind,
+				Fallback: fallback,
 			},
 			maxRunningRequests: maxRunning,
 			// ModelName is not set here: it is resolved per request from
@@ -819,6 +836,20 @@ func parseLB(j gjson.Result, config *Config) error {
 			return groupErr
 		}
 	}
+
+	// routeRules narrows the pool per request. Parsed **after** candidates
+	// so each rule's targets can be validated against the targetIds that
+	// actually exist -- a rule pointing at a targetId that is not in this
+	// config is a config error, not a silent no-op.
+	ids := make(map[string]struct{}, len(config.candidates))
+	for _, c := range config.candidates {
+		ids[c.TargetID] = struct{}{}
+	}
+	rules, err := parseRouteRules(j.Get("routeRules"), ids)
+	if err != nil {
+		return err
+	}
+	config.routeRules = rules
 
 	config.lbMode = true
 

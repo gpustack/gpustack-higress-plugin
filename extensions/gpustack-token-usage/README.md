@@ -57,6 +57,19 @@ additionalClusterNameRegexps:
 # Default: X-Organization-Id
 organizationIDHeader: X-Organization-Id
 
+# Optional: additional usage-attribution dimensions (gpustack#6738). Each
+# entry maps an inbound request header to an attribute name on the
+# metrics-report payload (`attributes` object). Headers are matched
+# case-insensitively; an absent header simply contributes no attribute —
+# metering fails open and never blocks traffic.
+attributionHeaders:
+  - header: x-app-id
+    attribute: app_id
+  - header: x-end-user
+    attribute: end_user
+  - header: x-gpustack-tier      # injected by gpustack-ext-auth (AUTHN/360);
+    attribute: tier              # client copies are stripped at 810
+
 # Optional: response header carrying the reported `request_id` back to the
 # caller, so there is something to quote when asking about a request. Envoy
 # does not return `x-request-id` downstream on its own (the HCM's

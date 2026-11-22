@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb/wire"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -34,6 +36,7 @@ const (
 	// router/mapper split).
 	ctxKeyBodyDriven  = "gpustack_grp_body_driven"
 	ctxKeyContentType = "gpustack_grp_content_type"
+	ctxKeyFallbackPass = "gpustack_grp_fallback_pass"
 )
 
 // AutoRoutingRule defines a regex-based routing rule for `model: higress/auto`
@@ -249,6 +252,46 @@ func multipartBoundary(contentType string) string {
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
+	// A fallback (internal-redirect) re-entry pass: the request is here
+	// because its previous target failed, and gpustack-lb's finisher has
+	// already rewritten the body's `model` field to that failed target's
+	// backend name. Re-deriving the routing model from the body here would
+	// overwrite x-higress-llm-model with the backend name — breaking the
+	// route match keyed on the public alias and the next target's
+	// modelMappers resolution. So the routing header always survives.
+	// Whether the body needs re-buffering is decided by the conditions
+	// below (LB re-entry AND a rewrite-dropped Content-Length).
+	if v, err := proxywasm.GetHttpRequestHeader("x-higress-fallback-from"); err == nil && v != "" {
+		// The length-only body pass applies ONLY to an LB re-selection
+		// re-entry, identified by a surviving x-higress-target-cluster.
+		// A legacy fallback deployment (marker without a target header)
+		// bypassed buffering on its FIRST pass — a path-driven upload
+		// went straight through — so buffering here would 413 bodies
+		// the first upstream already accepted. Keep those header-only.
+		// Even on an LB re-entry, buffering is needed only when the
+		// first pass actually REWROTE the body (its Content-Length
+		// removal is the tell): an intact Content-Length means the first
+		// pass went through unbuffered, so the length rules' CL fallback
+		// still works and re-imposing the buffer limit here would 413 a
+		// large upload the first upstream already accepted.
+		if t, terr := proxywasm.GetHttpRequestHeader("x-higress-target-cluster"); terr == nil && t != "" {
+			if cl, clerr := proxywasm.GetHttpRequestHeader("content-length"); clerr != nil || cl == "" {
+				proxywasm.LogInfof("%s: LB fallback re-entry pass (%s), length-only body pass", pluginName, v)
+				ctx.SetContext(ctxKeyFallbackPass, true)
+				if !ctx.HasRequestBody() {
+					ctx.DontReadRequestBody()
+					return types.ActionContinue
+				}
+				ctx.SetRequestBodyBufferLimit(config.maxBodyBytes)
+				return types.HeaderStopIteration
+			}
+			proxywasm.LogInfof("%s: LB fallback re-entry pass (%s), intact Content-Length, passing through", pluginName, v)
+		} else {
+			proxywasm.LogInfof("%s: legacy fallback pass (%s), passing through", pluginName, v)
+		}
+		ctx.DontReadRequestBody()
+		return types.ActionContinue
+	}
 	path, err := proxywasm.GetHttpRequestHeader(":path")
 	if err != nil {
 		proxywasm.LogWarnf("%s: failed to read :path header: %v — passing through", pluginName, err)
@@ -371,6 +414,15 @@ func writeRoutingHeaders(config PluginConfig, target string) string {
 // ActionContinue — which resumes envoy's header iteration and triggers
 // route re-matching against the `x-higress-llm-model` header we wrote.
 func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
+	// The fallback re-entry length-only pass: republish the measurement
+	// (filter state is recreated per redirect pass; the header was dropped
+	// by the pass-1 rewrite) and touch nothing else — no model extraction,
+	// no rewrite, no routing headers. The finisher rewrites the body for
+	// whichever candidate it re-selects.
+	if fb, _ := ctx.GetContext(ctxKeyFallbackPass).(bool); fb {
+		publishRequestLength(body, nil)
+		return types.ActionContinue
+	}
 	if armed, _ := ctx.GetContext(ctxKeyBodyDriven).(bool); !armed {
 		// Body callback fired without header-phase arming — should not
 		// happen, but bail safely.
@@ -391,9 +443,38 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	if out != nil && !bytes.Equal(out, body) {
 		if err := proxywasm.ReplaceHttpRequestBody(out); err != nil {
 			proxywasm.LogWarnf("%s: ReplaceHttpRequestBody failed: %v", pluginName, err)
+			// The upstream body stays as-is, so the length to publish is
+			// the original one.
+			out = nil
 		}
 	}
+	publishRequestLength(body, out)
 	return types.ActionContinue
+}
+
+// publishRequestLength writes the final request-body length into the
+// filter state under wire.FilterStateRequestContext, for consumers below
+// (gpustack-lb's context role at AUTHN/340). This runs **after** any body
+// rewrite: rewriting the body makes Envoy drop `Content-Length`, and this
+// plugin is then the only participant that still knows the length. The
+// header-phase pause above guarantees no consumer's header callback has
+// run yet, so the property is always visible to them.
+//
+// final is nil when no rewrite happened (or the rewrite failed): the
+// length is then the assembled body we received.
+func publishRequestLength(body, final []byte) {
+	n := int64(len(body))
+	if final != nil {
+		n = int64(len(final))
+	}
+	data, err := json.Marshal(wire.RequestContext{LengthBytes: &n})
+	if err != nil {
+		proxywasm.LogWarnf("%s: marshal request context failed: %v", pluginName, err)
+		return
+	}
+	if err := proxywasm.SetProperty([]string{wire.FilterStateRequestContext}, data); err != nil {
+		proxywasm.LogDebugf("%s: publish request length failed: %v", pluginName, err)
+	}
 }
 
 // handleMultipartBody walks the multipart body via the stdlib
@@ -577,4 +658,3 @@ func matchAutoRoutingRule(rules []AutoRoutingRule, message string) (string, bool
 	}
 	return "", false
 }
-
