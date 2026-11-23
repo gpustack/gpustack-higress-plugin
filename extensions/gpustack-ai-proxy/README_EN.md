@@ -31,6 +31,11 @@ description: Reference for configuring the AI Proxy plugin
 >   configuration.
 > - Added the `toolCallValidation` structural tool/tool_calls pairing check on the Chat
 >   Completions request path, off by default (see gpustack/gpustack#6210).
+> - Added `requestPrioritySource` / `requestPriorityTarget`: translate the caller's
+>   inference request priority written by `gpustack-ext-auth` into the backend's scheduling
+>   input -- for vLLM header `x-vllm-priority = -p` plus the same body member (its pooling
+>   endpoints read the body only), for SGLang body `priority = p`, nothing for any other
+>   provider (see gpustack/gpustack#6739).
 > - Added `cohere/v1/rerank` → `/compatible-api/v1/reranks` to the qwen provider's default
 >   capabilities in compatible mode (`qwenEnableCompatible: true`, GPUStack's default): an
 >   inbound Cohere-style `/v1/rerank` (the standard spelling used by the GPUStack UI,
@@ -97,6 +102,8 @@ Plugin execution priority: `100`
 |------------|--------|------|-----|------------------|
 | `provider` | object | Required   | -   | Configures information for the target AI service provider |
 | `toolCallValidation` | string | Optional | `off` | Structural `tool` / `tool_calls` pairing validation on the Chat Completions request path. `off` (the default) disables it entirely; `strict` rejects a malformed request with 400. See [Tool / tool_calls pairing validation](#tool--tool_calls-pairing-validation). |
+| `requestPrioritySource` | string | Optional | `x-gpustack-request-priority` | Request header carrying the caller's inference request priority (written by `gpustack-ext-auth`): a non-negative integer, larger = more urgent, absent = 0. Removed from the upstream request once read; whether and how it is translated is decided per provider by `requestPriorityTarget`. See [Request priority](#request-priority). |
+| `provider[].requestPriorityTarget` | string | Optional | - | Which backend the provider fronts, hence how the priority is delivered: `vllm` (header `x-vllm-priority = -p` and body `priority = -p`), `sglang` (body `priority = p`), unset (nothing). Rendered by GPUStack per model. See [Request priority](#request-priority). |
 
 **Details for the `provider` configuration fields:**
 
@@ -487,6 +494,79 @@ logs an ERROR. wasm-go swallows a global-config parse error and zeroes the globa
 GPUStack keeps `providers` only in `defaultConfig` — so a zeroed global would make the
 whole ai-proxy silently no-op. Taking the proxy down over a typo in one field costs far
 more than running the check in its default mode.
+
+## Request priority
+
+Translates the caller's inference request priority -- resolved per user / API
+key by `gpustack-ext-auth` and written as a request header -- into the
+scheduling input of the backend behind the active provider
+(gpustack/gpustack#6739). Two flat keys:
+
+| Key | Lives in | Meaning |
+| --- | --- | --- |
+| `requestPrioritySource` | top level of `defaultConfig`, inherited by matchRules that do not set it | Header carrying the priority, `x-gpustack-request-priority` by default. Non-negative integer, **larger = more urgent**; a request without it counts as `0`. The header is removed once read and never reaches an upstream |
+| `requestPriorityTarget` | each `provider` entry | Which backend the provider fronts: `vllm`, `sglang`, or unset (do nothing). Rendered by GPUStack per model |
+
+### The two backends
+
+| `requestPriorityTarget` | Written to | Value | Why |
+| --- | --- | --- | --- |
+| `vllm` | header `x-vllm-priority`, and top-level body `priority` | `-p` | vLLM schedules the **lower** value first. Its generation endpoints read the header (which overrides a body `priority`) but its pooling endpoints (`/v1/embeddings`) read the body only, so both are written on every request, `0` included, and a client-supplied body value is neutralised either way |
+| `sglang` | top-level body `priority` | `p` | SGLang schedules the **higher** value first and has no priority header |
+| unset / invalid | nothing | - | An invalid value logs one ERROR and behaves as unset -- not a config error, for the same reason as `toolCallValidation` |
+
+The same `p` yields the same ordering on both backends; only the sign differs.
+`0` lands on each backend's own baseline, level with traffic that never passed
+through the gateway. Do **not** run SGLang with
+`--schedule-low-priority-values-first`: it flips the direction and turns the
+most urgent caller into the least.
+
+### Where it applies
+
+- The vLLM header is written in the request-headers phase and is protocol-independent.
+- The body member (both targets) is written into the **final** body, after any
+  protocol conversion (Claude → OpenAI rebuilds the body), after `provider.context`
+  inserts its system message (which rebuilds the body again), and again on
+  `retryOnFailure` (which replays the pre-phase body and rebuilds the headers,
+  header included), for JSON bodies of chat completions / completions /
+  responses / embeddings only; multipart and `/v1/images/*` are untouched.
+  Every client-supplied `priority` member is removed first -- in one pass,
+  however many there are -- so a body carrying the key twice ends with exactly
+  one copy, the gateway's. The `generic` provider forwards the body outside
+  `handleRequestBody` and gets the member in its own `OnRequestBody`.
+- A body is only rewritten when the plugin reads it, so the media-type gate
+  that decides that recognises `application/json` case-insensitively and
+  `application/*+json`; otherwise `Content-Type: Application/JSON` would be a
+  way around the overwrite.
+- vLLM's `/v1/score`, `/v1/rerank` and `/v1/classify` are not classified by
+  this plugin and are passed through; the priority does not apply to them.
+- **SGLang's native Anthropic endpoint (`/v1/messages`) has no `priority`
+  field**: with `native_anthropic_api` on the Model, a Claude request passes
+  through verbatim and the priority silently does not apply; turning the flag
+  off lets ai-proxy convert to OpenAI, where it does.
+- Whether the value takes part in scheduling at all depends on the backend's
+  own flags: vLLM needs `--scheduling-policy priority`, SGLang
+  `--enable-priority-scheduling`. Without them vLLM rejects a non-zero value
+  and SGLang ignores it.
+- The source header is produced by `gpustack-ext-auth`, which also strips any
+  client-supplied copy; this plugin trusts it, but bounds it to a non-negative
+  32-bit integer (what vLLM validates) — a malformed value, including one
+  beyond that range, logs one WARN **per VM** (the value is client-influenced,
+  so it is not part of the warn-once key) and is treated as `0` rather than
+  failing the request.
+
+```yaml
+requestPrioritySource: x-gpustack-request-priority   # the default when omitted
+providers:
+  - id: model-42            # vLLM-backed model
+    type: openai
+    requestPriorityTarget: vllm
+  - id: model-43            # SGLang-backed model
+    type: openai
+    requestPriorityTarget: sglang
+  - id: model-7             # external provider / other backend: unset = do nothing
+    type: openai
+```
 
 ## Usage Examples
 

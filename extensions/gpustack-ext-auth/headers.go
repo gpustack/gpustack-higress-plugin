@@ -64,6 +64,19 @@ const (
 	// marker is not: it is protocol between this plugin and the server, not a
 	// client header an operator opted into.
 	headerDownstreamConn = "x-gpustack-downstream-conn"
+
+	// headerRequestPriority carries the caller's inference request priority,
+	// as GPustack defines it: a non-negative integer, larger meaning more
+	// urgent, absent meaning "no priority configured". ai-proxy translates it
+	// into the backend's own form (gpustack/gpustack#6739); this plugin only
+	// answers "how urgent is this caller", never "how does vLLM want it".
+	//
+	// Written only when the resolved identity's entry carries a priority. A
+	// client-supplied copy is dropped at the start of the request phase, and
+	// on the server-authorised path the server's own response header of the
+	// same name is relayed via allowed_upstream_headers, so an absent header
+	// always means "unconfigured" and never "forged".
+	headerRequestPriority = "x-gpustack-request-priority"
 )
 
 // credentialHeaders are the request headers that carry an end-user credential.

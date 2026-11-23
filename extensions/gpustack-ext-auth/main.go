@@ -214,6 +214,13 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// consumer on every 200, so the gap never opens in practice; removing it
 	// here means correctness does not depend on that staying true.
 	_ = proxywasm.RemoveHttpRequestHeader(headerConsumer)
+	// Same reasoning for the request priority: ai-proxy turns this header
+	// into the backend's scheduling input, so a client that could supply it
+	// would be scheduling itself ahead of everyone. Every path below either
+	// writes an authoritative value or leaves the header absent; on the
+	// server-authorised path the server's own copy arrives later through
+	// allowed_upstream_headers.
+	_ = proxywasm.RemoveHttpRequestHeader(headerRequestPriority)
 
 	if !config.Authz.ready() {
 		log.Errorf("%s: authz endpoint is not configured; failing closed", pluginName)
@@ -463,7 +470,7 @@ func skipAuthz(config PluginConfig, id identity, consumer, model, conn string, n
 	// resolved the caller, and under which policy, when that needs diagnosing.
 	log.Debugf("%s: allowing %s locally on a %s route, consumer %q",
 		pluginName, describeCaller(id), config.AccessPolicy, consumer)
-	applyUpstreamRewrites(config, consumer)
+	applyUpstreamRewrites(config, consumer, id, now)
 	// The server never runs on this path, so it can never mint the marker the
 	// fallback pass needs. If the plugin cannot sign either, the redirect has
 	// nothing to authenticate with.
@@ -484,13 +491,36 @@ func skipAuthz(config PluginConfig, id identity, consumer, model, conn string, n
 // Removal runs last so it also clears anything allowed_upstream_headers just
 // copied in -- notably a `cookie: dummy=dummy` from a server that still sends
 // one.
-func applyUpstreamRewrites(config PluginConfig, consumer string) {
+func applyUpstreamRewrites(config PluginConfig, consumer string, id identity, now time.Time) {
 	if consumer != "" {
 		_ = proxywasm.ReplaceHttpRequestHeader(headerConsumer, consumer)
+	}
+	// Written only when the table says so. When it does not, whatever is on
+	// the request is left alone: on the server-authorised path that is the
+	// server's own header, relayed by applyUpstreamHeaders a moment earlier.
+	if priority, ok := requestPriority(config, id, now); ok {
+		_ = proxywasm.ReplaceHttpRequestHeader(headerRequestPriority, priority)
 	}
 	for _, name := range config.UpstreamRequest.HeadersToRemove {
 		_ = proxywasm.RemoveHttpRequestHeader(name)
 	}
+}
+
+// requestPriority renders the caller's inference request priority as the
+// header value ai-proxy consumes, empty when the caller has none.
+//
+// Pure, so the lookup can be tested without a host. Anonymous callers have no
+// key to carry a priority, and an unresolved caller's priority -- if any --
+// is the server's to publish on its response, not this plugin's to guess.
+func requestPriority(config PluginConfig, id identity, now time.Time) (string, bool) {
+	if id.State != identityResolved || id.Anonymous || !config.LocalAuth.Enabled {
+		return "", false
+	}
+	priority, ok := config.LocalAuth.priority(id, now)
+	if !ok {
+		return "", false
+	}
+	return strconv.FormatInt(priority, 10), true
 }
 
 // resolveIdentity names the caller without leaving the gateway.
@@ -768,12 +798,15 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 			}
 			applyUpstreamHeaders(config, responseHeaders)
 			consumer := responseHeaders.Get(headerConsumer)
-			applyUpstreamRewrites(config, consumer)
+			// One clock for the rewrites and the marker below, for the same
+			// reason the request phase holds a single `now`.
+			now := time.Now()
 
 			// The server has just named a caller this gateway could not. Take
 			// the id it hands back so the request can mint a marker for its own
 			// fallback pass, and remember it so the next request skips the
-			// authentication half entirely.
+			// authentication half entirely. Done before the rewrites so the
+			// identity they see is the final one.
 			if id.State != identityResolved {
 				if ref := responseHeaders.Get(headerKeyRef); ref != "" {
 					id.Ref = ref
@@ -781,7 +814,9 @@ func dispatchAuthz(config PluginConfig, info requestInfo, requestHeaders [][2]st
 				}
 			}
 
-			applyMarker(config, id, model, consumer, conn, time.Now())
+			applyUpstreamRewrites(config, consumer, id, now)
+
+			applyMarker(config, id, model, consumer, conn, now)
 			proxywasm.ResumeHttpRequest()
 		},
 		config.Authz.TimeoutMillis,
@@ -864,6 +899,10 @@ func buildAuthzRequestHeaders(config PluginConfig, info requestInfo, requestHead
 	// phase already removes it, but repeating it keeps this function correct
 	// independent of the order its caller does things in.
 	authzHeaders.Del(headerConsumer)
+	// The priority travels the same way -- the server produces it, never
+	// reads it -- so a copy on the authorization call could only be the
+	// client's, and the request phase already removed it.
+	authzHeaders.Del(headerRequestPriority)
 
 	// Anonymity is not an identity to assert: telling the server authentication
 	// is done while naming nobody would have it skip the check and evaluate
@@ -901,10 +940,41 @@ func applyUpstreamHeaders(config PluginConfig, responseHeaders http.Header) {
 		if len(values) == 0 {
 			continue
 		}
-		if matchesHeader(config.Authz.AllowedUpstreamHeaders, name) || isMarkerHeader(config, name) {
+		if relayUpstreamHeader(config, name, values[0]) {
 			_ = proxywasm.ReplaceHttpRequestHeader(name, values[0])
 		}
 	}
+}
+
+// relayUpstreamHeader is relayResponseHeader with the value in hand. The
+// priority header is the one header that travels without being declared,
+// so its value is held to the same contract as the table's: a malformed
+// one is dropped here rather than handed to ai-proxy, which would have to
+// treat it as 0 anyway.
+func relayUpstreamHeader(config PluginConfig, name, value string) bool {
+	if !relayResponseHeader(config, name) {
+		return false
+	}
+	if strings.EqualFold(name, headerRequestPriority) {
+		_, ok := parseRequestPriority(value)
+		return ok
+	}
+	return true
+}
+
+// relayResponseHeader decides whether a header from the authorization
+// response continues to the upstream request.
+//
+// Besides the operator's matcher, two headers travel unconditionally because
+// they have one fixed meaning this plugin owns: the marker (see isMarkerHeader)
+// and the request priority. For the priority the server is the only source
+// when the identity was its to name -- a credential this plugin cannot verify
+// has no table entry to read a value from -- so requiring it in
+// allowed_upstream_headers would only create a way to lose it.
+func relayResponseHeader(config PluginConfig, name string) bool {
+	return matchesHeader(config.Authz.AllowedUpstreamHeaders, name) ||
+		isMarkerHeader(config, name) ||
+		strings.EqualFold(name, headerRequestPriority)
 }
 
 // applyMarker replaces the marker on the upstream request with one this plugin
@@ -1049,12 +1119,13 @@ func handleAuthzFailure(config PluginConfig, id identity, model, conn string, st
 		// provider -- which is the one thing headers_to_remove exists to
 		// prevent, and it would leave the consumer unset in the access log.
 		consumer, _ := localConsumer(id)
-		applyUpstreamRewrites(config, consumer)
+		now := time.Now()
+		applyUpstreamRewrites(config, consumer, id, now)
 		// Same rule as everywhere else: no server 200, so the plugin owes the
 		// marker. Without it the redirect pass of this very request would fail
 		// to name the caller and be rejected -- during the outage the marker is
 		// there to survive.
-		applyMarker(config, id, model, consumer, conn, time.Now())
+		applyMarker(config, id, model, consumer, conn, now)
 
 		// Worth a line: it only fires while the authorization service is down,
 		// and it is the one outcome where a request was served without a

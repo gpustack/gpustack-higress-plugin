@@ -25,6 +25,9 @@ description: AI 代理插件配置参考
 >   provider 可以通过配置声明，而不必依赖 provider 类型硬编码。
 > - 新增 `toolCallValidation`：在 Chat Completions 请求路径上做 tool/tool_calls 结构化配对校验，
 >   默认关闭（见 gpustack/gpustack#6210）。
+> - 新增 `requestPrioritySource` / `requestPriorityTarget`：把 `gpustack-ext-auth` 写入的调用方
+>   推理请求优先级翻译成后端的调度输入——vLLM 写请求头 `x-vllm-priority = -p` 并写同样的请求体成员
+>   （它的 pooling 端点只读请求体），SGLang 写请求体 `priority = p`，其余 provider 不处理（见 gpustack/gpustack#6739）。
 > - 为 qwen provider 兼容模式（`qwenEnableCompatible: true`，GPUStack 默认）的默认能力补充
 >   `cohere/v1/rerank` → `/compatible-api/v1/reranks`：入站 Cohere 风格的标准路径 `/v1/rerank`
 >   （GPUStack UI / llama-box / vLLM 所用的拼写）此前会在 `isSupportedAPI` 处被拒
@@ -84,6 +87,7 @@ description: AI 代理插件配置参考
 | ---------- | -------- | -------- | ------ | ---------------------------- |
 | `provider` | object   | 必填     | -      | 配置目标 AI 服务提供商的信息 |
 | `toolCallValidation` | string | 非必填 | `off` | Chat Completions 请求路径上的 `tool`/`tool_calls` 结构化配对校验。`off`（默认）：完全关闭；`strict`：校验失败返回 400。详见[tool/tool_calls 配对校验](#tooltool_calls-配对校验)。 |
+| `requestPrioritySource` | string | 非必填 | `x-gpustack-request-priority` | 携带调用方推理请求优先级的请求头（`gpustack-ext-auth` 写入）：非负整数，越大越紧急，缺失按 0 处理。读取后即从发往上游的请求中移除；是否翻译、如何翻译由各 provider 的 `requestPriorityTarget` 决定。详见[推理请求优先级](#推理请求优先级)。 |
 
 `provider`的配置字段说明如下：
 
@@ -98,6 +102,8 @@ description: AI 代理插件配置参考
 | `customSettings`       | array of customSetting | 非必填   | -      | 为 AI 请求指定覆盖或者填充参数                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `failover`             | object                 | 非必填   | -      | 配置 apiToken 的 failover 策略，当 apiToken 不可用时，将其移出 apiToken 列表，待健康检测通过或冷却时间到期后重新添加回 apiToken 列表                                                                                                                                                                                                                                                                                                       |
 | `retryOnFailure`       | object                 | 非必填   | -      | 当请求失败时立即进行重试                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `requestPriorityTarget` | string | 非必填 | - | 该 provider 背后的后端如何接收调用方的推理请求优先级：`vllm`（写请求头 `x-vllm-priority = -p` 及请求体 `priority = -p`）、`sglang`（写请求体 `priority = p`）、不设（不处理）。GPUStack 按模型的后端类型渲染。详见[推理请求优先级](#推理请求优先级)。 |
+
 | `reasoningContentMode` | string                 | 非必填   | -      | 如何处理大模型服务返回的推理内容。目前支持以下取值：passthrough（正常输出推理内容）、ignore（不输出推理内容）、concat（将推理内容拼接在常规输出内容之前）。默认为 passthrough。仅支持通义千问服务。                                                                                                                                                                                                                                        |
 | `capabilities`         | map of string          | 非必填   | -      | 部分 provider 的部分 ai 能力原生兼容 openai/v1 格式，不需要重写，可以直接转发，通过此配置项指定来开启转发, key 表示的是采用的厂商协议能力，values 表示的真实的厂商该能力的 api path, 厂商协议能力当前支持: openai/v1/chatcompletions, openai/v1/embeddings, openai/v1/imagegeneration, openai/v1/audiospeech, cohere/v1/rerank                                                                                                             |
 | `basePath`             | string                 | 非必填   | -      | 如果配置了 basePath，可用于在请求 path 中移除该前缀，或添加至请求 path 中，默认为进行移除                                                                                                                                                                                                                                                                                                                                                 |
@@ -564,6 +570,69 @@ GPUStack 的调谐器只会重写 `defaultConfig.providers` 和 `matchRules`，�
 配置了无法识别的取值时**不会**报配置错误，而是回退到默认的 `off` 并打一条 ERROR 日志 —— wasm-go 会吞掉
 全局配置的解析错误并把全局配置清零，而 GPUStack 只在 `defaultConfig` 里放 `providers`，一旦清零整个
 ai-proxy 会静默空转。因一个字段拼错拖垮整个代理，代价远大于按默认模式继续跑。
+
+## 推理请求优先级
+
+把调用方的推理请求优先级（由 `gpustack-ext-auth` 按用户 / API Key 解析并写入请求头）翻译成后端自己的
+调度输入（gpustack/gpustack#6739）。两个扁平键，各管一件事：
+
+| 键 | 位置 | 含义 |
+| --- | --- | --- |
+| `requestPrioritySource` | `defaultConfig` 顶层，matchRule 未声明时继承 | 携带优先级的请求头名，缺省 `x-gpustack-request-priority`。值是非负整数，**越大越紧急**；请求没带该头时按 `0` 处理。读取后该头即被移除，不会到达上游 |
+| `requestPriorityTarget` | 每个 `provider` 条目 | 该 provider 背后是什么后端：`vllm`、`sglang`，或不设（不处理）。GPUStack 按模型的后端类型渲染 |
+
+### 两种后端的翻译
+
+| `requestPriorityTarget` | 写入 | 值 | 原因 |
+| --- | --- | --- | --- |
+| `vllm` | 请求头 `x-vllm-priority`，以及请求体顶层 `priority` | `-p` | vLLM **越小越优先**。generation 类端点读请求头（并覆盖 body 里的 `priority`），pooling 类端点（`/v1/embeddings`）只读请求体，所以两处都写、每个请求都写（包括 `0`），客户端自带的 body `priority` 两种情况下都失效 |
+| `sglang` | 请求体顶层 `priority` | `p` | SGLang **越大越优先**，只读请求体，没有对应的请求头 |
+| 不设 / 非法 | 不写 | - | 非法值打一条 ERROR 日志后按不设处理，不算配置错误（原因同 `toolCallValidation`） |
+
+同一个 `p` 在两个后端上的排序结果一致，只是符号相反。`0` 落在各后端自己的基线上，与未经网关的流量平等。
+SGLang 后端**不要**加 `--schedule-low-priority-values-first`，否则它的方向翻转、高优先级用户变成最低。
+
+例：交互式应用 `p = 20`、普通用户未配置、次要业务 `p = 5`。
+
+| 调用者 | vLLM 收到 | SGLang 收到 |
+| --- | --- | --- |
+| 交互式应用 | `x-vllm-priority: -20` | `"priority": 20` |
+| 次要业务 | `x-vllm-priority: -5` | `"priority": 5` |
+| 普通用户 | `x-vllm-priority: 0` | `"priority": 0`（显式写 0：SGLang 把缺省当作最低，不是基线） |
+
+### 生效范围
+
+- vLLM 的请求头在请求头阶段写入，与协议无关（OpenAI / Claude 入站均可）。
+- 请求体成员（两种目标都写）写在**最终**请求体上：协议转换之后（Claude → OpenAI 转换会重建请求体）、`provider.context`
+  插入系统消息之后（会再次重建请求体）、`retryOnFailure` 重试时（回放的是处理前的请求体、请求头从零构建，header 也一并重写）
+  都会重新写入。仅对 chat completions / completions / responses / embeddings 且请求体为 JSON 的请求生效；multipart 与
+  `/v1/images/*` 不碰。写入前先删掉请求体里所有客户端自带的 `priority` 成员（无论多少个，一趟完成），重复出现也只会剩
+  网关写的那一个。`generic` provider 不走 `handleRequestBody`、原样转发请求体，由它自己的 `OnRequestBody` 写入。
+- 插件只改写它会读取的请求体，所以决定“读不读”的媒体类型判断对 `application/json` 不区分大小写、并识别
+  `application/*+json`；否则 `Content-Type: Application/JSON` 就能绕过覆盖。
+- vLLM 的 `/v1/score`、`/v1/rerank`、`/v1/classify` 不在本插件的 API 分类里，原样透传，优先级对它们不生效。
+- **SGLang 的 Anthropic 原生端点（`/v1/messages`）没有 `priority` 字段**：模型开启 `native_anthropic_api`
+  时 Claude 请求原样透传，优先级不生效且无报错；关闭该开关让 ai-proxy 转成 OpenAI 协议即可生效。
+- 优先级是否真正参与调度取决于后端启动参数：vLLM 需 `--scheduling-policy priority`，SGLang 需
+  `--enable-priority-scheduling`。未启用时 vLLM 对非 0 值返回错误，SGLang 静默忽略。
+- 源头的请求头由 `gpustack-ext-auth` 在认证阶段写入并剥离客户端伪造的副本；本插件信任它，但会按非负 32 位整数
+  （vLLM 校验的范围）兜底：值非法或超范围时**每个 VM** 打一条 WARN（值受客户端影响，不参与 warn-once 的 key）
+  后按 `0` 处理，不中断请求。
+
+### 配置示例
+
+```yaml
+requestPrioritySource: x-gpustack-request-priority   # 不写即此值
+providers:
+  - id: model-42            # vLLM 后端的模型
+    type: openai
+    requestPriorityTarget: vllm
+  - id: model-43            # SGLang 后端的模型
+    type: openai
+    requestPriorityTarget: sglang
+  - id: model-7             # 外部 provider / 其它后端：不设 = 不处理
+    type: openai
+```
 
 ## 用法示例
 
@@ -3012,3 +3081,5 @@ repository-level AGENTS.md — see that file for repo-wide policies).
 - **Upstream `ai-proxy` is no longer fetched in `remote_plugins.yaml`** — same treatment as model-router/model-mapper. This fork is a drop-in replacement (config schema untouched), and shipping both would double ~10 MiB of wasm in the wheel for no benefit.
 - `test/` holds upstream's hgctl e2e helper package. Nothing in the build or in `go test ./...` depends on it; it is retained purely to keep the diff against upstream small.
 - **Functional divergence 9 — upstream 401/403 remapped to 502 in `onHttpResponseHeaders` ([main.go](extensions/gpustack-ai-proxy/main.go), `remapUpstreamAuthErrorStatus`)** (gpustack/gpustack#6646). An upstream inference provider's 401 (e.g. invalid external-provider credentials) passed through verbatim collides with the meaning 401 already has on GPUStack's console API ("management session invalid"), so the UI's global 401 handler cleared the cached user and kicked the user out of a valid session to `#/login`. The fix is gateway-side per the maintainer decision in the issue: in `onHttpResponseHeaders`'s non-200 branch, when the response is from upstream (the `IsResponseFromUpstream()` gate at the top of the callback), no retry is in flight (`OnRequestFailed` returned `ActionContinue` — its retry path returns `HeaderStopAllIterationAndWatermark` and regenerates the response), and the status is `401`/`403`, rewrite `:status` to `502`, drop the upstream's now-meaningless `WWW-Authenticate`, and leave the body verbatim so the upstream error detail stays diagnosable (a `upstream_auth_error_remapped` warn log records provider + original status). Scope: gateway-generated 401/403 never reach this plugin's response phase (authn rejects earlier in the request phase at higher priority); other upstream statuses (400, 429, 5xx) pass through unchanged, as before. Pinned by [upstream_auth_status.go](extensions/gpustack-ai-proxy/test/upstream_auth_status.go) (GPUStack-local, no upstream counterpart).
+- **Functional divergence 10 — `requestPrioritySource` / `requestPriorityTarget`** ([provider/request_priority.go](extensions/gpustack-ai-proxy/provider/request_priority.go), hooks in [main.go](extensions/gpustack-ai-proxy/main.go) `onHttpRequestHeader` and [provider.go](extensions/gpustack-ai-proxy/provider/provider.go) `handleRequestBody`) (gpustack/gpustack#6739). GPUStack-local, no upstream counterpart. `gpustack-ext-auth` resolves the caller and writes its request priority as `x-gpustack-request-priority` (non-negative, larger = more urgent, absent = none); this plugin translates it into the active provider's backend form, decided per provider by `requestPriorityTarget`: `vllm` → header `x-vllm-priority = -p` plus body `priority = -p` (vLLM schedules the lower value first; its generation endpoints read the header, which overrides a body `priority`, its pooling endpoints read the body only, so both are written on every request -- 0 included -- and a client-supplied body value is neutralised either way); `sglang` → body `priority = p` (SGLang schedules the higher value first and has no priority header); unset → nothing. The source header is removed whatever the target, so the gateway-internal header never reaches an upstream. Three placement facts worth keeping straight: (1) the header half runs in `onHttpRequestHeader` *before* the provider's `handleRequestHeaders`, which writes the full header set back and therefore preserves it; (2) the body half is injected in `handleRequestBody` **after** `TransformRequestBody` and before both `replaceRequestBody` exits -- the Claude→OpenAI converter rebuilds the body from the Claude schema, which has no `priority`, so an earlier injection would be lost -- plus a second point on the `IsOriginal()` early return, where no other code touches the body, a third after `insertContext` (the `provider.context` system message rebuilds the body from the provider schema, which has no `priority`), a fourth in the `generic` provider's own `OnRequestBody` (it forwards the body outside `handleRequestBody`), and a fifth in `sendRetryRequest` after its header/body transform (the retry replays the pre-phase body with freshly built headers, so the header is re-written there as well). Every existing top-level `priority` member is removed before the write -- in one pass when there are several, since sjson touches one occurrence -- so a body carrying the key twice cannot keep a client-chosen copy for a last-wins decoder. The body is only rewritten when the plugin reads it, so `isSupportedRequestContentType` matches `application/json` case-insensitively and `application/*+json`; (3) the body half is gated to JSON bodies of chat completions / completions / responses / embeddings, because SGLang's Anthropic endpoint (`/v1/messages`, reached when the Model sets `native_anthropic_api`) has no `priority` member and a multipart body is not JSON. The translation is a sign, not a range mapping: `p = 0` lands on each backend's own baseline, and SGLang must therefore NOT run with `--schedule-low-priority-values-first`. A malformed source value (not a non-negative int32; one warning per VM, since the value is client-influenced) or an unrecognised target is a warning plus the default, never a config error, for the reason spelled out under divergence 4 (`toolCallValidation`). Pinned by [request_priority_test.go](extensions/gpustack-ai-proxy/provider/request_priority_test.go) and [request_priority_integration_test.go](extensions/gpustack-ai-proxy/request_priority_integration_test.go) (both GPUStack-local).
+

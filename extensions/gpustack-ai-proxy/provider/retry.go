@@ -155,6 +155,10 @@ func (c *ProviderConfig) sendRetryRequest(
 	if err != nil {
 		return fmt.Errorf("sendRetryRequest failed to transform request headers and body: %v", err)
 	}
+	// GPUStack-local: the rebuilt headers lost x-vllm-priority and the saved
+	// body predates the sglang overwrite, so the caller's priority has to be
+	// put back after the transform (gpustack/gpustack#6739).
+	modifiedHeaders, modifiedBody = c.applyRequestPriorityRetry(ctx, modifiedHeaders, modifiedBody)
 
 	err = retryClient.Post(generateUrl(modifiedHeaders), util.HeaderToSlice(modifiedHeaders), modifiedBody,
 		func(statusCode int, responseHeaders http.Header, responseBody []byte) {
