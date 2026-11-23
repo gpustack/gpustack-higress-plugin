@@ -7,6 +7,38 @@ on:
     branches: [main, develop]
 
 jobs:
+  version-guard:
+    runs-on: ubuntu-latest
+    # AGENTS.md plugin versioning policy: between two tags each plugin
+    # bumps at most once; unchanged plugins keep their version. The job
+    # diffs the tree against the most recent tag reachable from the PR
+    # base (falling back to HEAD's nearest tag on branch pushes).
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check plugin version bumps
+        run: |
+          # Window semantics (same for PR and push events):
+          #   BASE = merge-base of this change and the base branch —
+          #          attribution: only THIS change's commits are judged;
+          #   TAG  = latest release tag on the base branch — the release
+          #          window: a follow-up PR may RETAIN a version already
+          #          bumped in the window instead of paying a second bump.
+          BASE=""; TAG=""
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            git fetch origin "${{ github.base_ref }}" --no-tags
+            BASE="$(git merge-base origin/${{ github.base_ref }} HEAD || echo "origin/${{ github.base_ref }}")"
+            TAG="$(git describe --tags --abbrev=0 origin/${{ github.base_ref }} 2>/dev/null || echo "$BASE")"
+          else
+            TAG="$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo HEAD)"
+            BASE="$TAG"
+          fi
+          bash scripts/version-guard.sh "$BASE" "$TAG"
+
   validate:
     runs-on: ubuntu-latest
     steps:
