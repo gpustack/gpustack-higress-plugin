@@ -766,6 +766,10 @@ def main():
                             "id": delete_id,
                             "object": "video.deleted",
                             "deleted": True,
+                            "record_deleted": True,
+                            "file_cleanup": (
+                                "retained" if DELETE_STYLE == "sglang" else "unconfirmed"
+                            ),
                         }, (status, body)
                         assert REQUESTS[-1][:3] == (
                             delete_label,
@@ -793,6 +797,7 @@ def main():
                         "object": "video",
                         "status": "cancelled",
                         "record_only_delete": True,
+                        "file_cleanup": "unconfirmed",
                     }, (status, body)
                     assert (
                         JOBS[cancel_id]["deletion_state"] == "confirmed"
