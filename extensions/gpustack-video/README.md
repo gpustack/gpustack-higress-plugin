@@ -179,9 +179,13 @@ Configuration and Envoy logs remain in `VIDEO_GATEWAY_TEST_DIR` for inspection.
 The control plane persists status observations and serves the caller-scoped
 `GET /v2/video-tasks` history. Engine status observations carry only trusted
 native/public identity and generation metadata; public responses omit native
-storage paths. The Playground synchronizes on entry, refresh and selection,
-with task cards on the left and a prompt/Submit composer on the right. Cards own Stop/Delete actions.
-There is no background Server polling loop.
+storage paths. The Playground synchronizes visible active cards while the page
+is active. There is no background Server polling loop.
+
+History access checks the creating user, organization and current API-key scope.
+Revoking model access or deleting the original route does not remove access to
+owned history and available files. Creating a new task still requires current
+model-route authorization.
 
 New deployments with managed output directories can read completed MP4 files
 from a stable Worker service even after the inference runtime is removed.
@@ -198,14 +202,30 @@ root, rejects path traversal and symlink outputs, checks the MP4 structure,
 and supports Range requests.
 
 Native DELETE semantics remain unchanged. SGLang's retained output cleanup is
-not implemented. Engine TTL stays opt-in; GPUStack does not impose a 24-hour
-retention period. Custom output directories retain native access semantics;
-old unmanaged files are not automatically imported.
+not implemented. For its managed vLLM output directory, GPUStack defaults
+`VLLM_OMNI_SERVER_STORAGE__FILE_TTL` to 86400 seconds; an explicit model value
+takes precedence. Cleanup runs inside the inference engine, so removing that
+runtime also stops its cleanup loop. There is no independent Worker TTL sweeper.
+Custom output directories retain native access semantics; old unmanaged files
+are not automatically imported.
 
 ## Retained cancellation records
 
-`DELETE /v1/videos/{id}?keep_task=true` reuses native DELETE through the original binding. The final gateway strips the GPUStack query flag before forwarding, records the intent, and confirms cancellation metadata before returning `status: cancelled` and `record_only_delete: true`. The record remains visible. The edge validates the same retained confirmation on two-gateway requests. Uncertain outcomes are not labelled cancelled and are not retried automatically.
+`DELETE /v1/videos/{id}?keep_task=true` reuses native DELETE through the original
+binding. The final gateway strips the GPUStack query flag before forwarding,
+records the intent, and confirms the retained result before replying. Confirmed
+cancellation returns `cancelled`; a completion verified first stays `completed`.
+The record remains visible. The edge validates the same retained confirmation on
+two-gateway requests. Uncertain outcomes are not labelled cancelled and are not
+retried automatically.
 
-`DELETE /v2/video-tasks/{id}` removes a retained cancelled record only after native deletion is confirmed and the current owner, tenant and model access checks pass. It does not send another engine DELETE. Ordinary native task deletion retains its existing semantics. Cancellation acknowledgement does not guarantee immediate GPU termination.
+`DELETE /v2/video-tasks/{id}` independently hides owned history, including failed
+or expired tasks, without requiring native deletion or a reachable Worker. It
+does not send another engine DELETE or remove files. Cancellation acknowledgement
+does not guarantee immediate GPU termination.
 
-The Playground uses one five-second list scheduler for queued/in-progress rows, bounded per-task status requests, and manual retry after a failed row query. Completed rows are not polled and only the selected completed video downloads. Cursor pagination loads near the scroll boundary; card columns use the same core-ui ResizeContainer as Catalog. The parameter form always renders aspect ratio and a Select for resolution, including one-option defaults.
+The Playground uses one five-second scheduler for visible queued/in-progress
+cards with bounded concurrency and a five-second status-request timeout. Queries
+pause when the page is inactive. Errors preserve the task and progress, and a
+refresh resumes synchronization. Completed cards are not periodically polled;
+video content is fetched on demand.
