@@ -8,7 +8,7 @@ spec:
   # ext-auth (AUTHN/360) and gpustack-ip-acl (AUTHN/350) so unauthenticated
   # or IP-rejected requests never trigger a jev decision callout, and after
   # model-router (AUTHN/900). Within the band gpustack-lb keeps
-  # 340 context -> 335 session-affinity / 333 prefix / 330 least-load ->
+  # 340 context -> 336 session-affinity / 333 prefix / 330 least-load ->
   # 328 this plugin -> 325 finisher. It reads the candidate set the context
   # role published and appends a confidence-weighted rank entry to the
   # shared gpustack_lb_ranks filter state; the gpustack-lb finisher (325)

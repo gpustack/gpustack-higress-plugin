@@ -5,9 +5,11 @@ session consistently to the same instance.
 
 ```text
 340  gpustack-lb (mode: context)   publishes the candidate set into filter state
-335  this plugin                   reads the set -> rendezvous ranking ->
+336  this plugin                   reads the set -> rendezvous ranking ->
                                    appends one opinion
+333  gpustack-lb-prefix            prefix affinity (enterprise edition)
 330  gpustack-lb-least-load        least load (when deployed)
+328  gpustack-lb-decision-service  model-selection verdict (when deployed)
 325  gpustack-lb (mode: finisher)  L1-normalises + weighted sum -> picks a
                                    candidate -> writes the cluster header
 ```
@@ -232,7 +234,7 @@ fail outright, and silently.
 ## The cost of body sources
 
 ⚠️ **`maxBodyBytes` has to be raised here, not left to the finisher.** This
-plugin stops iteration at 335 and `gpustack-lb` only raises the decoder buffer
+plugin stops iteration at 336 and `gpustack-lb` only raises the decoder buffer
 limit at 325, so by then Envoy has already buffered under the route default —
 1 MiB in stock Envoy, and Higress deployments run values as low as 32 KiB. A
 `/v1/messages` body carrying images would take a 413, which would mean

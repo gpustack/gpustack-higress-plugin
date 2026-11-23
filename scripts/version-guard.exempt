@@ -1,0 +1,18 @@
+# version-guard exemptions — one entry per line, '#' starts a comment.
+# Two forms:
+#   name          — full skip (all checks), for plugins whose versioning
+#                   genuinely cannot follow the policy. Every entry needs
+#                   a justification comment.
+#   name @ <ref>  — grandfather: pre-policy history before <ref> is
+#                   ignored for source attribution and the bump count;
+#                   all other checks stay active. AUTO-LAPSES once the
+#                   comparison base descends from <ref> (the guard prints
+#                   a note, never fails) — no manual cleanup required.
+#
+# --- legacy pre-policy violations on main. Anchor: main tip right
+# --- before the policy landed; these lapse automatically at the first
+# --- post-policy tag and may then be deleted as optional housekeeping.
+gpustack-ai-proxy            @ d446a8d225d5ff66a95f226b8a2c5e16df6d71ab  # 2 bumps predate the policy
+gpustack-lb-decision-service @ d446a8d225d5ff66a95f226b8a2c5e16df6d71ab  # source change predates the policy
+gpustack-lb-least-load       @ d446a8d225d5ff66a95f226b8a2c5e16df6d71ab  # source change predates the policy
+gpustack-lb-session-affinity @ d446a8d225d5ff66a95f226b8a2c5e16df6d71ab  # source change predates the policy

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -58,55 +57,6 @@ var (
 	headerToOriginalHeaderMapping = map[string]string{
 		util.HeaderAuthority: util.HeaderOriginalHost,
 		util.HeaderPath:      util.HeaderOriginalPath,
-	}
-	pathSuffixToApiName = []pair[string, provider.ApiName]{
-		// OpenAI style
-		{provider.PathOpenAIChatCompletions, provider.ApiNameChatCompletion},
-		{provider.PathOpenAICompletions, provider.ApiNameCompletion},
-		{provider.PathOpenAIEmbeddings, provider.ApiNameEmbeddings},
-		{provider.PathOpenAIAudioSpeech, provider.ApiNameAudioSpeech},
-		{provider.PathOpenAIAudioTranscriptions, provider.ApiNameAudioTranscription},
-		{provider.PathOpenAIAudioTranslations, provider.ApiNameAudioTranslation},
-		{provider.PathOpenAIRealtime, provider.ApiNameRealtime},
-		{provider.PathOpenAIImageGeneration, provider.ApiNameImageGeneration},
-		{provider.PathOpenAIImageVariation, provider.ApiNameImageVariation},
-		{provider.PathOpenAIImageEdit, provider.ApiNameImageEdit},
-		{provider.PathOpenAIBatches, provider.ApiNameBatches},
-		{provider.PathOpenAIFiles, provider.ApiNameFiles},
-		{provider.PathOpenAIModels, provider.ApiNameModels},
-		{provider.PathOpenAIFineTuningJobs, provider.ApiNameFineTuningJobs},
-		{provider.PathOpenAIResponses, provider.ApiNameResponses},
-		{provider.PathOpenAIVideos, provider.ApiNameVideos},
-		// Anthropic style
-		{provider.PathAnthropicMessagesCountTokens, provider.ApiNameAnthropicCountTokens},
-		{provider.PathAnthropicMessages, provider.ApiNameAnthropicMessages},
-		{provider.PathAnthropicComplete, provider.ApiNameAnthropicComplete},
-		// Cohere style
-		{provider.PathCohereV1Rerank, provider.ApiNameCohereV1Rerank},
-		// Qwen style
-		{provider.PathQwenV1Reranks, provider.ApiNameQwenV1Rerank},
-		{provider.PathQwenV1Conversations, provider.ApiNameQwenV1Conversations},
-	}
-	pathPatternToApiName = []pair[*regexp.Regexp, provider.ApiName]{
-		// OpenAI style
-		{util.RegRetrieveBatchPath, provider.ApiNameRetrieveBatch},
-		{util.RegCancelBatchPath, provider.ApiNameCancelBatch},
-		{util.RegRetrieveFilePath, provider.ApiNameRetrieveFile},
-		{util.RegRetrieveFileContentPath, provider.ApiNameRetrieveFileContent},
-		{util.RegRetrieveVideoPath, provider.ApiNameRetrieveVideo},
-		{util.RegRetrieveVideoContentPath, provider.ApiNameRetrieveVideoContent},
-		{util.RegVideoRemixPath, provider.ApiNameVideoRemix},
-		{util.RegRetrieveFineTuningJobPath, provider.ApiNameRetrieveFineTuningJob},
-		{util.RegRetrieveFineTuningJobEventsPath, provider.ApiNameFineTuningJobEvents},
-		{util.RegRetrieveFineTuningJobCheckpointsPath, provider.ApiNameFineTuningJobCheckpoints},
-		{util.RegCancelFineTuningJobPath, provider.ApiNameCancelFineTuningJob},
-		{util.RegResumeFineTuningJobPath, provider.ApiNameResumeFineTuningJob},
-		{util.RegPauseFineTuningJobPath, provider.ApiNamePauseFineTuningJob},
-		{util.RegFineTuningCheckpointPermissionPath, provider.ApiNameFineTuningCheckpointPermissions},
-		{util.RegDeleteFineTuningCheckpointPermissionPath, provider.ApiNameDeleteFineTuningCheckpointPermission},
-		// Gemini style
-		{util.RegGeminiGenerateContent, provider.ApiNameGeminiGenerateContent},
-		{util.RegGeminiStreamGenerateContent, provider.ApiNameGeminiStreamGenerateContent},
 	}
 )
 
@@ -253,6 +203,21 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 	if providerConfig.IsOriginal() {
 		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
 			apiName = handler.GetApiName(path.Path)
+		}
+	} else if apiName == "" {
+		// GPUStack-local: a provider may claim API names of its own on paths
+		// the shared map does not know (the Jev decision contract). Without
+		// this fallback an unrecognized path skips body processing entirely,
+		// which would disable the provider's own normalization. Only the
+		// Systemone claim is accepted here: every provider's GetApiName
+		// returns non-Systemone names for some paths the shared map leaves
+		// unclassified (e.g. Gemini /v1beta/...:batchEmbedContents ->
+		// ApiNameEmbeddings), and honoring those would reclassify native
+		// passthrough payloads into the OpenAI conversion pipeline.
+		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
+			if claimed := handler.GetApiName(path.Path); claimed == provider.ApiNameSystemone {
+				apiName = claimed
+			}
 		}
 	} else {
 		// Only perform protocol conversion for non-original protocols.
@@ -881,21 +846,10 @@ func checkStream(ctx wrapper.HttpContext) {
 }
 
 func getApiName(path string) provider.ApiName {
-	// Check path suffix matches first
-	for _, p := range pathSuffixToApiName {
-		if strings.HasSuffix(path, p.key) {
-			return p.value
-		}
-	}
-
-	// Check path pattern matches
-	for _, p := range pathPatternToApiName {
-		if p.key.MatchString(path) {
-			return p.value
-		}
-	}
-
-	return ""
+	// The shared, deterministic inbound classifier lives in the provider
+	// package so providers (e.g. openai under protocol original) can reuse
+	// the exact same tables instead of re-implementing them.
+	return provider.ClassifyPath(path)
 }
 
 func isSupportedRequestContentType(apiName provider.ApiName, contentType string) bool {

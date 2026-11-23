@@ -40,7 +40,7 @@ Framework integration:
 - **Weighted sets are left alone** (business traffic split), exactly like every capability plugin.
 - **Degrade, never fail closed**: no published candidates, no configured question, callout error/timeout, or an unknown verdict → no rank entry is published and the finisher routes as usual. There is no defaultModel to configure. On a successful verdict the plugin logs the **per-instance scores and confidence** at DEBUG level (`model-selection verdict: choice=… confidence=… effectiveWeight=… scores=…`).
 - **Internal redirects** (`x-higress-fallback-from`) are not re-routed; strip the header at the listener so clients cannot forge it.
-- **Position**: `phase: AUTHN, priority: 328` — after the capability plugins (335/333/330), before the gpustack-lb finisher (325).
+- **Position**: `phase: AUTHN, priority: 328` — after the capability plugins (336/333/330), before the gpustack-lb finisher (325).
 
 ## The decision request
 
@@ -167,7 +167,7 @@ The model-serving backends (the candidates) are likewise reached through their o
 This README alone is **not sufficient** to build an upper-layer controller — it documents this plugin's slice, while a controller must provision the whole band. Read in this order:
 
 1. **`extensions/gpustack-lb/wire/wire.go`** — the authoritative cross-binary contract: `Candidate` field semantics (`Weight` pointer presence = weighted-mode switch, `ModelName` = the context-resolved rewrite target, `Key()` = `cluster\x00targetId`), `RankEntry` combination maths (per-entry L1 normalisation, weighted sum), filter-state key names. README summaries must never be copied into codegen; import this package instead.
-2. **`extensions/gpustack-lb/README.md` + `example.yaml`** — the schema a controller actually generates: the context role's `candidates` + `modelMappers` (built from ModelRouteTargets), the finisher's selection/book-keeping, and the AUTHN band ordering (340 context → 335/333/330 capabilities → 328 this plugin → 325 finisher).
+2. **`extensions/gpustack-lb/README.md` + `example.yaml`** — the schema a controller actually generates: the context role's `candidates` + `modelMappers` (built from ModelRouteTargets), the finisher's selection/book-keeping, and the AUTHN band ordering (340 context → 336/333/330 capabilities → 328 this plugin → 325 finisher).
 3. **`designs/gpustack-lb-decision-service-modelselection-lb-example.md`** — a worked end-to-end example (single external model, multi-target backends, per-prompt score/weight arithmetic).
 4. **This README** — this plugin's config schema and behaviour (the last mile: `modelSelection.criteria` keys must equal the candidates' `ModelName`).
 

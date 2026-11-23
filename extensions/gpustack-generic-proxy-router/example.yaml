@@ -10,11 +10,19 @@ spec:
   # `defaultConfigDisable: true`), otherwise both plugins will write
   # `x-higress-llm-model` and you'll get whichever-priority-wins behaviour.
   #
-  # Priority 900 matches model-router's original slot so downstream
-  # consumers (ai-route, gpustack-rate-limit at 600, ai-token-ratelimit at
-  # 600) see the final resolved model name without any other ordering
-  # changes.
-  phase: UNSPECIFIED_PHASE
+  # Phase/priority match the GPUStack deployment exactly (gpustack core,
+  # gateway/__init__.py): **AUTHN/900** — model-router's original slot. The
+  # AUTHN bucket precedes UNSPECIFIED, so downstream consumers in either
+  # bucket (header-transformer AUTHN/810, token-usage UNSPECIFIED/400,
+  # rate-limit UNSPECIFIED/600, ext-auth AUTHN/360, the whole LB band
+  # AUTHN/340-325) all see the final resolved model name.
+  #
+  # Being first has a second purpose: this is the entry-classification point
+  # of the chain. When it pauses in the header phase to buffer the body, the
+  # plugins after it (810 and below) have not run their header callbacks yet
+  # — so tags derived here from headers *and* the body are visible to every
+  # consumer below, including the LB band.
+  phase: AUTHN
   priority: 900
   url: oci://<your-registry>/<your-org>/gpustack-generic-proxy-router:1.0.0
   sha256: "<sha256-digest>"

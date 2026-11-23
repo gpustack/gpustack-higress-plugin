@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -215,13 +216,26 @@ type PluginConfig struct {
 	RealIPHeader         string
 	ClusterNameMatchers  []*regexp.Regexp
 	OrganizationIDHeader string
-	// RequestIDResponseHeader is the response header carrying the reported
-	// request_id back to the caller. Empty switches the echo off; the id is
-	// still reported, it just stops being quotable from the client side.
+	// AttributionHeaders generalises organizationIDHeader into a list of
+	// request headers reported as usage dimensions (gpustack#6738): one
+	// API key is often shared by several applications / end users, and
+	// key-level reporting can only attribute usage to a department. Each
+	// entry maps a request header to an attribute name on the report
+	// payload. Headers absent from the request simply contribute no
+	// attribute -- metering must fail open, never block traffic.
+	AttributionHeaders      []AttributionHeader
 	RequestIDResponseHeader string
 	// MaxResponseBodyBytes caps the non-streaming sniff buffer and the
 	// gzip-decoded size (see defaultMaxResponseBodyBytes).
 	MaxResponseBodyBytes int
+}
+
+// AttributionHeader is one attributionHeaders[] entry: a request header
+// (matched case-insensitively, like every header read here) and the
+// attribute name its value is reported under.
+type AttributionHeader struct {
+	Header    string
+	Attribute string
 }
 
 // ModelUsageMetrics is the JSON payload sent to the metrics reporting endpoint.
@@ -290,6 +304,11 @@ type ModelUsageMetrics struct {
 	ProviderID         *int64  `json:"provider_id,omitempty"`
 	AccessKey          *string `json:"access_key,omitempty"`
 	OrganizationID     *string `json:"organization_id,omitempty"`
+	// Attributes carries the configurable attribution dimensions
+	// (attributionHeaders, gpustack#6738): request-header values keyed by
+	// their configured attribute name. Absent headers contribute nothing;
+	// the map is omitted entirely when no dimension yielded a value.
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 func matchPathSuffix(targetURI string, suffixes []string) bool {
@@ -390,6 +409,29 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 		config.OrganizationIDHeader = orgHeader
 	} else {
 		config.OrganizationIDHeader = defaultOrganizationIDHeader
+	}
+
+	// attributionHeaders: [{header, attribute}, ...]. Malformed entries are
+	// an error rather than a silent skip -- a typo'd attribute name would
+	// otherwise report usage under a dimension nobody queries, with nothing
+	// in the config saying why (the same convention as header_add above).
+	// Reset first: wasm-go's rule_matcher retries a failed parse with backup
+	// JSON on this same config object, so dimensions appended before the
+	// failure would survive into the retry and collect headers the restored
+	// configuration did not authorize.
+	config.AttributionHeaders = nil
+	if ah := json.Get("attributionHeaders"); ah.Exists() && ah.Type != gjson.Null {
+		if !ah.IsArray() {
+			return errors.New("attributionHeaders must be an array")
+		}
+		for _, e := range ah.Array() {
+			h := e.Get("header").String()
+			a := e.Get("attribute").String()
+			if h == "" || a == "" {
+				return errors.New("attributionHeaders[] entries need both header and attribute")
+			}
+			config.AttributionHeaders = append(config.AttributionHeaders, AttributionHeader{Header: h, Attribute: a})
+		}
 	}
 
 	// Absent takes the default; an explicit empty string switches the echo
@@ -632,7 +674,26 @@ func buildBaseMetrics(ctx wrapper.HttpContext, config PluginConfig, headers [][2
 			m.OrganizationID = &v
 		}
 	}
+	applyAttributionHeaders(m, config.AttributionHeaders, headers)
 	return m
+}
+
+// applyAttributionHeaders fills m.Attributes from the configured
+// attribution dimensions. A pure function over the header list so it is
+// unit-testable without a wasm host (buildBaseMetrics reads the model name
+// off the HttpContext, which panics outside a host).
+func applyAttributionHeaders(m *ModelUsageMetrics, dims []AttributionHeader, headers [][2]string) {
+	for _, a := range dims {
+		for _, h := range headers {
+			if strings.EqualFold(h[0], a.Header) && h[1] != "" {
+				if m.Attributes == nil {
+					m.Attributes = make(map[string]string, len(dims))
+				}
+				m.Attributes[a.Attribute] = h[1]
+				break
+			}
+		}
+	}
 }
 
 // processRequestBody extracts the model name, sets stream state, optionally
@@ -1740,6 +1801,7 @@ func reportMetrics(ctx wrapper.HttpContext, config PluginConfig) {
 		UserID:              base.UserID,
 		AccessKey:           base.AccessKey,
 		OrganizationID:      base.OrganizationID,
+		Attributes:          base.Attributes,
 		ModelID:             modelID,
 		ModelRouteID:        modelRouteID,
 		ProviderID:          providerID,

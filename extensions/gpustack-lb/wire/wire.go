@@ -37,7 +37,33 @@ const (
 
 	KindInstance = "instance"
 	KindProvider = "provider"
+
+	// FilterStateRequestContext carries request **measurements** that are
+	// not derivable from headers at the consumer's position in the chain.
+	//
+	// The one field today: LengthBytes, the final request-body length. It
+	// exists because a decoder filter that rewrites the body makes Envoy
+	// drop `Content-Length` (upstream goes chunked), and the rewriting
+	// filter is also the only participant that still knows the length
+	// afterwards. generic-proxy-router (AUTHN/900) writes it in its body
+	// phase; its header-phase pause guarantees the property has landed
+	// before any consumer below runs its header callback.
+	//
+	// Consumers read it with a `Content-Length` fallback, which keeps
+	// working on paths the writer never buffered (there, nothing rewrote
+	// the body before the consumer, so the header is intact) — the two
+	// sources are complementary, with no overlap and no gap.
+	FilterStateRequestContext = "gpustack_request_context"
 )
+
+// RequestContext is the value stored under FilterStateRequestContext.
+type RequestContext struct {
+	// LengthBytes is the final request-body length in bytes (post-rewrite
+	// when the writer rewrote the body). A POINTER: 0 is a valid length
+	// (an empty body) and must stay distinguishable from "unset", which
+	// consumers read as "fall back to Content-Length". nil means unset.
+	LengthBytes *int64 `json:"lengthBytes,omitempty"`
+}
 
 // Candidate is one candidate instance published to downstream plugins.
 type Candidate struct {
@@ -94,6 +120,19 @@ type Candidate struct {
 	// Probation: this candidate was just released from a cooldown and its
 	// penalty has not fully decayed yet.
 	Probation bool `json:"probation,omitempty"`
+
+	// Fallback marks a **fallback-tier** candidate: it is excluded from
+	// normal selection entirely (a fallback target must not take a share
+	// of healthy traffic) and enters the published set only when a
+	// re-selection pass has exhausted the main tier — the strict-tier
+	// counterpart of the legacy fallback path, where the fallback
+	// destination only ever saw failed traffic.
+	//
+	// The controller marks candidates whose ModelRouteTarget declares
+	// fallback status codes. Capability plugins should treat a fallback
+	// candidate like any other once it appears in the set: it is only in
+	// the set when it is legitimately selectable.
+	Fallback bool `json:"fallback,omitempty"`
 }
 
 // candidateKeySep separates the two halves of Key.

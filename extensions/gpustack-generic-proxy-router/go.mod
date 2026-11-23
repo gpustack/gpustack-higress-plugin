@@ -3,12 +3,18 @@ module github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-generic-
 go 1.24.4
 
 require (
+	github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb v0.0.0
 	github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-video v0.0.0
 	github.com/higress-group/proxy-wasm-go-sdk v0.0.0-20251103120604-77e9cce339d2
 	github.com/higress-group/wasm-go v1.0.10-0.20260120033417-1c84f010156d
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 )
+
+// The wire package is the cross-binary contract (filter-state keys and
+// value shapes shared with gpustack-lb); it must not be hand-copied into
+// each consumer. See the header of gpustack-lb/wire/wire.go.
+replace github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb => ../gpustack-lb
 
 require (
 	github.com/google/uuid v1.6.0 // indirect

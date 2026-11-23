@@ -29,3 +29,13 @@ enableOnPathSuffix: # Optional, list of URI path suffixes to process
 enableOnPathPrefix:
   - "/model/proxy"
 ```
+
+
+## Implementation Notes
+
+Design decisions and hazards (agent guidance, migrated from the
+repository-level AGENTS.md — see that file for repo-wide policies).
+
+Injects route/cluster name into request headers **before** routing (pre-route phase).
+
+Config fields: `routeNameHeader`, `clusterNameHeader`, `enableOnPathSuffix`, `enableOnPathPrefix`

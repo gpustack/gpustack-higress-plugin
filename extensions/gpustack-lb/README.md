@@ -7,7 +7,8 @@ which role it plays:
 mode: context   AUTHN/340  read config -> filter -> publish the candidate set
                            into filter state; on non-LB routes it degrades to
                            model-mapper's existing behaviour
-  ↓ the capability band (session-affinity 335 / prefix 333 / least-load 330)
+  ↓ the capability band (session-affinity 336 / prefix 333 (enterprise) /
+    least-load 330 / decision-service 328)
     each append a ranking opinion
 mode: finisher  AUTHN/325  read the rankings -> pick a candidate -> write
                            x-higress-target-cluster -> buffer the body to
@@ -58,10 +59,19 @@ request actually reaches disagree, **completely silently**.
 
 ### `x-higress-fallback-from` must not be accepted from clients
 
-Both roles treat this header as proof that the request is an internal redirect:
-context publishes no candidates and the finisher strips
-`x-higress-target-cluster` and skips selection. It is an ordinary request
-header, so a client that simply sets it gets LB bypassed -- and because
+Both roles treat this header as proof that the request is an internal
+redirect. **Re-selection mode**: when the marker is present together with an
+`x-higress-target-cluster` this plugin itself wrote on the previous pass, the
+context role excludes that cluster's candidates and republishes the
+remainder, and the finisher re-selects among the survivors (the 503
+re-selection path — the redirect trigger rides the same per-route
+EnvoyFilter as `cluster_header`, see gpustack `routes/plugins/lb`). Without
+a surviving target header — a legacy fallback deployment, whose fallback
+ingress steers by this very marker, or a forged marker on a request LB never
+touched — the context publishes nothing and the finisher strips any
+surviving `x-higress-target-cluster`. It is an ordinary request
+header, so a client that sets it can bias its own requests' exclusion (or,
+on a non-LB route, get LB bypassed) -- and because
 `cluster_header` has displaced `weighted_clusters` on this route, no header
 means no cluster, which is the 503 that does not flush. The request then hangs
 until the client times out.
@@ -78,6 +88,18 @@ The plugin cannot defend itself here: the whole point of the header is to be
 indistinguishable from one Envoy set itself, so there is nothing for the wasm
 filter to check. Deployments that do not use Higress's AI fallback at all can
 strip the header unconditionally instead.
+
+### Fallback tier
+
+Candidates may carry `fallback: true` (rendered by gpustack for targets
+that declare fallback status codes). The tier is **ordinal, not
+proportional**: fallback candidates take no share of normal traffic — a
+normal pass publishes the main tier only — and join the published set
+only on a re-selection pass whose surviving main tier is empty. The
+redirect trigger itself keeps its **legacy EnvoyFilter CR name**
+(gpustack updates the same CR in place, `lb_reselect=True`: no
+response-side marker, no fallback-path header), and the separate fallback
+ingress is reclaimed on LB routes.
 
 ## Configuration
 
@@ -108,6 +130,30 @@ matchRules:
       modelMappers:
         "2":
           "gpt-*": "qwen3-0.6b"
+      # routeRules (optional): deterministic request->pool narrowing — the
+      # third section next to candidates / modelMappers. The first matching
+      # rule narrows `candidates` to its `targets` before the candidate set
+      # is built, so health filtering, failOpen, the capability band and the
+      # finisher all operate within the narrowed subset (a matched request
+      # can never silently fall back to a candidate its rule excluded).
+      # Headers are read live at 340 — the post-authn view. contextLength
+      # prefers the gpustack_request_context.lengthBytes filter-state
+      # measurement (written by generic-proxy-router; a body rewrite drops
+      # Content-Length) and falls back to the Content-Length header; with no
+      # measurement available a length rule does not match. See
+      # designs/request-tagging-and-route-rules.md for the full contract.
+      # routeRules:
+      #   - name: vip-fixed
+      #     match:
+      #       headers:
+      #         - {name: x-gpustack-tier, exact: vip}
+      #         - {name: x-api-key, prefix: "sk-vip-*"}
+      #       model: "deepseek-r1*"
+      #     targets: ["2"]
+      #   - name: long-context
+      #     match:
+      #       contextLength: {min: 65536}
+      #     targets: ["3"]
       # health.failOpen is inherited from defaultConfig; only write it to turn
       # it off for this route alone:
       # health:
