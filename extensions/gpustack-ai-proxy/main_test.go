@@ -144,6 +144,38 @@ func Test_isSupportedRequestContentType(t *testing.T) {
 			contentType: "multipart/form-data; boundary=----boundary",
 			want:        false,
 		},
+		// Media types are case-insensitive; a body declined here is never
+		// rewritten below, so a case variant must not become a bypass.
+		{
+			name:        "json_uppercase_chat_completion",
+			apiName:     provider.ApiNameChatCompletion,
+			contentType: "Application/JSON; Charset=UTF-8",
+			want:        true,
+		},
+		{
+			name:        "suffixed_json_embeddings",
+			apiName:     provider.ApiNameEmbeddings,
+			contentType: "application/vnd.api+json",
+			want:        true,
+		},
+		{
+			name:        "suffixed_json_chat_completion_uppercase",
+			apiName:     provider.ApiNameChatCompletion,
+			contentType: "Application/Merge-Patch+JSON",
+			want:        true,
+		},
+		{
+			name:        "text_json_is_not_recognised",
+			apiName:     provider.ApiNameChatCompletion,
+			contentType: "text/json",
+			want:        false,
+		},
+		{
+			name:        "json_suffix_outside_application_is_not_recognised",
+			apiName:     provider.ApiNameChatCompletion,
+			contentType: "text/vnd.api+json",
+			want:        false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

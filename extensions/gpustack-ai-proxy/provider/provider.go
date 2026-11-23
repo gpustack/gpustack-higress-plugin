@@ -88,20 +88,20 @@ const (
 	ApiNameVertexRaw                   ApiName = "vertex/raw"
 
 	// OpenAI
-	PathOpenAIPrefix                               = "/v1"
-	PathOpenAICompletions                          = "/v1/completions"
-	PathOpenAIChatCompletions                      = "/v1/chat/completions"
-	PathOpenAIEmbeddings                           = "/v1/embeddings"
-	PathOpenAIFiles                                = "/v1/files"
-	PathOpenAIRetrieveFile                         = "/v1/files/{file_id}"
-	PathOpenAIRetrieveFileContent                  = "/v1/files/{file_id}/content"
-	PathOpenAIBatches                              = "/v1/batches"
-	PathOpenAIRetrieveBatch                        = "/v1/batches/{batch_id}"
-	PathOpenAICancelBatch                          = "/v1/batches/{batch_id}/cancel"
-	PathOpenAIModels                               = "/v1/models"
+	PathOpenAIPrefix              = "/v1"
+	PathOpenAICompletions         = "/v1/completions"
+	PathOpenAIChatCompletions     = "/v1/chat/completions"
+	PathOpenAIEmbeddings          = "/v1/embeddings"
+	PathOpenAIFiles               = "/v1/files"
+	PathOpenAIRetrieveFile        = "/v1/files/{file_id}"
+	PathOpenAIRetrieveFileContent = "/v1/files/{file_id}/content"
+	PathOpenAIBatches             = "/v1/batches"
+	PathOpenAIRetrieveBatch       = "/v1/batches/{batch_id}"
+	PathOpenAICancelBatch         = "/v1/batches/{batch_id}/cancel"
+	PathOpenAIModels              = "/v1/models"
 
 	// Systemone (Jev decision contract)
-	PathSystemone = "/v1/systemone"
+	PathSystemone                                  = "/v1/systemone"
 	PathOpenAIImageGeneration                      = "/v1/images/generations"
 	PathOpenAIImageEdit                            = "/v1/images/edits"
 	PathOpenAIImageVariation                       = "/v1/images/variations"
@@ -361,6 +361,14 @@ type ProviderConfig struct {
 	// @Title zh-CN 失败请求重试
 	// @Description zh-CN 对失败的请求立即进行重试
 	retryOnFailure *retryOnFailure `required:"false" yaml:"retryOnFailure" json:"retryOnFailure"`
+	// @Title zh-CN 请求优先级目标
+	// @Description zh-CN 该 provider 背后的后端如何接收调用方的推理请求优先级（由 requestPrioritySource 指定的请求头携带）：vllm（写请求头 x-vllm-priority = -p）、sglang（写请求体 priority = p）、不设（不处理）。由 GPustack 按模型的后端类型渲染。
+	requestPriorityTarget RequestPriorityTarget `required:"false" yaml:"requestPriorityTarget" json:"requestPriorityTarget"`
+	// requestPriorityTargetWarning records that requestPriorityTarget fell back
+	// to unset because the configured value was unrecognised; logged by the
+	// caller of FromJson, since this package's logger is nil under plain
+	// `go test` until the host installs it.
+	requestPriorityTargetWarning string `yaml:"-" json:"-"`
 	// @Title zh-CN 禁用流式使用统计
 	// @Description zh-CN 禁用后流式请求不会注入 stream_options.include_usage 字段。启用此选项后，流式请求的 token 使用统计将不可用，影响 ai-statistics/access-log 的 usage 字段。适用于不支持 stream_options 的旧版推理引擎（如 vLLM 0.4.3）。
 	disableStreamUsageStats bool `required:"false" yaml:"disableStreamUsageStats" json:"disableStreamUsageStats"`
@@ -750,6 +758,7 @@ func (c *ProviderConfig) FromJson(json gjson.Result) {
 	if retryOnFailureJson.Exists() {
 		c.retryOnFailure.FromJson(retryOnFailureJson)
 	}
+	c.requestPriorityTarget, c.requestPriorityTargetWarning = normalizeRequestPriorityTarget(json.Get("requestPriorityTarget").String())
 	c.disableStreamUsageStats = json.Get("disableStreamUsageStats").Bool()
 	c.difyApiUrl = json.Get("difyApiUrl").String()
 	c.botType = json.Get("botType").String()
@@ -965,6 +974,18 @@ func (c *ProviderConfig) IsGeneric() bool {
 
 func (c *ProviderConfig) GetPromoteThinkingOnEmpty() bool {
 	return c.promoteThinkingOnEmpty
+}
+
+// GetRequestPriorityTarget reports which backend family this provider fronts
+// for request-priority translation, unset when the provider takes none.
+func (c *ProviderConfig) GetRequestPriorityTarget() RequestPriorityTarget {
+	return c.requestPriorityTarget
+}
+
+// GetRequestPriorityTargetWarning is non-empty when the configured target was
+// unrecognised and fell back to unset.
+func (c *ProviderConfig) GetRequestPriorityTargetWarning() string {
+	return c.requestPriorityTargetWarning
 }
 
 func (c *ProviderConfig) GetLogUpstreamErrorResponseBody() bool {
@@ -1298,6 +1319,12 @@ func (c *ProviderConfig) handleRequestBody(
 
 	// use original protocol
 	if c.IsOriginal() {
+		// The body is otherwise passed as received; a sglang priority target
+		// is the one thing still written into it. Nothing else touches the
+		// body on this path, so this is the only injection point.
+		if injected := c.requestPriorityBody(ctx, apiName, body); !bytes.Equal(injected, body) {
+			return types.ActionContinue, replaceRequestBody(injected)
+		}
 		return types.ActionContinue, nil
 	}
 
@@ -1389,6 +1416,13 @@ func (c *ProviderConfig) handleRequestBody(
 	if err != nil {
 		return types.ActionContinue, err
 	}
+
+	// GPUStack-local: the request priority for a sglang target goes into the
+	// final body, after every conversion above (Claude -> OpenAI rebuilds the
+	// body from the Claude schema, which has no such member, so injecting any
+	// earlier would be lost) and before both replaceRequestBody exits below,
+	// context-cache path included.
+	body = c.requestPriorityBody(ctx, apiName, body)
 
 	if apiName == ApiNameChatCompletion {
 		if c.context == nil {

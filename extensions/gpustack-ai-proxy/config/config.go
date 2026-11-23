@@ -6,6 +6,8 @@
 package config
 
 import (
+	"strings"
+
 	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-ai-proxy/provider"
 	"github.com/tidwall/gjson"
 )
@@ -38,6 +40,12 @@ type PluginConfig struct {
 	// configured value was unrecognised; logged by the caller of FromJson.
 	toolCallValidationWarning string `yaml:"-"`
 
+	// @Title zh-CN 请求优先级来源
+	// @Description zh-CN 携带调用方推理请求优先级的请求头（gpustack-ext-auth 写入）：非负整数，越大越紧急，缺失按 0 处理。读取后即从上游请求中移除；是否翻译、如何翻译由各 provider 的 requestPriorityTarget 决定。
+	// Parsed like toolCallValidation: only assigned when the key is present, so
+	// a matchRule override inherits the global value; empty means the default.
+	requestPrioritySource string `yaml:"requestPrioritySource"`
+
 	activeProviderConfig *provider.ProviderConfig `yaml:"-"`
 	activeProvider       provider.Provider        `yaml:"-"`
 }
@@ -48,6 +56,9 @@ func (c *PluginConfig) FromJson(json gjson.Result) {
 	// not mention it inherits the global value copied by parseOverrideRuleConfig.
 	if modeJson := json.Get("toolCallValidation"); modeJson.Exists() {
 		c.toolCallValidation, c.toolCallValidationWarning = normalizeToolCallValidationMode(modeJson.String())
+	}
+	if sourceJson := json.Get("requestPrioritySource"); sourceJson.Exists() {
+		c.requestPrioritySource = strings.TrimSpace(sourceJson.String())
 	}
 
 	if providersJson := json.Get("providers"); providersJson.Exists() && providersJson.IsArray() {
@@ -128,6 +139,26 @@ func (c *PluginConfig) GetToolCallValidationMode() ToolCallValidationMode {
 		return ToolCallValidationDefault
 	}
 	return c.toolCallValidation
+}
+
+// GetRequestPrioritySource returns the header carrying the caller's request
+// priority: the configured one, or the header gpustack-ext-auth writes.
+func (c *PluginConfig) GetRequestPrioritySource() string {
+	if c.requestPrioritySource == "" {
+		return provider.DefaultRequestPrioritySource
+	}
+	return c.requestPrioritySource
+}
+
+// GetRequestPriorityTargetWarning reports an unrecognised requestPriorityTarget
+// on the active provider, empty when there is nothing to report. Only the
+// active provider is consulted: a matchRule selects one, and the others never
+// run, so a typo in an unselected entry is not worth a log line per parse.
+func (c *PluginConfig) GetRequestPriorityTargetWarning() string {
+	if c.activeProviderConfig == nil {
+		return ""
+	}
+	return c.activeProviderConfig.GetRequestPriorityTargetWarning()
 }
 
 func (c *PluginConfig) GetProviderConfig() *provider.ProviderConfig {

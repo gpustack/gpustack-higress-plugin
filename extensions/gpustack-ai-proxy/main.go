@@ -256,6 +256,14 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 	// allowing plugins to inspect or modify the response correctly
 	_ = proxywasm.RemoveHttpRequestHeader("Accept-Encoding")
 
+	// GPUStack-local: translate the caller's request priority into the active
+	// provider's backend form (gpustack/gpustack#6739). Ahead of the provider's
+	// own header rewrite rather than behind it, so it also runs for a provider
+	// without a RequestHeadersHandler; the shared rewrite (handleRequestHeaders)
+	// writes the full header set back and so preserves it. The source header
+	// is consumed here whatever the target, so it never reaches an upstream.
+	provider.ApplyRequestPriorityHeaders(ctx, pluginConfig.GetRequestPrioritySource(), providerConfig.GetRequestPriorityTarget())
+
 	_, hasRequestBodyHandler := activeProvider.(provider.RequestBodyHandler)
 	hasRequestBody := ctx.HasRequestBody()
 	if hasRequestBody && hasRequestBodyHandler && requestContentLengthExceedsLimit(defaultMaxBodyBytes) {
@@ -846,12 +854,21 @@ func getApiName(path string) provider.ApiName {
 	return provider.ClassifyPath(path)
 }
 
+// isSupportedRequestContentType reports whether the plugin reads and
+// processes the body of this request. Media types are case-insensitive, and
+// `application/<x>+json` is JSON too, so both are recognised: a body the
+// plugin declines to read here is never rewritten below -- not for protocol
+// conversion, and not for the request-priority member, which a client could
+// otherwise sidestep with `Content-Type: Application/JSON`.
 func isSupportedRequestContentType(apiName provider.ApiName, contentType string) bool {
-	if strings.Contains(contentType, util.MimeTypeApplicationJson) {
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:i])
+	}
+	if mediaType == "application/json" || (strings.HasPrefix(mediaType, "application/") && strings.HasSuffix(mediaType, "+json")) {
 		return true
 	}
-	contentType = strings.ToLower(contentType)
-	if strings.HasPrefix(contentType, "multipart/form-data") {
+	if strings.HasPrefix(mediaType, "multipart/form-data") {
 		return apiName == provider.ApiNameImageEdit || apiName == provider.ApiNameImageVariation
 	}
 	return false

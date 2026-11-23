@@ -64,6 +64,11 @@ type contextCache struct {
 
 	loaded  bool
 	content string
+
+	// config is the provider the cache belongs to, consulted when the
+	// inserted body is final so a sglang priority member survives the rebuild
+	// (see insertContext).
+	config *ProviderConfig
 }
 
 type ContextInserter interface {
@@ -109,30 +114,31 @@ func createContextCache(providerConfig *ProviderConfig) *contextCache {
 		client:  wrapper.NewClusterClient(cluster),
 		fileUrl: fileUrlObj,
 		timeout: providerConfig.timeout,
+		config:  providerConfig,
 	}
 }
 
 func (c *contextCache) GetContextFromFile(ctx wrapper.HttpContext, provider Provider, body []byte) error {
 	if c.loaded {
 		log.Debugf("context file loaded from cache")
-		insertContext(provider, c.content, nil, body)
+		c.insertContext(ctx, provider, c.content, nil, body)
 		return nil
 	}
 
 	log.Infof("loading context file from %s", c.fileUrl.String())
 	return c.client.Get(c.fileUrl.Path, nil, func(statusCode int, responseHeaders http.Header, responseBody []byte) {
 		if statusCode != http.StatusOK {
-			insertContext(provider, "", fmt.Errorf("failed to load context file, status: %d", statusCode), nil)
+			c.insertContext(ctx, provider, "", fmt.Errorf("failed to load context file, status: %d", statusCode), nil)
 			return
 		}
 		c.content = string(responseBody)
 		c.loaded = true
 		log.Debugf("content: %s", c.content)
-		insertContext(provider, c.content, nil, body)
+		c.insertContext(ctx, provider, c.content, nil, body)
 	}, c.timeout)
 }
 
-func insertContext(provider Provider, content string, err error, body []byte) {
+func (c *contextCache) insertContext(ctx wrapper.HttpContext, provider Provider, content string, err error, body []byte) {
 	defer func() {
 		_ = proxywasm.ResumeHttpRequest()
 	}()
@@ -151,6 +157,14 @@ func insertContext(provider Provider, content string, err error, body []byte) {
 
 	if err != nil {
 		util.ErrorHandler(fmt.Sprintf("ai-proxy.%s.insert_ctx_failed", typ), fmt.Errorf("failed to insert context message: %v", err))
+	}
+	// GPUStack-local: the insertion above rebuilds the body from the
+	// provider's own request schema, which has no `priority` member, so the
+	// sglang priority the body phase already wrote is gone -- put it back
+	// once the body is final (gpustack/gpustack#6739). No-op for any other
+	// target: the ctx holds a value only when the headers phase wrote one.
+	if c.config != nil {
+		body = c.config.requestPriorityBody(ctx, ApiNameChatCompletion, body)
 	}
 	if err := replaceRequestBody(body); err != nil {
 		util.ErrorHandler(fmt.Sprintf("ai-proxy.%s.replace_request_body_failed", typ), fmt.Errorf("failed to replace request body: %v", err))

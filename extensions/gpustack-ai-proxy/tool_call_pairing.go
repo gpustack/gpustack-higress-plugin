@@ -268,6 +268,12 @@ func logToolCallValidationWarning(pluginConfig *config.PluginConfig) {
 	if warning := pluginConfig.ToolCallValidationWarning(); warning != "" {
 		log.Errorf("[%s] %s", pluginName, warning)
 	}
+	// Same shape for the request-priority target: a typo disables the feature
+	// for that provider and must say so, since the symptom is otherwise a
+	// priority that silently never takes effect.
+	if warning := pluginConfig.GetRequestPriorityTargetWarning(); warning != "" {
+		log.Errorf("[%s] %s", pluginName, warning)
+	}
 }
 
 // toolCallPairingDecision answers "should this request be rejected, and why"

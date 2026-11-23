@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,6 +130,38 @@ func (l LocalAuth) unrestricted(id identity, now time.Time) bool {
 	}
 	entry, ok := l.Refs[id.Ref]
 	return ok && !entry.expired(now) && entry.Unrestricted
+}
+
+// priority reports the inference request priority configured for the key
+// behind this identity, if the key is still live and carries one.
+//
+// A fresh table lookup for the same reasons as unrestricted, and one more:
+// on the server-authorised path the identity may only have been named by the
+// server a moment ago, so there was no entry to carry a value from. Anonymous
+// and unresolved identities have no key and therefore no priority -- the
+// header is simply not written for them, which ai-proxy reads as "default".
+func (l LocalAuth) priority(id identity, now time.Time) (int64, bool) {
+	var p *int64
+	switch {
+	case id.AccessKey != "":
+		entry, ok := l.Keys[id.AccessKey]
+		if !ok || entry.expired(now) {
+			return 0, false
+		}
+		p = entry.Priority
+	case id.Ref != "":
+		entry, ok := l.Refs[id.Ref]
+		if !ok || entry.expired(now) {
+			return 0, false
+		}
+		p = entry.Priority
+	default:
+		return 0, false
+	}
+	if p == nil {
+		return 0, false
+	}
+	return *p, true
 }
 
 // Authz is the authorization call: endpoint, and which headers cross it in
@@ -343,6 +376,7 @@ func parseLocalAuth(raw gjson.Result, local *LocalAuth) error {
 				Digest:       digest,
 				UserID:       entry.Get("user_id").Int(),
 				Unrestricted: entry.Get("unrestricted").Bool(),
+				Priority:     optionalPriority(entry.Get("priority")),
 			}
 			return true
 		})
@@ -357,6 +391,7 @@ func parseLocalAuth(raw gjson.Result, local *LocalAuth) error {
 			refs[k.String()] = refEntry{
 				Exp:          optionalUnixSeconds(entry.Get("exp")),
 				Unrestricted: entry.Get("unrestricted").Bool(),
+				Priority:     optionalPriority(entry.Get("priority")),
 			}
 			return true
 		})
@@ -372,6 +407,43 @@ func optionalUnixSeconds(v gjson.Result) *int64 {
 	}
 	seconds := v.Int()
 	return &seconds
+}
+
+// requestPriorityMax bounds a published priority to what the consuming
+// backends accept as a 32-bit scheduling value; vLLM validates its header
+// against exactly this range and rejects the request otherwise.
+const requestPriorityMax = int64(1<<31 - 1)
+
+// parseRequestPriority is the one spelling of a priority this plugin
+// publishes or relays: the JSON literal must be a plain non-negative 32-bit
+// integer. gjson's Number includes fractions and Int() truncates them
+// (`1.9` -> 1, `-0.5` -> 0), so the raw literal is parsed instead of the
+// converted value. Returns false for anything else.
+func parseRequestPriority(raw string) (int64, bool) {
+	p, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || p < 0 || p > requestPriorityMax {
+		return 0, false
+	}
+	return p, true
+}
+
+// optionalPriority maps an absent, null, fractional or out-of-range
+// `priority` to "not configured".
+//
+// Out of range is dropped rather than clipped: a clipped value would schedule
+// a caller the server never intended, and silently at that. Dropping it costs
+// the caller its priority, which is the same as a server that never published
+// one. GPustack validates the range at write time, so this only catches a CR
+// edited by hand.
+func optionalPriority(v gjson.Result) *int64 {
+	if !v.Exists() || v.Type != gjson.Number {
+		return nil
+	}
+	priority, ok := parseRequestPriority(v.Raw)
+	if !ok {
+		return nil
+	}
+	return &priority
 }
 
 func parseAuthz(raw gjson.Result, authz *Authz) error {

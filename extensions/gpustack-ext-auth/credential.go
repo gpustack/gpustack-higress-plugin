@@ -264,6 +264,19 @@ type keyEntry struct {
 	// negotiable: the inverse encoding would be cheaper in CR bytes and would
 	// turn every unrecognised key into an unrestricted one.
 	Unrestricted bool `json:"unrestricted"`
+
+	// Priority is the inference request priority GPustack assigned to this
+	// key, nil when none is configured. Published for ai-proxy to translate
+	// into the backend's scheduling input (gpustack/gpustack#6739); the
+	// server has already folded the key-over-user-default decision into this
+	// one number, so the plugin never needs to know which it came from.
+	//
+	// Read live from the table on every request rather than carried on the
+	// identity, for the same reason as Unrestricted: a marker or a cache hit
+	// names the caller without reading its entry, and a priority changed on
+	// the server should take effect on the next request, not on the next
+	// marker expiry.
+	Priority *int64 `json:"priority,omitempty"`
 }
 
 // expired reports whether the entry's lifetime has run out as of now.
@@ -288,6 +301,11 @@ type refEntry struct {
 	// resolved identities that may skip an authed route's authorization call,
 	// so the flag has to be readable from this table too.
 	Unrestricted bool `json:"unrestricted"`
+	// Priority carries the same meaning as on keyEntry. A refs identity is
+	// only ever named by a marker or a cache hit, and both of those are
+	// resolved identities whose priority ai-proxy must be able to learn, so
+	// it has to be readable from this table too.
+	Priority *int64 `json:"priority,omitempty"`
 }
 
 func (e refEntry) expired(now time.Time) bool {

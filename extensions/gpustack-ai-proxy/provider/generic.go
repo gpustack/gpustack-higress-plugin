@@ -57,6 +57,11 @@ func (m *genericProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiN
 }
 
 func (m *genericProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, error) {
+	// GPUStack-local: the generic provider never goes through
+	// handleRequestBody, so the request-priority member has to be written
+	// here; the headers phase already consumed the source header
+	// (gpustack/gpustack#6739).
+	body = m.config.requestPriorityBody(ctx, apiName, body)
 	// buffer original request body
 	_ = proxywasm.ReplaceHttpRequestBody(body)
 	return types.ActionContinue, nil

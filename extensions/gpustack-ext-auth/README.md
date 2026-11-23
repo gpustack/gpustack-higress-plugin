@@ -49,6 +49,7 @@ spec:
           digest: "s128$<salt>$<hash>"
           user_id: 7
           unrestricted: true # absent means false, i.e. ask the server
+          priority: 20 # absent means none; ai-proxy translates it per backend
       refs:
         "58": { exp: null } # keyed by api_keys.id
 
@@ -102,9 +103,10 @@ spec:
 | Field | Meaning |
 | --- | --- |
 | `local_auth.enabled` | Master switch for local authentication. Off ⇒ every request forwards its credential to the server, as before. |
-| `local_auth.keys` | `access_key` → `{exp, digest, user_id, unrestricted}`. Drives authentication, expiry and revocation. |
-| `local_auth.refs` | `api_keys.id` → `{exp, unrestricted}`. Validity index only; cannot verify a credential, but gates and invalidates the verification cache. |
+| `local_auth.keys` | `access_key` → `{exp, digest, user_id, unrestricted, priority}`. Drives authentication, expiry and revocation. |
+| `local_auth.refs` | `api_keys.id` → `{exp, unrestricted, priority}`. Validity index only; cannot verify a credential, but gates and invalidates the verification cache. |
 | `local_auth.keys.*.unrestricted`, `local_auth.refs.*.unrestricted` | Same field on either table: the key adds nothing to its user's own reach, i.e. its scope admits inference and it names no `allowed_model_names`. Absent means false. Read only on an `authed` route. |
+| `local_auth.keys.*.priority`, `local_auth.refs.*.priority` | Inference request priority GPustack assigned to the key: a non-negative int (`0 ≤ p ≤ 2^31-1`), larger meaning more urgent. Written to `x-gpustack-request-priority` for ai-proxy to translate. Absent, null, fractional or out of range means none, and the header is not written (the literal must be a plain integer: gjson would truncate `1.9` to `1`). Read live on every request from whichever table answers for the identity. |
 | `authz.endpoint` | `/token-auth` location. `service_name` and `path` are required. |
 | `authz.endpoint_mode` | Optional; `forward_auth` is the only accepted value. An explicit `envoy` is rejected at parse time. |
 | `authz.timeout` | Milliseconds, default 1000. |
@@ -327,6 +329,7 @@ only misconfigure them.
 | `X-Mse-Consumer` | Client copy removed on the way in, authoritative value stamped on the way out. Name is hard-coded, matching every other Higress plugin. |
 | `x-gpustack-auth-cache` | Forwarded to the authorization call and relayed to the upstream request. |
 | `X-GPUStack-Access-Key`, `X-GPUStack-Key-Ref` | Set when the plugin has resolved an identity; any client-supplied copy is dropped. |
+| `x-gpustack-request-priority` | Client copy removed on the way in. On the way out: set from the resolved identity's `priority` when it has one; the server's own response header of this name is relayed without needing to be declared (like the marker), provided its value is a well-formed priority; this is the only source when the identity was the server's to name. Absent means "no priority configured", which ai-proxy reads as the default. |
 | `Authorization`, `x-api-key`, `cookie` | Forwarded when the identity is unresolved, stripped when it is not. |
 
 `authorization_response.allowed_upstream_headers` is not supported: every header
@@ -381,6 +384,17 @@ revocations propagating.
 
 A key left out of the tables still works; it authenticates at the server on
 every request.
+
+### `priority`
+
+Set it on an entry, in either table, to the key's effective inference request
+priority — the key's own value, or its user's default when the key has none —
+already folded into one number by the server. Emit it only when configured and
+non-zero (`,"priority":20` is ~14 bytes an entry); absent already means none.
+On the server-authorised path (`/token-auth`) the same number must come back
+as the `X-GPUStack-Request-Priority` response header, which this plugin relays
+without it having to be declared (a malformed value is dropped, not forwarded). The plugin never interprets the value: ai-proxy translates it
+per backend (gpustack/gpustack#6739).
 
 ### Route rules
 
