@@ -703,8 +703,7 @@ func (c *ProviderConfig) resetSharedData() {
 func (c *ProviderConfig) OnRequestFailed(activeProvider Provider, ctx wrapper.HttpContext, apiTokenInUse string, apiTokens []string, status string) types.Action {
 	// Async creation may have been accepted even when the response is lost.
 	// Replaying it through another key or target could submit a second job.
-	// Task reads also retain their native path and fixed endpoint; provider
-	// retries must not reconstruct a request with the public ID.
+	// Follow-up requests use the native task ID and the selected model route.
 	apiName, _ := ctx.GetContext(CtxKeyApiName).(ApiName)
 	if apiName == ApiNameVideos || apiName == ApiNameRetrieveVideo || apiName == ApiNameRetrieveVideoContent {
 		return types.ActionContinue

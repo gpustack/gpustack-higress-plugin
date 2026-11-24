@@ -11,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb/wire"
-	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-video/routing"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/wrapper"
@@ -48,8 +47,7 @@ type AutoRoutingRule struct {
 }
 
 type PluginConfig struct {
-	videoJobs          bool
-	videoRole          string
+	videoRoutes        bool
 	prefix             string
 	targetHeader       string
 	modelKey           string
@@ -96,14 +94,7 @@ func init() {
 }
 
 func parseConfig(json gjson.Result, config *PluginConfig) error {
-	config.videoJobs = json.Get("videoJobs").Bool()
-	config.videoRole = json.Get("videoRole").String()
-	if config.videoRole == "" {
-		config.videoRole = "edge"
-	}
-	if config.videoRole != "edge" && config.videoRole != "cluster" {
-		return errors.New("invalid videoRole")
-	}
+	config.videoRoutes = json.Get("videoRoutes").Bool()
 	config.prefix = json.Get("prefix").String()
 	if config.prefix == "" {
 		config.prefix = defaultPrefix
@@ -263,55 +254,9 @@ func multipartBoundary(contentType string) string {
 }
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
-	// Discard caller-supplied bootstrap markers before identifying a task path.
-	// Only the resolver may retain one after authorizing persisted history.
-	_ = proxywasm.RemoveHttpRequestHeader(routing.BootstrapHeader)
-	if config.videoJobs {
-		method, _ := proxywasm.GetHttpRequestHeader(":method")
-		path, _ := proxywasm.GetHttpRequestHeader(":path")
-		relay, _ := proxywasm.GetHttpRequestHeader(routing.RelayHeader)
-		_ = proxywasm.RemoveHttpRequestHeader(routing.RelayHeader)
-		if config.videoRole == "cluster" && relay != "" {
-			_ = proxywasm.SetProperty([]string{routing.RelayState}, []byte(relay))
-		}
-		canonical, pathModel, isVideo := routing.CanonicalPath(path, config.prefix, config.aliasNameMapping)
-		fallback, _ := proxywasm.GetHttpRequestHeader("x-gpustack-fallback-path")
-		if fallbackPath, fallbackModel, fallbackVideo := routing.CanonicalPath(fallback, config.prefix, config.aliasNameMapping); fallbackVideo {
-			canonical, pathModel, isVideo = fallbackPath, fallbackModel, true
-		}
-		if isVideo {
-			// The later header transformer must not replace a validated video
-			// path with a caller-supplied fallback path.
-			_ = proxywasm.RemoveHttpRequestHeader("x-gpustack-fallback-path")
-		}
-		if isVideo && canonical != path {
-			_ = proxywasm.ReplaceHttpRequestHeader(":path", canonical)
-			path = canonical
-		}
-		op, _ := routing.Operation(method, path)
-		if isVideo && op == "" {
-			// A cluster gateway may have a catch-all model route. Reject native
-			// IDs and unsupported operations before they can reach that route.
-			_ = proxywasm.SendHttpResponse(404, [][2]string{{"content-type", "application/json"}},
-				[]byte(`{"error":{"message":"Video operation is not supported"}}`), -1)
-			return types.ActionPause
-		}
-		if isVideo {
-			_ = proxywasm.RemoveHttpRequestHeader("x-gpustack-model-instance")
-			_ = proxywasm.RemoveHttpRequestHeader("x-gpustack-video-cluster")
-			_ = proxywasm.RemoveHttpRequestHeader("x-higress-target-cluster")
-		}
-		if op == "status" || op == "content" || op == "delete" {
-			_ = proxywasm.RemoveHttpRequestHeader(config.targetHeader)
-			_ = proxywasm.RemoveHttpRequestHeader("x-gpustack-model")
-			_ = proxywasm.ReplaceHttpRequestHeader(routing.BootstrapHeader, "1")
-			ctx.DontReadRequestBody()
-			return types.ActionContinue
-		}
-		if isVideo && pathModel != "" {
-			writeRoutingHeaders(config, pathModel)
-			ctx.DontReadRequestBody()
-			return types.ActionContinue
+	if config.videoRoutes {
+		if action, handled := routeVideo(ctx, config); handled {
+			return action
 		}
 	}
 	// A fallback (internal-redirect) re-entry pass: the request is here

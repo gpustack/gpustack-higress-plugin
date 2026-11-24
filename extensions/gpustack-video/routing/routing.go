@@ -1,4 +1,4 @@
-// Package routing defines the async video path and trusted header contract.
+// Package routing defines video operations and their model routing contract.
 package routing
 
 import (
@@ -7,13 +7,7 @@ import (
 	"strings"
 )
 
-const BootstrapHeader = "x-gpustack-video-bootstrap"
-const ClusterHeader = "x-gpustack-video-cluster"
-const RelayHeader = "x-gpustack-video-delegation"
-const RelayState = "gpustack_video_delegation"
-
-var PublicID = regexp.MustCompile(`^video_[0-9a-f]{32}$`)
-var legacyID = regexp.MustCompile(`^video_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
+var nativeID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
 
 func Operation(method, rawPath string) (string, string) {
 	path, err := url.ParseRequestURI(rawPath)
@@ -24,10 +18,15 @@ func Operation(method, rawPath string) (string, string) {
 	if len(parts) < 3 || parts[0] != "" || parts[1] != "v1" || parts[2] != "videos" {
 		return "", ""
 	}
-	if method == "POST" && len(parts) == 3 {
-		return "create", ""
+	if method == "POST" {
+		if len(parts) == 3 {
+			return "create", ""
+		}
+		if len(parts) == 4 && parts[3] == "sync" {
+			return "sync", ""
+		}
 	}
-	if (method != "GET" && method != "DELETE") || len(parts) < 4 || len(parts[3]) > 4096 || !(PublicID.MatchString(parts[3]) || legacyID.MatchString(parts[3])) {
+	if (method != "GET" && method != "DELETE") || len(parts) < 4 || parts[3] == "sync" || !nativeID.MatchString(parts[3]) {
 		return "", ""
 	}
 	if len(parts) == 4 {
@@ -42,8 +41,7 @@ func Operation(method, rawPath string) (string, string) {
 	return "", ""
 }
 
-// CanonicalPath makes async video aliases enter the same protected task routes.
-// Synchronous video keeps its existing model-proxy path and filters.
+// CanonicalPath sends model-proxy aliases through the same video routes.
 func CanonicalPath(rawPath, prefix string, aliases map[string]string) (string, string, bool) {
 	parsed, err := url.ParseRequestURI(rawPath)
 	if err != nil {
@@ -69,7 +67,7 @@ func CanonicalPath(rawPath, prefix string, aliases map[string]string) (string, s
 		return rawPath, "", false
 	}
 	if len(parts) == 4 && strings.EqualFold(parts[3], "sync") {
-		return rawPath, "", false
+		parts[3] = "sync"
 	}
 	parts[1] = "v1"
 	parts[2] = "videos"

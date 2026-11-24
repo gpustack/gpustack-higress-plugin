@@ -40,6 +40,8 @@ var (
 		{PathOpenAIFineTuningJobs, ApiNameFineTuningJobs},
 		{PathOpenAIResponses, ApiNameResponses},
 		{PathOpenAIVideos, ApiNameVideos},
+		// Synchronous generation returns raw video rather than a task object.
+		{PathOpenAIVideos + "/sync", ""},
 		// Anthropic style
 		{PathAnthropicMessagesCountTokens, ApiNameAnthropicCountTokens},
 		{PathAnthropicMessages, ApiNameAnthropicMessages},
