@@ -188,6 +188,16 @@ it again. `make clean` is the fix.
 - **push.yaml**: runs on push to main — builds `whl-output` via Dockerfile (includes remote plugins via oras), uploads `.whl` as GitHub artifact `gpustack-higress-plugins-dist` (7 days), then builds and pushes `linux/amd64,linux/arm64` Docker image with tags `:latest`/`:main`; override registry with `vars.DOCKER_REPO`
 - **release.yaml**: triggered by version tags (`v*.*.*` or `*.*.*`) — syncs `pyproject.toml` version from tag, builds whl + image via Dockerfile; uploads `.whl` as release asset; RC tags (`*rc*`) → TestPyPI + Docker without `:latest`; stable tags → PyPI + Docker with `:latest`
 
+## Commit Messages
+
+Conventional-commit style: `type(scope): summary`, then a blank line, then an optional body.
+
+- **Summary**: imperative, no trailing period, **≤ 50 characters** (72 is the hard ceiling, not the target). `scope` is the plugin short name (`ai-proxy`, `lb`, `ext-auth`); omit it for repo-wide changes (`ci:`, `docs:`, `chore:`).
+- **Body**: one paragraph per concern, **hard-wrapped at ≤ 72 characters per line**. Never leave a long line for the reader's terminal to wrap — GitHub renders body text pre-wrapped. Explain *why*; the diff already says *what*.
+- **Issue references**: default to `refs #N` (or `refs gpustack/gpustack#N` across repos). Closing keywords (`Closes #N`, `Fixes #N`, `Resolves #N`) auto-close the issue on merge into the default branch and are used **only when a maintainer explicitly asks for it** — a merged PR is not automatically "issue resolved" (release pending, follow-ups, etc.).
+- **Amend only unpushed commits.** Fixing message/format problems on a commit that was already pushed requires a new commit, not history rewrite.
+- Check before committing: `git log -1 --format=%B | awk '{ print length($0) }'` — no line over 72.
+
 ## Pre-commit
 
 `.pre-commit-config.yaml` runs `ruff` (lint + fix) and `ruff-format` on `gpustack_higress_plugins/` and `scripts/` before each commit. Installed automatically by `make dev`.
