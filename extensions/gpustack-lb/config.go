@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -16,6 +18,12 @@ const (
 	modeFinisher = "finisher"
 
 	DefaultMaxBodyBytes = 100 * 1024 * 1024 // 100 MiB, same as model-mapper
+
+	// Bounds the decimal exponent intField will materialise. An int64 needs
+	// at most 19 significant digits, so any exponent beyond this is either
+	// out of range or fractional; the bound exists to keep big.Rat from
+	// allocating 10^exp for a literal like 1e1000000000 inside the wasm VM.
+	maxDecimalExponent = 512
 
 	defaultUnhealthyThreshold = 3
 	defaultCooldownMs         = 10000
@@ -355,14 +363,44 @@ func boolField(j gjson.Result, path string) (val bool, set bool, err error) {
 //
 // Integral floats are accepted (2.0, 1e3): the value is what matters, not how
 // the YAML happened to render it.
+//
+// Out-of-range values are rejected rather than wrapped. gjson's Int() wraps
+// silently: 2^64 becomes 0, 2^63 becomes negative, and -(2^63+1) flips to
+// +MaxInt64. For a tier that is the dangerous direction -- a standby rendered
+// as 0 joins the first-served tier and takes a share of healthy traffic.
+//
+// The literal is parsed exactly, never through r.Num: that float64 has
+// already rounded, so 1.0000000000000001 reads as integral, 1e-400 underflows
+// to 0 (a fractional value promoted to first-served), and 9007199254740993.0
+// collapses onto ...992, merging two distinct tiers. ParseInt is not the
+// answer either: it reports ErrRange mid-scan, before reaching the exponent,
+// so the valid 100000000000000000000e-20 (= 1) would be rejected.
 func intField(r gjson.Result, what string) (int64, error) {
 	if r.Type != gjson.Number {
 		return 0, fmt.Errorf("%s must be a number, got %s", what, r.Raw)
 	}
-	if r.Num != math.Trunc(r.Num) {
+	// Bound the exponent before the exact parse: big.Rat materialises
+	// 10^exp, so a literal like 1e1000000000 would allocate gigabytes
+	// inside the wasm VM. Nothing expressible as an int64 needs an
+	// exponent this far out -- it is either out of range or fractional.
+	if i := strings.IndexAny(r.Raw, "eE"); i >= 0 {
+		exp, err := strconv.Atoi(r.Raw[i+1:])
+		if err != nil || exp > maxDecimalExponent || exp < -maxDecimalExponent {
+			return 0, fmt.Errorf("%s is out of range for a 64-bit integer, got %s", what, r.Raw)
+		}
+	}
+	v, ok := new(big.Rat).SetString(r.Raw)
+	if !ok {
+		return 0, fmt.Errorf("%s must be a number, got %s", what, r.Raw)
+	}
+	if !v.IsInt() {
 		return 0, fmt.Errorf("%s must be a whole number, got %s", what, r.Raw)
 	}
-	return r.Int(), nil
+	n := v.Num()
+	if !n.IsInt64() {
+		return 0, fmt.Errorf("%s is out of range for a 64-bit integer, got %s", what, r.Raw)
+	}
+	return n.Int64(), nil
 }
 
 // stateBackend is the only read path for store.
@@ -708,22 +746,47 @@ func parseLB(j gjson.Result, config *Config) error {
 			}
 			maxRunning = v
 		}
-		// The fallback tier mark. Strict bool: a typo coerced to false would
-		// silently move a fallback target into the main tier, handing it a
-		// share of healthy traffic -- the exact semantics this field guards.
-		var fallback bool
+		// The drain tier. Strict whole number: a typo coerced to 0 would
+		// silently promote a standby target into the first-served tier,
+		// handing it a share of healthy traffic -- the exact semantics this
+		// field guards.
+		//
+		// `fallback` is the two-tier spelling of the same fact (true = tier
+		// 1). Setting both is a config error rather than a precedence rule:
+		// `fallback: true, tier: 0` would otherwise read as "standby" to a
+		// human and "first-served" to the filter, with nothing saying which
+		// won.
+		var tier int64
+		tierSet := false
+		if t := c.Get("tier"); t.Exists() && t.Type != gjson.Null {
+			v, err := intField(t, fmt.Sprintf("candidates[].tier (cluster %q)", cluster))
+			if err != nil {
+				return err
+			}
+			if v < 0 {
+				return fmt.Errorf("candidates[].tier must not be negative, got %d for cluster %q", v, cluster)
+			}
+			tier, tierSet = v, true
+		}
 		if fb := c.Get("fallback"); fb.Exists() && fb.Type != gjson.Null {
 			if fb.Type != gjson.True && fb.Type != gjson.False {
 				return fmt.Errorf("candidates[].fallback must be a boolean, got %s (cluster %q)", fb.Raw, cluster)
 			}
-			fallback = fb.Type == gjson.True
+			if tierSet {
+				return fmt.Errorf("candidates[] (cluster %q): set either tier or fallback, not both", cluster)
+			}
+			if fb.Type == gjson.True {
+				tier = 1
+			}
 		}
 		cand := candidateSpec{
 			Candidate: Candidate{
 				Cluster:  cluster,
 				TargetID: c.Get("targetId").String(),
 				Kind:     kind,
-				Fallback: fallback,
+				Tier:     tier,
+				// Derived, for consumers still reading the two-tier wire.
+				Fallback: tier > 0,
 			},
 			maxRunningRequests: maxRunning,
 			// ModelName is not set here: it is resolved per request from

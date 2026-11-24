@@ -121,17 +121,26 @@ type Candidate struct {
 	// penalty has not fully decayed yet.
 	Probation bool `json:"probation,omitempty"`
 
-	// Fallback marks a **fallback-tier** candidate: it is excluded from
-	// normal selection entirely (a fallback target must not take a share
-	// of healthy traffic) and enters the published set only when a
-	// re-selection pass has exhausted the main tier — the strict-tier
-	// counterpart of the legacy fallback path, where the fallback
-	// destination only ever saw failed traffic.
+	// Tier is the candidate's **ordinal drain layer**: 0 is served first,
+	// and a higher tier only enters the published set once every lower
+	// tier present in the narrowed pool has been exhausted (tried clusters
+	// excluded, or all its survivors ejected). Normal traffic goes to the
+	// lowest tier present; the tiers are ordinal, never proportional -- a
+	// higher-tier candidate takes no share of healthy traffic.
 	//
-	// The controller marks candidates whose ModelRouteTarget declares
-	// fallback status codes. Capability plugins should treat a fallback
-	// candidate like any other once it appears in the set: it is only in
-	// the set when it is legitimately selectable.
+	// The controller assigns it from the route's tier ladder. Tiers need
+	// not be contiguous: a pool holding only tiers 0 and 5 drains 0 -> 5.
+	Tier int64 `json:"tier,omitempty"`
+
+	// Fallback is the legacy spelling of "not the first tier", kept for
+	// consumers compiled against the two-tier contract (the separately
+	// shipped enterprise capability plugins read the wire package). It is
+	// derived from Tier and carries no independent meaning: true iff
+	// Tier > 0.
+	//
+	// Capability plugins should treat a fallback candidate like any other
+	// once it appears in the set: it is only in the set when it is
+	// legitimately selectable.
 	Fallback bool `json:"fallback,omitempty"`
 }
 

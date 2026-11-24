@@ -177,36 +177,39 @@ func TestExcludeCluster(t *testing.T) {
 	}
 }
 
-// mainTier: fallback-marked candidates take no share of normal traffic and
-// only join the set when a re-selection pass drains the main tier.
-func TestMainTier(t *testing.T) {
+// firstTier: higher-tier candidates take no share of normal traffic and
+// only join the set when a re-selection pass drains every lower tier.
+func TestFirstTier(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[
 		{"cluster":"a","targetId":"1"},
 		{"cluster":"b","targetId":"2","fallback":true},
 		{"cluster":"c","targetId":"3","fallback":true}
 	]}`)
 
-	main := mainTier(config.candidates)
-	if len(main) != 1 || main[0].Cluster != "a" {
-		t.Errorf("mainTier = %v, want only a/1", main)
+	first := firstTier(config.candidates)
+	if len(first) != 1 || first[0].Cluster != "a" {
+		t.Errorf("firstTier = %v, want only a/1", first)
 	}
 
 	// The tier composition mirrors the re-selection drain order: exclude the
-	// failed main cluster, keep surviving main candidates; only when the
-	// main tier is gone does the fallback tier serve.
+	// failed first-tier cluster, keep its survivors; only when the tier is
+	// gone does the next one serve.
 	step1 := excludeClusters(config.candidates, []string{"a"})
-	if m := mainTier(step1); len(m) != 0 {
-		t.Errorf("after the only main cluster fails, mainTier should be empty, got %v", m)
+	if m := firstTier(step1); len(m) != 2 {
+		t.Errorf("after the only tier-0 cluster fails, firstTier should be the standby tier, got %v", m)
 	}
 	if len(step1) != 2 {
-		t.Errorf("fallback tier should survive the exclusion: %v", step1)
+		t.Errorf("standby tier should survive the exclusion: %v", step1)
 	}
 
-	// All-fallback routes degrade to publishing everything (a route whose
-	// only targets are fallback targets must still serve).
+	// An all-standby route still serves: its lowest present tier IS its
+	// first tier (there is no tier 0 to wait for).
 	allFb := lbConfig(t, `{"candidates":[{"cluster":"a","targetId":"1","fallback":true}]}`)
-	if m := mainTier(allFb.candidates); len(m) != 0 {
-		t.Errorf("all-fallback route: mainTier = %v", m)
+	if m := firstTier(allFb.candidates); len(m) != 1 {
+		t.Errorf("all-standby route: firstTier = %v, want the standby candidate", m)
+	}
+	if m := firstTier(nil); len(m) != 0 {
+		t.Errorf("empty pool: firstTier = %v", m)
 	}
 }
 
@@ -250,36 +253,41 @@ func TestMatchModelPattern(t *testing.T) {
 	}
 }
 
-// The health-aware tier drain: when every publishable main-tier survivor
-// is ejected, the fallback tier of the narrowed set serves — but an
-// EJECTED fallback candidate must not be handed back either.
-func TestFallbackTierOnly(t *testing.T) {
+// The drain must not pre-filter by ejection: provider candidates are
+// exempt from passive health (one DNS cluster, many endpoints), so a
+// first-tier provider carrying a shared or lingering ejection record still
+// serves. Filtering it out here would hand traffic to a higher tier that
+// should not receive it.
+func TestTierDrainKeepsEjectedProvider(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[
-		{"cluster":"a","targetId":"1"},
-		{"cluster":"c","targetId":"3","fallback":true}
+		{"cluster":"p","targetId":"1","kind":"provider","tier":0},
+		{"cluster":"c","targetId":"2","tier":1}
 	]}`)
-	// No state: the healthy fallback is returned.
-	got := fallbackTierOnly(config.candidates, nil)
-	if len(got) != 1 || got[0].Cluster != "c" {
-		t.Errorf("healthy fallback drain = %v", got)
-	}
-	// The fallback itself ejected: nothing to drain to.
 	states := map[string]clusterState{
-		"c\u00003": {Health: healthState{EjectedUntil: 1 << 62}},
+		"p\u00001": {Health: healthState{EjectedUntil: 1 << 62}},
 	}
-	if got := fallbackTierOnly(config.candidates, states); got != nil {
-		t.Errorf("ejected fallback returned: %v", got)
+	set := buildFailClosed(firstTierConfig(t, config), config.candidates, nowMillis(), "m", states)
+	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "p" {
+		t.Errorf("ejected first-tier provider should still serve, got %v", set.Candidates)
 	}
-	// A main-tier-only set has no drain target.
-	main := lbConfig(t, `{"candidates":[{"cluster":"a","targetId":"1"}]}`)
-	if got := fallbackTierOnly(main.candidates, nil); got != nil {
-		t.Errorf("main-only set returned a fallback: %v", got)
+
+	// An ejected INSTANCE in the first tier does drain to the next tier.
+	inst := lbConfig(t, `{"candidates":[
+		{"cluster":"a","targetId":"1","tier":0},
+		{"cluster":"c","targetId":"2","tier":1}
+	]}`)
+	istates := map[string]clusterState{
+		"a\u00001": {Health: healthState{EjectedUntil: 1 << 62}},
+	}
+	set = buildFailClosed(firstTierConfig(t, inst), inst.candidates, nowMillis(), "m", istates)
+	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "c" {
+		t.Errorf("ejected first-tier instance should drain to tier 1, got %v", set.Candidates)
 	}
 }
 
-// buildFailClosed implements the strict preference order: healthy main
-// tier, then healthy fallback tier, and never a re-admitted ejected
-// candidate.
+// buildFailClosed implements the strict preference order: the healthy
+// candidates of the lowest tier, then the next tier, and never a
+// re-admitted ejected candidate.
 func TestBuildFailClosed(t *testing.T) {
 	config := lbConfig(t, `{"candidates":[
 		{"cluster":"a","targetId":"1"},
@@ -287,32 +295,132 @@ func TestBuildFailClosed(t *testing.T) {
 		{"cluster":"c","targetId":"3","fallback":true}
 	]}`)
 	now := nowMillis()
-	// All healthy: the main tier serves, the fallback stays out.
-	set := buildFailClosed(mainOnlyConfig(t, config), config.candidates, now, "m", nil)
+	// All healthy: the first tier serves, the standby stays out.
+	set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", nil)
 	if len(set.Candidates) != 2 || set.Candidates[0].Fallback || set.Candidates[1].Fallback {
-		t.Errorf("healthy main tier should serve, got %v", set.Candidates)
+		t.Errorf("healthy first tier should serve, got %v", set.Candidates)
 	}
-	// Every main survivor ejected: the healthy fallback F serves, not the
-	// ejected B.
+	// Every first-tier survivor ejected: the healthy standby serves, not
+	// the ejected B.
 	states := map[string]clusterState{
 		"a\u00001": {Health: healthState{EjectedUntil: 1 << 62}},
 		"b\u00002": {Health: healthState{EjectedUntil: 1 << 62}},
 	}
-	set = buildFailClosed(mainOnlyConfig(t, config), config.candidates, now, "m", states)
+	set = buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states)
 	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "c" {
-		t.Errorf("ejected mains should drain to the healthy fallback, got %v", set.Candidates)
+		t.Errorf("ejected first tier should drain to the healthy standby, got %v", set.Candidates)
 	}
-	// Everything ejected (fallback included): nothing fail-closed.
+	// Everything ejected (standby included): nothing fail-closed.
 	states["c\u00003"] = clusterState{Health: healthState{EjectedUntil: 1 << 62}}
-	if set := buildFailClosed(mainOnlyConfig(t, config), config.candidates, now, "m", states); len(set.Candidates) != 0 {
+	if set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states); len(set.Candidates) != 0 {
 		t.Errorf("fully-ejected pool should fail closed, got %v", set.Candidates)
 	}
 }
 
-func mainOnlyConfig(t *testing.T, c Config) Config {
+// A route with no tier configured is the default for every existing
+// deployment, so its behavior is pinned explicitly rather than left to
+// fall out of the drain: one tier holding the whole pool, published
+// together, and fail-closed once every member is ejected.
+func TestNoTiersKeepsSinglePoolBehavior(t *testing.T) {
+	config := lbConfig(t, `{"candidates":[
+		{"cluster":"a","targetId":"1"},
+		{"cluster":"b","targetId":"2"}
+	]}`)
+	now := nowMillis()
+	set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", nil)
+	if len(set.Candidates) != 2 {
+		t.Fatalf("untiered pool should publish together, got %v", set.Candidates)
+	}
+	for _, cand := range set.Candidates {
+		if cand.Tier != 0 || cand.Fallback {
+			t.Errorf("untiered candidate should be tier 0 / not fallback, got %+v", cand)
+		}
+	}
+	states := map[string]clusterState{
+		"a\x001": {Health: healthState{EjectedUntil: 1 << 62}},
+		"b\x002": {Health: healthState{EjectedUntil: 1 << 62}},
+	}
+	if set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states); len(set.Candidates) != 0 {
+		t.Errorf("fully-ejected untiered pool should fail closed, got %v", set.Candidates)
+	}
+}
+
+// firstTierConfig mirrors what handleLBMode hands buildFailClosed: the
+// config narrowed to the published (lowest) tier, with the FULL narrowed
+// pool passed separately as the drain source.
+func firstTierConfig(t *testing.T, c Config) Config {
 	t.Helper()
-	if main := mainTier(c.candidates); len(main) > 0 {
-		c.candidates = main
+	if first := firstTier(c.candidates); len(first) > 0 {
+		c.candidates = first
 	}
 	return c
+}
+
+// N-tier drain: the ordinal chain generalises past two tiers, and a tier
+// whose survivors are all ejected is skipped rather than handed back.
+func TestOrderedTierDrain(t *testing.T) {
+	config := lbConfig(t, `{"candidates":[
+		{"cluster":"a","targetId":"1","tier":0},
+		{"cluster":"b","targetId":"2","tier":1},
+		{"cluster":"c","targetId":"3","tier":2}
+	]}`)
+	now := nowMillis()
+
+	if got := tierOrder(config.candidates); len(got) != 3 || got[0] != 0 || got[2] != 2 {
+		t.Fatalf("tierOrder = %v, want [0 1 2]", got)
+	}
+	// Normal pass publishes tier 0 only.
+	if first := firstTier(config.candidates); len(first) != 1 || first[0].Cluster != "a" {
+		t.Errorf("firstTier = %v, want a/1", first)
+	}
+
+	// Tier 0 ejected -> tier 1 serves.
+	states := map[string]clusterState{
+		"a\u00001": {Health: healthState{EjectedUntil: 1 << 62}},
+	}
+	set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states)
+	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "b" {
+		t.Errorf("tier 0 ejected should drain to tier 1, got %v", set.Candidates)
+	}
+	// Tiers 0 and 1 ejected -> tier 2 serves.
+	states["b\u00002"] = clusterState{Health: healthState{EjectedUntil: 1 << 62}}
+	set = buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states)
+	if len(set.Candidates) != 1 || set.Candidates[0].Cluster != "c" {
+		t.Errorf("tiers 0,1 ejected should drain to tier 2, got %v", set.Candidates)
+	}
+	// All three ejected -> fail closed (the caller's fail-open build is
+	// the last resort, not this function).
+	states["c\u00003"] = clusterState{Health: healthState{EjectedUntil: 1 << 62}}
+	if set := buildFailClosed(firstTierConfig(t, config), config.candidates, now, "m", states); len(set.Candidates) != 0 {
+		t.Errorf("fully-ejected 3-tier pool should fail closed, got %v", set.Candidates)
+	}
+
+	// The tried-set exclusion composes with the drain: a and b attempted
+	// leaves tier 2 as the first tier present.
+	step := excludeClusters(config.candidates, []string{"a", "b"})
+	if first := firstTier(step); len(first) != 1 || first[0].Cluster != "c" {
+		t.Errorf("after excluding a,b firstTier = %v, want c/3", first)
+	}
+}
+
+// Tiers are ordinals, not indices: gaps carry no meaning and a missing
+// tier is simply not a step.
+func TestTierOrderNonContiguous(t *testing.T) {
+	config := lbConfig(t, `{"candidates":[
+		{"cluster":"a","targetId":"1","tier":5},
+		{"cluster":"b","targetId":"2","tier":0},
+		{"cluster":"c","targetId":"3","tier":5}
+	]}`)
+	got := tierOrder(config.candidates)
+	if len(got) != 2 || got[0] != 0 || got[1] != 5 {
+		t.Fatalf("tierOrder = %v, want [0 5]", got)
+	}
+	if first := firstTier(config.candidates); len(first) != 1 || first[0].Cluster != "b" {
+		t.Errorf("firstTier = %v, want b/2 (tier 0)", first)
+	}
+	set := buildFailClosed(firstTierConfig(t, config), config.candidates, nowMillis(), "m",
+		map[string]clusterState{"b\u00002": {Health: healthState{EjectedUntil: 1 << 62}}})
+	if len(set.Candidates) != 2 {
+		t.Errorf("tier 0 ejected should drain straight to tier 5, got %v", set.Candidates)
+	}
 }

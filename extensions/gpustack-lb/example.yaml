@@ -41,7 +41,7 @@ spec:
   # deserves one live check after the move).
   phase: AUTHN
   priority: 340
-  url: oci://<registry>/<org>/gpustack-lb:0.1.2
+  url: oci://<registry>/<org>/gpustack-lb:0.2.1
   defaultConfigDisable: false
   # mode belongs in defaultConfig: Higress applies defaultConfig to routes not
   # listed in matchRules as well, so it cannot be turned off by omission.
@@ -102,6 +102,23 @@ spec:
             kind: instance
             weight: 30            #   none at all -> capability plugins score,
                                   #   then round-robin
+          # Optional ordinal drain layer. The two candidates above declare no
+          # tier, so both are tier 0; this standby is tier 1, meaning it takes
+          # no share of normal traffic and only serves once BOTH of them are
+          # exhausted (tried clusters excluded, or all survivors ejected).
+          #
+          # The number is a sort key, not an array index: only the relative
+          # order matters, so a pool holding 0 and 5 drains 0 -> 5 and gaps are
+          # fine. Each candidate has exactly one tier -- drain order is a total
+          # order, so "in two layers" could only mean "served at the earlier
+          # one", which is what binding to that layer already says.
+          #
+          # `fallback: true` is the two-tier spelling of `tier: 1`; setting
+          # both on one candidate is a config error.
+          # - cluster: "outbound|80||model-standby.static"
+          #   targetId: "4"
+          #   kind: instance
+          #   tier: 1
         # Kept apart from candidates: adding a model alias should not touch
         # candidates, and adjusting a weight should not touch the mapping table.
         # Keys within a group use model-mapper syntax (exact / "prefix*" / "*").
@@ -116,6 +133,13 @@ spec:
         # health but failOpen -- the windows all live in the finisher.
         # health:
         #   failOpen: false
+        #
+        # ⚠️ routeRules and candidates[].tier are different axes: a rule says
+        #    "may this request go here" (request attributes -> eligible pool),
+        #    tier says "who first" (failure-driven drain order). In particular
+        #    the x-gpustack-tier header below is a consumer class injected by
+        #    ext-auth -- it has nothing to do with the candidates[].tier
+        #    ordinal, despite the shared word.
         #
         # routeRules (optional): deterministic request->pool narrowing.
         # First matching rule narrows `candidates` to its targets before the
@@ -150,7 +174,7 @@ metadata:
 spec:
   phase: AUTHN
   priority: 325
-  url: oci://<registry>/<org>/gpustack-lb:0.1.2
+  url: oci://<registry>/<org>/gpustack-lb:0.2.1
   defaultConfigDisable: false
   # **No matchRules**: the config is entirely deployment-level, and "does this
   # route do LB" exists in exactly one place, the context role. With no

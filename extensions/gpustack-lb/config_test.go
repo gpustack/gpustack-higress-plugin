@@ -96,6 +96,114 @@ func TestParseConfigRejectsBadMaxBodyBytes(t *testing.T) {
 	}
 }
 
+// The drain tier: absent means 0, `fallback: true` is the two-tier spelling
+// of tier 1, and the wire's Fallback flag is derived from the tier so
+// consumers compiled against the old contract keep reading the same fact.
+func TestParseCandidateTier(t *testing.T) {
+	c := parse(t, `{"candidates":[
+		{"cluster":"a","targetId":"1"},
+		{"cluster":"b","targetId":"2","fallback":true},
+		{"cluster":"c","targetId":"3","fallback":false},
+		{"cluster":"d","targetId":"4","tier":2}
+	]}`)
+	want := []struct {
+		tier     int64
+		fallback bool
+	}{{0, false}, {1, true}, {0, false}, {2, true}}
+	for i, w := range want {
+		got := c.candidates[i]
+		if got.Tier != w.tier || got.Fallback != w.fallback {
+			t.Errorf("candidate %d: tier=%d fallback=%v, want tier=%d fallback=%v",
+				i, got.Tier, got.Fallback, w.tier, w.fallback)
+		}
+	}
+}
+
+// A malformed tier must be a config error, not a silent promotion into the
+// first-served tier; and setting both spellings is ambiguous, so it is
+// rejected rather than resolved by a precedence rule nobody can see.
+func TestParseCandidateTierRejectsBadValues(t *testing.T) {
+	for _, raw := range []string{
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":-1}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":"oops"}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":1.5}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":0,"fallback":true}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","fallback":"yes"}]}`,
+		// Out of int64 range: gjson's Int() wraps these (2^64 -> 0, which
+		// would promote a standby into the first-served tier).
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":18446744073709551616}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":9223372036854775808}]}`,
+		`{"candidates":[{"cluster":"a","targetId":"1","tier":-9223372036854775809}]}`,
+	} {
+		var c Config
+		if err := parseConfig(gjson.Parse(raw), &c); err == nil {
+			t.Errorf("expected error for %s", raw)
+		}
+	}
+}
+
+// intField is shared by tier, weight, maxRunningRequests and contextLength,
+// so the range guard belongs here rather than at one call site. The
+// boundary cases matter in both directions: wrapping must be rejected, and
+// the legitimate int64 extremes must still parse (float64 rounds MaxInt64
+// up to 2^63, so a naive range check on the float would reject it).
+func TestIntFieldRangeAndNotation(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{raw: "0", want: 0},
+		{raw: "7", want: 7},
+		{raw: "-7", want: -7},
+		{raw: "9223372036854775807", want: 9223372036854775807},
+		{raw: "-9223372036854775808", want: -9223372036854775808},
+		// Integral decimal / exponent notation stays supported, including
+		// an oversized mantissa cancelled by a negative exponent: ParseInt
+		// reports ErrRange mid-scan here, before it ever reaches the "e".
+		{raw: "2.0", want: 2},
+		{raw: "1e3", want: 1000},
+		{raw: "-1e3", want: -1000},
+		{raw: "100000000000000000000e-20", want: 1},
+		{raw: "1E3", want: 1000},
+		{raw: "1e+3", want: 1000},
+		// Values float64 cannot hold: reading r.Num would accept the
+		// fractional ones as whole and shift the precise one to a
+		// neighbouring tier.
+		{raw: "9007199254740993.0", want: 9007199254740993},
+		{raw: "1.0000000000000001", wantErr: true},
+		{raw: "1e-400", wantErr: true},
+		{raw: "1e-20", wantErr: true},
+		// Wrapping / sign-flip cases.
+		{raw: "18446744073709551616", wantErr: true},
+		{raw: "9223372036854775808", wantErr: true},
+		{raw: "-9223372036854775809", wantErr: true},
+		{raw: "1e30", wantErr: true},
+		// Exponent bound: big.Rat must not materialise 10^exp for these.
+		{raw: "1e1000000000", wantErr: true},
+		{raw: "1e-1000000000", wantErr: true},
+		{raw: "1e513", wantErr: true},
+		// Truncation toward zero is the dangerous direction: 0 is meaningful
+		// in every field this helper serves.
+		{raw: "1.5", wantErr: true},
+		{raw: "0.5", wantErr: true},
+		{raw: "-0.5", wantErr: true},
+		{raw: `"7"`, wantErr: true},
+	}
+	for _, tc := range cases {
+		got, err := intField(gjson.Parse(tc.raw), "field")
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("intField(%s) = %d, want error", tc.raw, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("intField(%s) = %d, %v; want %d, nil", tc.raw, got, err, tc.want)
+		}
+	}
+}
+
 // The reject body must not be empty: Envoy's local-reply path treats an empty
 // body as a degenerate response, queuing it without ever flushing (the client
 // hangs until its own timeout).

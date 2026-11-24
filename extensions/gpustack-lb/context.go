@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -26,15 +27,15 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 //
 // Ordering on a fallback (redirect re-entry) pass, each stage narrowing the
 // next: exclude every ATTEMPTED cluster (the accumulated x-gpustack-lb-tried
-// header — excluding only the last one would let two failing main clusters
-// alternate until the redirect budget expires); then routeRules (a rule
-// narrowing to [A,F] must keep F eligible even when the main-tier survivor B
-// exists — the rule's verdict outranks the tier); then the tier split (main
-// tier while it has survivors in the narrowed set, the fallback tier only
-// when it does not). A normal pass runs the same chain minus the exclusion.
-// Only when the marker is present but no target header survived does the
-// legacy behaviour (publish nothing, let the fallback ingress own the pass)
-// apply.
+// header — excluding only the last one would let two failing first-tier
+// clusters alternate until the redirect budget expires); then routeRules (a
+// rule narrowing to [A,F] must keep F eligible even when the first-tier
+// survivor B exists — the rule's verdict outranks the tier); then the tier
+// split (the lowest tier present while it has survivors in the narrowed set,
+// the next tier only when it does not). A normal pass runs the same chain
+// minus the exclusion. Only when the marker is present but no target header
+// survived does the legacy behaviour (publish nothing, let the fallback
+// ingress own the pass) apply.
 func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	ctx.DontReadRequestBody()
 
@@ -89,18 +90,18 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	}
 
 	// The tier split runs AFTER the rule narrowing: a rule's verdict
-	// outranks the tier (a rule narrowing to [A, F] must keep the fallback
-	// F eligible even when a main-tier survivor exists outside the rule).
-	// A normal pass publishes the main tier only — the fallback tier takes
-	// no share of healthy traffic. On a fallback pass the main tier serves
-	// while it has survivors in the narrowed set; the fallback tier only
-	// when it does not. The tier split narrows ONLY the published set:
-	// config.candidates keeps the full (main+fallback) narrowed pool so
-	// the health-aware drain inside LoadStates can still reach the
-	// fallback tier when every main survivor turns out to be ejected.
+	// outranks the tier (a rule narrowing to [A, F] must keep the standby
+	// F eligible even when a first-tier survivor exists outside the rule).
+	// A normal pass publishes the lowest tier present only — higher tiers
+	// take no share of healthy traffic. On a re-selection pass the lowest
+	// tier serves while it has survivors in the narrowed set; the next
+	// tier only when it does not. The split narrows ONLY the published
+	// set: publishPool keeps the full narrowed pool (every tier) so the
+	// health-aware drain inside LoadStates can still reach a higher tier
+	// when every survivor of the lower one turns out to be ejected.
 	publishPool := config.candidates
-	if main := mainTier(config.candidates); len(main) > 0 {
-		config.candidates = main
+	if first := firstTier(config.candidates); len(first) > 0 {
+		config.candidates = first
 	}
 
 	// Degenerate guard: if every stage together emptied the set — all
@@ -120,13 +121,13 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 		if len(rescueCfg.routeRules) > 0 {
 			rescuePool = applyRouteRules(rescueCfg, clientModel)
 		}
-		if rescue := tieredFallback(rescuePool); len(rescue) > 0 {
+		if rescue := firstTier(rescuePool); len(rescue) > 0 {
 			proxywasm.LogDebugf("%s: all-tried dead end, rescuing %d rule-allowed candidate(s)", pluginName, len(rescue))
 			// config.candidates takes the tier-restricted pool (the
 			// published set), publishPool keeps the FULL rule pool —
 			// the same shape as the normal path, so the state load and
-			// the healthy-fallback drain can still reach a fallback
-			// candidate when the rescued main tier turns out ejected.
+			// the ordered drain can still reach a higher tier when the
+			// rescued first tier turns out ejected.
 			config.candidates = rescue
 			publishPool = rescuePool
 		}
@@ -374,76 +375,90 @@ func excludeClusters(cands []candidateSpec, clusters []string) []candidateSpec {
 	return out
 }
 
-// mainTier keeps only the non-fallback candidates. The inverse filter is
-// the fallback tier: those candidates join the published set only on a
-// re-selection pass whose main tier is exhausted.
-func mainTier(cands []candidateSpec) []candidateSpec {
+// tierOrder lists the distinct tiers present in a pool, ascending. Tiers
+// are ordinals, not indices: a pool holding only 0 and 5 drains 0 -> 5, and
+// the gaps carry no meaning. Derived from the pool rather than configured
+// so a tier whose candidates all disappeared (deleted targets, tried
+// clusters) simply stops being a step.
+//
+// Linear search rather than a set: a route's candidate pool is a handful of
+// targets, and this runs on every LB request -- a map allocation per call
+// costs more than the comparisons it saves.
+func tierOrder(cands []candidateSpec) []int64 {
+	var out []int64
+	for _, c := range cands {
+		found := false
+		for _, t := range out {
+			if t == c.Tier {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, c.Tier)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// firstTier keeps the candidates of the lowest tier present -- the only
+// tier a normal pass publishes. Higher tiers take no share of healthy
+// traffic; they join the set on a re-selection pass that has exhausted
+// every lower tier. An all-standby route (no tier-0 candidate) still
+// serves: its lowest present tier IS its first tier.
+func firstTier(cands []candidateSpec) []candidateSpec {
+	order := tierOrder(cands)
+	if len(order) == 0 {
+		return nil
+	}
+	return tierOnly(cands, order[0])
+}
+
+// tierOnly keeps the candidates of one tier, preserving order (the
+// weighted-interval / scoring code downstream relies on it).
+func tierOnly(cands []candidateSpec, tier int64) []candidateSpec {
 	out := make([]candidateSpec, 0, len(cands))
 	for _, c := range cands {
-		if !c.Fallback {
+		if c.Tier == tier {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// fallbackTierOnly returns the fallback-tier candidates of a narrowed set
-// that are not ejected — the health-aware drain target when the main tier
-// produced nothing publishable. nil when there is no healthy fallback
-// candidate. Pure over the loaded state, so it is unit-testable.
-func fallbackTierOnly(cands []candidateSpec, states map[string]clusterState) []candidateSpec {
-	var out []candidateSpec
-	now := nowMillis()
-	for _, c := range cands {
-		if !c.Fallback {
-			continue
-		}
-		if h := states[c.Key()].Health; now < h.EjectedUntil {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
-}
-
-// tieredFallback restores a tier split over an emptied pool: the main tier
-// of the full (post-rule) pool when it has any candidate, otherwise the
-// fallback tier. Used by the degenerate all-tried guard, which must
-// republish SOMETHING (an empty cluster_header set is a non-flushing 503)
-// without letting the escape hatch bypass the matched route rule or the
-// tier discipline.
-func tieredFallback(fullPool []candidateSpec) []candidateSpec {
-	if main := mainTier(fullPool); len(main) > 0 {
-		return main
-	}
-	return fullPool
-}
-
 // buildFailClosed is the strict preference order over the narrowed pool
-// with fail-open OFF: healthy main tier first, then the healthy fallback
-// tier. It bypasses buildCandidateSet's fail-open re-admission entirely
-// (that path hands back the very instances the health verdict condemned);
-// an empty result tells the caller the pool has nothing left and the
-// fail-open build is the last resort. Pure over the loaded state, so it
-// is unit-testable.
-var noFailOpen = false
-
+// with fail-open OFF: the healthy candidates of the lowest tier first,
+// then the next tier, and so on. It bypasses buildCandidateSet's fail-open
+// re-admission entirely (that path hands back the very instances the
+// health verdict condemned); an empty result tells the caller the pool
+// has nothing left and the fail-open build is the last resort. Pure over
+// the loaded state, so it is unit-testable.
 func buildFailClosed(config Config, publishPool []candidateSpec, nowMs int64, clientModel string, states map[string]clusterState) CandidateSet {
-	// The published set is the main tier when it has survivors in the
-	// narrowed pool (set by handleLBMode); the fallback tier of the FULL
-	// narrowed pool (publishPool, main + fallback) is the drain target --
-	// the main-tier config alone no longer contains it.
+	// publishPool is the FULL narrowed pool (every tier), not the published
+	// set: the drain has to reach the tiers the first-tier split left out.
+	//
+	// Each step hands the tier's candidates to buildCandidateSet UNFILTERED
+	// and lets it apply the health verdict with fail-open off. Pre-filtering
+	// by ejection here would drop provider candidates, which buildCandidateSet
+	// deliberately exempts from passive health (one DNS cluster, many
+	// endpoints): a first-tier provider carrying a shared or lingering
+	// ejection record would be skipped and a higher tier would take traffic
+	// it should not.
 	fc := config
+	noFailOpen := false
 	fc.failOpen = &noFailOpen
-	if set := buildCandidateSet(fc, nowMs, clientModel, states); len(set.Candidates) > 0 {
-		return set
+	for _, tier := range tierOrder(publishPool) {
+		tc := fc
+		tc.candidates = tierOnly(publishPool, tier)
+		if len(tc.candidates) == 0 {
+			continue
+		}
+		if set := buildCandidateSet(tc, nowMs, clientModel, states); len(set.Candidates) > 0 {
+			return set
+		}
 	}
-	fbc := fc
-	fbc.candidates = fallbackTierOnly(publishPool, states)
-	if fbc.candidates == nil {
-		return CandidateSet{}
-	}
-	return buildCandidateSet(fbc, nowMs, clientModel, states)
+	return CandidateSet{}
 }
 
 func publishCandidates(set CandidateSet) {

@@ -89,14 +89,36 @@ indistinguishable from one Envoy set itself, so there is nothing for the wasm
 filter to check. Deployments that do not use Higress's AI fallback at all can
 strip the header unconditionally instead.
 
-### Fallback tier
+### Ordered tiers
 
-Candidates may carry `fallback: true` (rendered by gpustack for targets
-that declare fallback status codes). The tier is **ordinal, not
-proportional**: fallback candidates take no share of normal traffic — a
-normal pass publishes the main tier only — and join the published set
-only on a re-selection pass whose surviving main tier is empty. The
-redirect trigger itself keeps its **legacy EnvoyFilter CR name**
+Candidates may carry `tier: <n>` — an **ordinal drain layer**, 0 served
+first. Tiers are **ordinal, not proportional**: a normal pass publishes
+the lowest tier present only, and a higher tier joins the published set
+on a re-selection pass that has exhausted every lower tier (its clusters
+are in the accumulated tried set, or all its survivors are ejected).
+Tiers need not be contiguous: a pool holding only 0 and 5 drains 0 → 5,
+and a tier whose candidates all disappeared is simply not a step.
+
+`fallback: true` is the two-tier spelling of the same fact (`tier: 1`),
+kept for controllers still rendering the main/standby split. Setting
+both `tier` and `fallback` on one candidate is a **config error**, not a
+precedence rule — `fallback: true, tier: 0` would read as "standby" to a
+human and "first-served" to the filter. The wire keeps publishing
+`fallback` (derived: true iff `tier > 0`) so capability plugins compiled
+against the two-tier contract keep reading the same fact.
+
+The narrowing order is **tried-exclusion → routeRules → tier split**: a
+rule's verdict outranks the tier, so a rule narrowing to `[A, F]` keeps
+the standby F eligible even when a first-tier survivor exists outside
+the rule. An all-standby route still serves — its lowest present tier
+*is* its first tier.
+
+Not to be confused with the `x-gpustack-tier` header in the routeRules
+example below: that is a **consumer class** injected by ext-auth, unrelated
+to this ordinal despite the shared word. routeRules answer "may this request
+go here"; `tier` answers "who first".
+
+The redirect trigger itself keeps its **legacy EnvoyFilter CR name**
 (gpustack updates the same CR in place, `lb_reselect=True`: no
 response-side marker, no fallback-path header), and the separate fallback
 ingress is reclaimed on LB routes.
@@ -167,6 +189,8 @@ matchRules:
 | `candidates[].targetId` | empty | Looks up the `modelMappers` group, **and is part of the candidate's scoring identity** — see below. Several candidates may share one cluster and differ only here |
 | `candidates[].kind` | `instance` | `provider` must be given explicitly; it cannot be inferred from "there is only one candidate" -- a single-instance self-hosted model also has only one |
 | `candidates[].maxRunningRequests` | 0 (unlimited) | The candidate's concurrency cap. Enforced as a **hard** cap by the finisher's atomic check-and-reserve (see below); published on the candidate so the finisher knows the budget. Rejected requests get `reject.capStatus` / `reject.capMessage` (default 429) |
+| `candidates[].tier` | 0 | The ordinal drain layer, 0 served first. Higher tiers take no share of normal traffic and only serve once every lower tier is exhausted — see [Ordered tiers](#ordered-tiers). Strict whole number ≥ 0; mutually exclusive with `fallback` |
+| `candidates[].fallback` | false | The two-tier spelling of `tier: 1`, kept for controllers rendering a main/standby split. Setting both it and `tier` is a config error |
 | `modelMappers` | none | Model name mappings grouped by `targetId`; keys within a group use model-mapper syntax (exact / `prefix*` / `*`) |
 | `health.failOpen` | `true` | When every candidate has been ejected, pass through rather than reject. With a misconfigured path or a fleet-wide engine restart, it is better to send the request and have it fail than to take the whole route out of service. **Can be set globally in `defaultConfig` and overridden by matchRules** |
 | `modelMapping` etc. | — | The existing model-mapper config for non-LB routes; upstream semantics are followed verbatim |
