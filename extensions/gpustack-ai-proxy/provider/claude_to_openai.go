@@ -292,6 +292,12 @@ func (c *ClaudeToOpenAIConverter) ConvertClaudeRequestToOpenAIWithOptions(body [
 	// this leaves more than one system message, and any system message that is not the
 	// first one makes strict OpenAI-compatible backends (such as vLLM) reject the request
 	// with "System message must be at the beginning.".
+	//
+	// Tool-result images go first: the pass below only merges user messages and
+	// never touches tool messages, so the two are order-independent in effect,
+	// but running the hoist first lets a demoted inline system reminder land in
+	// the same user turn as the images it sits between.
+	openaiRequest.Messages = hoistToolResultImages(openaiRequest.Messages)
 	openaiRequest.Messages = demoteInlineSystemMessages(openaiRequest.Messages)
 
 	// Convert tools if present
@@ -1344,24 +1350,8 @@ func (c *ClaudeToOpenAIConverter) convertContentArray(claudeContents []claudeCha
 			preserveClaudeContentBlocks = true
 			// data is an opaque Claude blob, not portable reasoning text.
 		case "image":
-			if claudeContent.Source != nil {
-				if claudeContent.Source.Type == "base64" {
-					// Convert base64 image to OpenAI format
-					dataUrl := fmt.Sprintf("data:%s;base64,%s", claudeContent.Source.MediaType, claudeContent.Source.Data)
-					result.openaiContents = append(result.openaiContents, chatMessageContent{
-						Type: contentTypeImageUrl,
-						ImageUrl: &chatMessageContentImageUrl{
-							Url: dataUrl,
-						},
-					})
-				} else if claudeContent.Source.Type == "url" {
-					result.openaiContents = append(result.openaiContents, chatMessageContent{
-						Type: contentTypeImageUrl,
-						ImageUrl: &chatMessageContentImageUrl{
-							Url: claudeContent.Source.Url,
-						},
-					})
-				}
+			if imageUrlContent, ok := claudeImageToOpenAIContent(claudeContent); ok {
+				result.openaiContents = append(result.openaiContents, imageUrlContent)
 			}
 		case "tool_use":
 			preserveClaudeContentBlocks = true
@@ -1398,6 +1388,138 @@ func (c *ClaudeToOpenAIConverter) convertContentArray(claudeContents []claudeCha
 		result.claudeContentBlocks = claudeContentBlocks
 	}
 
+	return result
+}
+
+// claudeImageToOpenAIContent converts a Claude image block (base64 or url source)
+// into an OpenAI image_url content part. The second return value is false when
+// the block carries no usable source.
+func claudeImageToOpenAIContent(claudeContent claudeChatMessageContent) (chatMessageContent, bool) {
+	if claudeContent.Source == nil {
+		return chatMessageContent{}, false
+	}
+	switch claudeContent.Source.Type {
+	case "base64":
+		return chatMessageContent{
+			Type: contentTypeImageUrl,
+			ImageUrl: &chatMessageContentImageUrl{
+				Url: fmt.Sprintf("data:%s;base64,%s", claudeContent.Source.MediaType, claudeContent.Source.Data),
+			},
+		}, true
+	case "url":
+		return chatMessageContent{
+			Type: contentTypeImageUrl,
+			ImageUrl: &chatMessageContentImageUrl{
+				Url: claudeContent.Source.Url,
+			},
+		}, true
+	}
+	return chatMessageContent{}, false
+}
+
+// toolResultImageContents returns the OpenAI image parts carried by the
+// tool_result block preserved on an OpenAI tool message, in their original order.
+// Anthropic allows image blocks inside tool_result content; the tool message's
+// own content is text-only, so these parts must travel somewhere else.
+func toolResultImageContents(message chatMessage) []chatMessageContent {
+	var contents []chatMessageContent
+	for _, toolResult := range message.ClaudeContentBlocks {
+		if toolResult.Type != "tool_result" || toolResult.Content == nil || toolResult.Content.IsString {
+			continue
+		}
+		for _, block := range toolResult.Content.ArrayValue {
+			if block.Type != "image" {
+				continue
+			}
+			if imageUrlContent, ok := claudeImageToOpenAIContent(block); ok {
+				contents = append(contents, imageUrlContent)
+			}
+		}
+	}
+	return contents
+}
+
+// hasToolResultImages reports whether the tool message carries at least one
+// convertible tool_result image. It is the allocation-free probe used on the
+// common path; toolResultImageContents does the extraction once a rewrite is
+// known to be needed.
+func hasToolResultImages(message chatMessage) bool {
+	for _, toolResult := range message.ClaudeContentBlocks {
+		if toolResult.Type != "tool_result" || toolResult.Content == nil || toolResult.Content.IsString {
+			continue
+		}
+		for _, block := range toolResult.Content.ArrayValue {
+			if block.Type == "image" {
+				if _, ok := claudeImageToOpenAIContent(block); ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hoistToolResultImages moves images embedded in Claude tool_result blocks into
+// the OpenAI request as image_url parts.
+//
+// A tool message's content is text-only in OpenAI Chat Completions (strict
+// backends reject an image_url array there), so the images cannot ride on the
+// tool message itself. They also must not be inserted between a tool-call
+// assistant message and its tool results, which has to stay contiguous. So the
+// images collected from one contiguous group of tool messages are emitted right
+// after that group as a user turn, each image preceded by a one-line label
+// naming the tool_use_id it came from, so the tool call/result association the
+// model sees is preserved. When a user message already follows the group (the
+// text accompanying the tool_result, or the caller's next turn) the images are
+// merged into it in front of its content instead, because several chat
+// templates reject adjacent user messages.
+//
+// Messages without tool_result images are returned as-is without allocation
+// (the probe never builds a slice). System messages between tool messages are
+// passed through untouched and do not end the tool group;
+// demoteInlineSystemMessages decides their fate afterwards.
+func hoistToolResultImages(messages []chatMessage) []chatMessage {
+	needsRewrite := false
+	for i := range messages {
+		if messages[i].Role == roleTool && hasToolResultImages(messages[i]) {
+			needsRewrite = true
+			break
+		}
+	}
+	if !needsRewrite {
+		return messages
+	}
+
+	result := make([]chatMessage, 0, len(messages)+1)
+	var pending []chatMessageContent
+	for _, msg := range messages {
+		switch msg.Role {
+		case roleTool:
+			if images := toolResultImageContents(msg); len(images) > 0 {
+				pending = append(pending, chatMessageContent{
+					Type: contentTypeText,
+					Text: fmt.Sprintf("Image returned by tool result %s:", msg.ToolCallId),
+				})
+				pending = append(pending, images...)
+			}
+		case roleSystem:
+			result = append(result, msg)
+			continue
+		default:
+			if len(pending) > 0 {
+				if msg.Role == roleUser {
+					msg.Content = mergeChatContents(pending, msg.Content)
+				} else {
+					result = append(result, chatMessage{Role: roleUser, Content: pending})
+				}
+				pending = nil
+			}
+		}
+		result = append(result, msg)
+	}
+	if len(pending) > 0 {
+		result = append(result, chatMessage{Role: roleUser, Content: pending})
+	}
 	return result
 }
 

@@ -1407,6 +1407,142 @@ func TestClaudeToOpenAIConverter_ConvertClaudeRequestToOpenAI(t *testing.T) {
 		assert.Equal(t, "toolu_calc", toolMsg2.ToolCallId)
 	})
 
+	t.Run("tool_result_image_is_forwarded_as_image_url", func(t *testing.T) {
+		// gpustack/gpustack-higress-plugin#65: an image block inside tool_result
+		// content used to survive only in claude_content_blocks, which is stripped
+		// before forwarding, so the model never saw the pixels.
+		const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+		claudeRequest := `{
+			"model": "qwen2.5-vl",
+			"messages": [{
+				"role": "assistant",
+				"content": [{
+					"type": "tool_use",
+					"id": "toolu_image",
+					"name": "read_file",
+					"input": {"path": "a.png"}
+				}]
+			}, {
+				"role": "user",
+				"content": [{
+					"type": "tool_result",
+					"tool_use_id": "toolu_image",
+					"content": [{
+						"type": "text",
+						"text": "Read a PNG"
+					}, {
+						"type": "image",
+						"source": {"type": "base64", "media_type": "image/png", "data": "` + png + `"}
+					}]
+				}]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		// assistant tool_call, tool result (text + id intact), then a user turn carrying the pixels
+		require.Len(t, openaiRequest.Messages, 3)
+		toolMsg := openaiRequest.Messages[1]
+		assert.Equal(t, "tool", toolMsg.Role)
+		assert.Equal(t, "Read a PNG", toolMsg.Content)
+		assert.Equal(t, "toolu_image", toolMsg.ToolCallId)
+
+		imageMsg := openaiRequest.Messages[2]
+		assert.Equal(t, "user", imageMsg.Role)
+		// After the JSON round trip the content is a generic array of maps.
+		assert.Equal(t, []any{
+			map[string]any{"type": contentTypeText, "text": "Image returned by tool result toolu_image:"},
+			map[string]any{"type": contentTypeImageUrl, "text": "", "image_url": map[string]any{"url": "data:image/png;base64," + png}},
+		}, imageMsg.Content)
+
+		// The images must survive the internal-field stripping done before forwarding.
+		forwarded := stripClaudeInternalMessageFields(result)
+		assert.NotContains(t, string(forwarded), "claude_content_blocks")
+		assert.Contains(t, string(forwarded), `"type":"image_url"`)
+		assert.Contains(t, string(forwarded), "data:image/png;base64,"+png)
+	})
+
+	t.Run("tool_result_images_merge_into_following_user_message", func(t *testing.T) {
+		claudeRequest := `{
+			"model": "qwen2.5-vl",
+			"messages": [{
+				"role": "assistant",
+				"content": [{
+					"type": "tool_use",
+					"id": "toolu_a",
+					"name": "screenshot",
+					"input": {}
+				}, {
+					"type": "tool_use",
+					"id": "toolu_b",
+					"name": "screenshot",
+					"input": {}
+				}]
+			}, {
+				"role": "user",
+				"content": [{
+					"type": "tool_result",
+					"tool_use_id": "toolu_a",
+					"content": [{
+						"type": "image",
+						"source": {"type": "url", "url": "https://example.com/a.png"}
+					}]
+				}, {
+					"type": "tool_result",
+					"tool_use_id": "toolu_b",
+					"content": "plain text"
+				}, {
+					"type": "tool_result",
+					"tool_use_id": "toolu_b2",
+					"content": [{
+						"type": "text",
+						"text": "shot b"
+					}, {
+						"type": "image",
+						"source": {"type": "url", "url": "https://example.com/b.png"}
+					}]
+				}, {
+					"type": "text",
+					"text": "What do these show?"
+				}]
+			}],
+			"max_tokens": 1000
+		}`
+
+		result, err := converter.ConvertClaudeRequestToOpenAI([]byte(claudeRequest))
+		require.NoError(t, err)
+
+		var openaiRequest chatCompletionRequest
+		err = json.Unmarshal(result, &openaiRequest)
+		require.NoError(t, err)
+
+		// No user turn may split the tool-call / tool-result group; the images
+		// land in the companion user text message that already follows it.
+		require.Len(t, openaiRequest.Messages, 5)
+		assert.Equal(t, "assistant", openaiRequest.Messages[0].Role)
+		for i := 1; i <= 3; i++ {
+			assert.Equal(t, "tool", openaiRequest.Messages[i].Role)
+		}
+		assert.Equal(t, "", openaiRequest.Messages[1].Content)
+		assert.Equal(t, "shot b", openaiRequest.Messages[3].Content)
+
+		imageMsg := openaiRequest.Messages[4]
+		assert.Equal(t, "user", imageMsg.Role)
+		assert.Equal(t, []any{
+			map[string]any{"type": contentTypeText, "text": "Image returned by tool result toolu_a:"},
+			map[string]any{"type": contentTypeImageUrl, "text": "", "image_url": map[string]any{"url": "https://example.com/a.png"}},
+			map[string]any{"type": contentTypeText, "text": "Image returned by tool result toolu_b2:"},
+			map[string]any{"type": contentTypeImageUrl, "text": "", "image_url": map[string]any{"url": "https://example.com/b.png"}},
+			map[string]any{"type": contentTypeText, "text": "What do these show?"},
+		}, imageMsg.Content)
+	})
+
 	t.Run("convert_mixed_text_and_tool_use", func(t *testing.T) {
 		// Test message with both text and tool_use
 		claudeRequest := `{
