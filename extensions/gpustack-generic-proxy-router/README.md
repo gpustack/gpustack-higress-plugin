@@ -72,7 +72,7 @@ filter-state contract so downstream plugins stop re-implementing matchers:
   which is safe for every consumer below, because this plugin pauses header
   iteration while buffering, so nothing downstream (810 and below) has run
   its header callback yet;
-- consumers reference tags, not raw headers: LB `routeRules` match on
+- consumers reference tags, not raw headers: LB `groups` match on
   `tags` for deterministic routing (#9/#10), `gpustack-token-usage`
   attributes usage by tag (#6738, gpustack issue "header-based usage
   attribution");
@@ -84,9 +84,9 @@ filter-state contract so downstream plugins stop re-implementing matchers:
 **Implemented**: the measurement half of this design ships today — on every
 body-driven path this plugin writes the final body length (post-rewrite)
 into the filter state under `gpustack_request_context.lengthBytes`, which
-`gpustack-lb`'s `routeRules` `contextLength` matching reads (with a
+`gpustack-lb`'s `groups` `contextLength` matching reads (with a
 `Content-Length` fallback on paths this plugin never buffered). Header
-matching in `routeRules` reads the live request headers at 340 and needs
+matching in `groups` reads the live request headers at 340 and needs
 nothing from this plugin; the tag map remains unbuilt until a value exists
 that equals no header (see `designs/request-tagging-and-route-rules.md`).
 

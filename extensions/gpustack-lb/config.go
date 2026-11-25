@@ -98,12 +98,12 @@ type Config struct {
 	// -- Specific to mode: context.
 	lbMode     bool
 	candidates []candidateSpec
-	// routeRules narrows the candidate pool per request (deterministic
+	// groups narrows the candidate pool per request (deterministic
 	// routing: header / model / body-length match -> a fixed subset of
 	// targets). Parsed and validated against candidates at config time;
-	// evaluated per request in applyRouteRules before the candidate set is
+	// evaluated per request in applyRouteGroups before the candidate set is
 	// built. Empty means the feature is off and behaviour is unchanged.
-	routeRules []routeRule
+	groups []routeGroup
 	// modelMappers holds model-name mappings grouped by targetId. The keys use
 	// model-mapper's existing syntax (exact / "prefix*" / "*"). The publisher
 	// resolves the model name the client sent into the rewrite target and
@@ -663,9 +663,21 @@ func parseLB(j gjson.Result, config *Config) error {
 	// the place that can actually say so.
 	var totalWeight int64
 	for _, c := range cands.Array() {
-		cluster := c.Get("cluster").String()
-		if cluster == "" {
-			return errors.New("candidates[].cluster must not be empty")
+		// cluster and targetId together are the candidate's identity (see the
+		// duplicate check below), and targetId is what a legacy `targets` entry
+		// names, so both are type-checked: gjson renders a non-string as its
+		// string form, and "true" is a legal-looking identity.
+		cl := c.Get("cluster")
+		if cl.Type != gjson.String || cl.String() == "" {
+			return fmt.Errorf("candidates[].cluster must be a non-empty string, got %s", cl.Raw)
+		}
+		cluster := cl.String()
+		var targetID string
+		if t := c.Get("targetId"); t.Exists() && t.Type != gjson.Null {
+			if t.Type != gjson.String {
+				return fmt.Errorf("candidates[].targetId must be a string, got %s (cluster %q)", t.Raw, cluster)
+			}
+			targetID = t.String()
 		}
 		// kind has to be given explicitly for a provider; it cannot be inferred
 		// from "there is only one candidate", because a single-instance
@@ -718,14 +730,45 @@ func parseLB(j gjson.Result, config *Config) error {
 			}
 			fallback = fb.Type == gjson.True
 		}
+		// groups is the candidate's membership: a group narrows to the
+		// candidates whose groups list the group's name. Strict array of
+		// non-empty, unique names -- a typo would otherwise read as "in no
+		// group", and the intended group would then silently drop this
+		// candidate with nothing in the config saying why.
+		var groups []string
+		if gs := c.Get("groups"); gs.Exists() && gs.Type != gjson.Null {
+			if !gs.IsArray() {
+				return fmt.Errorf("candidates[].groups must be an array (cluster %q)", cluster)
+			}
+			arr := gs.Array()
+			seenGroups := make(map[string]struct{}, len(arr))
+			for _, g := range arr {
+				// A group name is a routing identity, so a non-string is a
+				// config error rather than its string form: gjson renders
+				// `true` as "true", which would then match a rule named "true".
+				if g.Type != gjson.String {
+					return fmt.Errorf("candidates[].groups[] must be a string, got %s (cluster %q)", g.Raw, cluster)
+				}
+				name := g.String()
+				if name == "" {
+					return fmt.Errorf("candidates[].groups[] must not be empty (cluster %q)", cluster)
+				}
+				if _, dup := seenGroups[name]; dup {
+					return fmt.Errorf("candidates[].groups lists %q twice (cluster %q)", name, cluster)
+				}
+				seenGroups[name] = struct{}{}
+				groups = append(groups, name)
+			}
+		}
 		cand := candidateSpec{
 			Candidate: Candidate{
 				Cluster:  cluster,
-				TargetID: c.Get("targetId").String(),
+				TargetID: targetID,
 				Kind:     kind,
 				Fallback: fallback,
 			},
 			maxRunningRequests: maxRunning,
+			groups:             groups,
 			// ModelName is not set here: it is resolved per request from
 			// modelMappers against **the model name the client sent** (see
 			// resolveCandidateModel). Hard-coding a modelName on the candidate
@@ -766,6 +809,12 @@ func parseLB(j gjson.Result, config *Config) error {
 			cand.Weight = &v
 		}
 		config.candidates = append(config.candidates, cand)
+	}
+
+	// Needs the whole set: whether a service name is a safe short key depends
+	// on whether a DIFFERENT cluster also answers to it.
+	if err := checkServiceKeys(config.candidates); err != nil {
+		return err
 	}
 
 	// (cluster, targetId) is the candidate's identity everywhere downstream --
@@ -837,19 +886,52 @@ func parseLB(j gjson.Result, config *Config) error {
 		}
 	}
 
-	// routeRules narrows the pool per request. Parsed **after** candidates
-	// so each rule's targets can be validated against the targetIds that
-	// actually exist -- a rule pointing at a targetId that is not in this
+	// groups narrow the pool per request. Parsed **after** candidates
+	// so a legacy `targets` entry can be validated against the targetIds that
+	// actually exist -- a group pointing at a targetId that is not in this
 	// config is a config error, not a silent no-op.
 	ids := make(map[string]struct{}, len(config.candidates))
 	for _, c := range config.candidates {
 		ids[c.TargetID] = struct{}{}
 	}
-	rules, err := parseRouteRules(j.Get("routeRules"), ids)
+	// An unrecognised top-level key is otherwise ignored, and a config still
+	// using the old section name would silently publish the full pool --
+	// indistinguishable from "no group matched". Reject it by name instead.
+	if old := j.Get("routeRules"); old.Exists() && old.Type != gjson.Null {
+		return errors.New("routeRules is not a recognised key; the section is named groups")
+	}
+	groups, err := parseRouteGroups(j.Get("groups"), ids)
 	if err != nil {
 		return err
 	}
-	config.routeRules = rules
+	// A candidate may only name a group that selects by membership. Naming an
+	// absent group leaves the candidate unreachable by that name; naming a
+	// legacy `targets` group is just as dead, because that group ignores
+	// membership entirely. Either way nothing in the config would say why --
+	// the same reasoning that makes a `targets` entry naming an unknown
+	// targetId an error. The two cases get their own message so the fix is
+	// obvious: rename the reference, or drop `targets` from the group.
+	membership := make(map[string]struct{}, len(groups))
+	legacy := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		if len(g.targets) == 0 {
+			membership[g.name] = struct{}{}
+		} else {
+			legacy[g.name] = struct{}{}
+		}
+	}
+	for _, c := range config.candidates {
+		for _, name := range c.groups {
+			if _, ok := membership[name]; ok {
+				continue
+			}
+			if _, ok := legacy[name]; ok {
+				return fmt.Errorf("candidates[].groups references %q, but that group selects by legacy targets and ignores membership; remove its targets or the reference", name)
+			}
+			return fmt.Errorf("candidates[].groups references %q, which is not a group name in this config", name)
+		}
+	}
+	config.groups = groups
 
 	config.lbMode = true
 

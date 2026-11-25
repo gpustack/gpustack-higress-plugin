@@ -41,7 +41,7 @@ spec:
   # deserves one live check after the move).
   phase: AUTHN
   priority: 340
-  url: oci://<registry>/<org>/gpustack-lb:0.1.2
+  url: oci://<registry>/<org>/gpustack-lb:0.3.0
   defaultConfigDisable: false
   # mode belongs in defaultConfig: Higress applies defaultConfig to routes not
   # listed in matchRules as well, so it cannot be turned off by omission.
@@ -102,6 +102,12 @@ spec:
             kind: instance
             weight: 30            #   none at all -> capability plugins score,
                                   #   then round-robin
+            # groups: ["long-context"]
+            #   Optional membership, multi-valued. Each entry is the `name` of
+            #   a `groups` entry; that group narrows to the candidates listing
+            #   it. Absent means "in no group", which every group excludes.
+            #   Unlike targetId it survives an instance rebuild. A group that
+            #   still uses legacy `targets` cannot be named here.
         # Kept apart from candidates: adding a model alias should not touch
         # candidates, and adjusting a weight should not touch the mapping table.
         # Keys within a group use model-mapper syntax (exact / "prefix*" / "*").
@@ -117,30 +123,40 @@ spec:
         # health:
         #   failOpen: false
         #
-        # routeRules (optional): deterministic request->pool narrowing.
-        # First matching rule narrows `candidates` to its targets before the
-        # candidate set is built; health filtering, failOpen, the capability
-        # band and the finisher then all operate within the narrowed subset.
-        # No rule matching (or no routeRules at all) = the full pool,
-        # behaviour identical to before. Headers are read live at 340 -- the
-        # post-authn view (810 strip + 360 ext-auth injection already done).
+        # groups (optional): deterministic request->pool narrowing. A group is
+        # a named matcher; the first whose conditions hold narrows
+        # `candidates` before the candidate set is built, so health filtering,
+        # failOpen, the capability band and the finisher then all operate
+        # within the narrowed subset.
+        # No group matching (or no groups at all) = the full pool, behaviour
+        # identical to before. Headers are read live at 340 -- the post-authn
+        # view (810 strip + 360 ext-auth injection already done).
         # contextLength prefers the gpustack_request_context.lengthBytes
         # filter-state measurement (written by generic-proxy-router after a
         # body rewrite, which drops Content-Length) and falls back to the
-        # Content-Length header. A length rule with no measurement available
-        # does not match -- safe degradation, never a wrong pool.
-        # routeRules:
-        #   - name: vip-fixed
+        # Content-Length header. A length condition with no measurement
+        # available does not match -- safe degradation, never a wrong pool.
+        #
+        # A group's `name` IS its selector: it narrows to the candidates whose
+        # `groups` list that name. Required, and unique by last-wins -- a
+        # redefinition replaces the earlier one in place, so the list order
+        # (first match wins) is preserved and a warning is logged. `targets`
+        # is the legacy selector, REMOVED IN 0.4.0; it names targetIds, so it
+        # breaks when a target is rebuilt, and a group that still carries it
+        # cannot be named from candidates[].groups.
+        #
+        # Fallback candidates are never narrowed away: a group pins the main
+        # pool, and the route-level fallback stays reachable on failure.
+        #
+        # groups:
+        #   - name: vip
         #     match:
         #       headers:
-        #         - {name: x-gpustack-tier, exact: vip}    # ext-auth-injected
         #         - {name: x-api-key, prefix: "sk-vip-*"}
         #       model: "deepseek-r1*"                      # modelMappers syntax
-        #     targets: ["2"]
         #   - name: long-context
         #     match:
-        #       contextLength: {min: 65536}                # bytes, per-rule threshold
-        #     targets: ["3"]
+        #       contextLength: {min: 65536}                # bytes, per-group threshold
 ---
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
@@ -150,7 +166,7 @@ metadata:
 spec:
   phase: AUTHN
   priority: 325
-  url: oci://<registry>/<org>/gpustack-lb:0.1.2
+  url: oci://<registry>/<org>/gpustack-lb:0.3.0
   defaultConfigDisable: false
   # **No matchRules**: the config is entirely deployment-level, and "does this
   # route do LB" exists in exactly one place, the context role. With no
