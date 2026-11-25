@@ -27,9 +27,9 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 // Ordering on a fallback (redirect re-entry) pass, each stage narrowing the
 // next: exclude every ATTEMPTED cluster (the accumulated x-gpustack-lb-tried
 // header — excluding only the last one would let two failing main clusters
-// alternate until the redirect budget expires); then routeRules (a rule
+// alternate until the redirect budget expires); then groups (a group
 // narrowing to [A,F] must keep F eligible even when the main-tier survivor B
-// exists — the rule's verdict outranks the tier); then the tier split (main
+// exists — the group's verdict outranks the tier); then the tier split (main
 // tier while it has survivors in the narrowed set, the fallback tier only
 // when it does not). A normal pass runs the same chain minus the exclusion.
 // Only when the marker is present but no target header survived does the
@@ -77,15 +77,15 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// header exists before 340, otherwise the route would not match at all.)
 	clientModel, _ := proxywasm.GetHttpRequestHeader("x-higress-llm-model")
 
-	// routeRules narrow the pool first (deterministic routing): state is
+	// groups narrow the pool first (deterministic routing): state is
 	// then loaded only for the surviving candidates, and every later stage
 	// -- health filtering, failOpen, the capability band's scoring -- sees
 	// only the narrowed subset, so a matched request can never silently
-	// fall back to a candidate its rule excluded. applyRouteRules returns
-	// config.candidates itself when no rule matches, so an unmatched
+	// fall back to a candidate its group excluded. applyRouteGroups returns
+	// config.candidates itself when no group matches, so an unmatched
 	// request is literally the same code path as before this feature.
-	if len(config.routeRules) > 0 {
-		config.candidates = applyRouteRules(config, clientModel)
+	if len(config.groups) > 0 {
+		config.candidates = applyRouteGroups(config, clientModel)
 	}
 
 	// The tier split runs AFTER the rule narrowing: a rule's verdict
@@ -117,8 +117,8 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 		rescueCfg := config
 		rescueCfg.candidates = originalPool
 		rescuePool := originalPool
-		if len(rescueCfg.routeRules) > 0 {
-			rescuePool = applyRouteRules(rescueCfg, clientModel)
+		if len(rescueCfg.groups) > 0 {
+			rescuePool = applyRouteGroups(rescueCfg, clientModel)
 		}
 		if rescue := tieredFallback(rescuePool); len(rescue) > 0 {
 			proxywasm.LogDebugf("%s: all-tried dead end, rescuing %d rule-allowed candidate(s)", pluginName, len(rescue))
@@ -357,6 +357,17 @@ func triedClusters() []string {
 // excludeClusters removes every candidate of the given clusters — the
 // fallback re-selection primitive over the ATTEMPTED set. Pure function so
 // it is directly unit-testable; the host calls stay in handleLBMode.
+//
+// Two spellings of one identity reach this function, so both are accepted:
+// the accumulator records the service name (see triedKey), while the legacy
+// path — no accumulator header survived — passes the full cluster name from
+// x-higress-target-cluster. Matching only one would silently re-select the
+// cluster that just failed and never drain to fallback.
+//
+// Drift between this and recordTriedCluster does not fail loudly: nothing
+// would ever match, and every re-selection pass would see the full pool
+// again -- spending the redirect budget retrying the instance that just
+// failed. TestExclusionAcceptsBothSpellings pins the pairing.
 func excludeClusters(cands []candidateSpec, clusters []string) []candidateSpec {
 	if len(clusters) == 0 {
 		return cands
@@ -367,11 +378,25 @@ func excludeClusters(cands []candidateSpec, clusters []string) []candidateSpec {
 	}
 	out := make([]candidateSpec, 0, len(cands))
 	for _, c := range cands {
-		if _, bad := exclude[c.Cluster]; !bad {
-			out = append(out, c)
+		if _, bad := exclude[triedKey(c.Candidate)]; bad {
+			continue
 		}
+		if _, bad := exclude[c.Cluster]; bad {
+			continue
+		}
+		out = append(out, c)
 	}
 	return out
+}
+
+// triedKey is the identity a candidate contributes to the tried-clusters
+// accumulator: the service name alone, so the header stays short and survives
+// a port change. It is derived rather than stored -- the finisher reads the
+// published candidate, and there is nothing about the key that the cluster
+// name does not already determine (checkServiceKeys guarantees the service
+// name is unambiguous across the route).
+func triedKey(c Candidate) string {
+	return serviceKey(c.Cluster)
 }
 
 // mainTier keeps only the non-fallback candidates. The inverse filter is

@@ -177,7 +177,7 @@ func finalizeSelection(ctx wrapper.HttpContext, config Config, ordered []Candida
 	// breaks the cycle). An ordinary request header, same trust caveat as
 	// x-higress-fallback-from: strip it at the listener if clients must
 	// not influence the exclusion set.
-	recordTriedCluster(c.Cluster)
+	recordTriedCluster(triedKey(*c))
 
 	// The token identifies this request's in-flight entry; the store hands it
 	// back at onHttpStreamDone so exactly this entry is released. An empty

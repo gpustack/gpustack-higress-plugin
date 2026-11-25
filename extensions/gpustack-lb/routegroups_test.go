@@ -8,7 +8,7 @@ import (
 )
 
 // The parse is a pure function; the per-request evaluation is too (inputs
-// injected). Host calls (header reads, filter state) live in applyRouteRules
+// injected). Host calls (header reads, filter state) live in applyRouteGroups
 // and are out of unit-test scope -- the same split as buildCandidateSet.
 
 const threeTargets = `{
@@ -17,7 +17,7 @@ const threeTargets = `{
 		{"cluster": "b", "targetId": "t2"},
 		{"cluster": "c", "targetId": "t3"}
 	],
-	"routeRules": [
+	"groups": [
 		{
 			"name": "vip",
 			"match": {
@@ -37,44 +37,45 @@ const threeTargets = `{
 	]
 }`
 
-func TestParseRouteRules(t *testing.T) {
+func TestParseRouteGroups(t *testing.T) {
 	c := lbConfig(t, threeTargets)
-	if len(c.routeRules) != 2 {
-		t.Fatalf("parsed %d rules, want 2", len(c.routeRules))
+	if len(c.groups) != 2 {
+		t.Fatalf("parsed %d groups, want 2", len(c.groups))
 	}
-	r0 := c.routeRules[0]
+	r0 := c.groups[0]
 	if r0.name != "vip" || len(r0.headers) != 2 || r0.model != "deepseek-r1*" || len(r0.targets) != 1 || r0.targets[0] != "t1" {
-		t.Errorf("rule 0 parsed wrong: %+v", r0)
+		t.Errorf("group 0 parsed wrong: %+v", r0)
 	}
 	// The glob habit is tolerated: a trailing '*' is stripped.
 	if r0.headers[1].prefix != "sk-vip-" {
 		t.Errorf("prefix = %q, want %q (trailing * stripped)", r0.headers[1].prefix, "sk-vip-")
 	}
-	r1 := c.routeRules[1]
+	r1 := c.groups[1]
 	if r1.minLength == nil || *r1.minLength != 65536 || r1.maxLength != nil {
-		t.Errorf("rule 1 parsed wrong: %+v", r1)
+		t.Errorf("group 1 parsed wrong: %+v", r1)
 	}
 }
 
-func TestParseRouteRulesRejectsBadConfigs(t *testing.T) {
-	base := func(rules string) string {
-		return `{"candidates":[{"cluster":"a","targetId":"t1"}],"routeRules":` + rules + `}`
+func TestParseRouteGroupsRejectsBadConfigs(t *testing.T) {
+	base := func(raw string) string {
+		return `{"candidates":[{"cluster":"a","targetId":"t1"}],"groups":` + raw + `}`
 	}
 	cases := []struct {
-		name, rules, wantErr string
+		name, raw, wantErr string
 	}{
-		{"unknown target", `[{"match":{},"targets":["nope"]}]`, "not a candidate targetId"},
-		{"empty targets", `[{"match":{},"targets":[]}]`, "non-empty array"},
-		{"header without matcher", `[{"match":{"headers":[{"name":"x"}]},"targets":["t1"]}]`, "exactly one of exact / prefix"},
-		{"header both matchers", `[{"match":{"headers":[{"name":"x","exact":"a","prefix":"b"}]},"targets":["t1"]}]`, "exactly one of exact / prefix"},
-		{"min above max", `[{"match":{"contextLength":{"min":10,"max":5}},"targets":["t1"]}]`, "greater than max"},
+		{"unknown target", `[{"name":"r","match":{},"targets":["nope"]}]`, "not a candidate targetId"},
+		{"empty targets", `[{"name":"r","match":{},"targets":[]}]`, "non-empty array"},
+		{"header without matcher", `[{"name":"r","match":{"headers":[{"name":"x"}]},"targets":["t1"]}]`, "exactly one of exact / prefix"},
+		{"header both matchers", `[{"name":"r","match":{"headers":[{"name":"x","exact":"a","prefix":"b"}]},"targets":["t1"]}]`, "exactly one of exact / prefix"},
+		{"min above max", `[{"name":"r","match":{"contextLength":{"min":10,"max":5}},"targets":["t1"]}]`, "greater than max"},
 		{"not an array", `{"x":1}`, "must be an array"},
-		{"duplicate target", `[{"match":{},"targets":["t1","t1"]}]`, "twice"},
-		{"match not an object", `[{"match":[{"model":"m*"}],"targets":["t1"]}]`, "match must be an object"},
+		{"duplicate target", `[{"name":"r","match":{},"targets":["t1","t1"]}]`, "twice"},
+		{"non-string target", `[{"name":"r","match":{},"targets":[true]}]`, "must be a string"},
+		{"match not an object", `[{"name":"r","match":[{"model":"m*"}],"targets":["t1"]}]`, "match must be an object"},
 	}
 	for _, tc := range cases {
 		var c Config
-		err := parseConfig(gjson.Parse(base(tc.rules)), &c)
+		err := parseConfig(gjson.Parse(base(tc.raw)), &c)
 		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 			t.Errorf("%s: err = %v, want it to contain %q", tc.name, err, tc.wantErr)
 		}
@@ -83,61 +84,61 @@ func TestParseRouteRulesRejectsBadConfigs(t *testing.T) {
 
 func noHeaders(string) string { return "" }
 
-func TestEvaluateRouteRulesMatching(t *testing.T) {
-	rules := lbConfig(t, threeTargets).routeRules
+func TestEvaluateRouteGroupsMatching(t *testing.T) {
+	groups := lbConfig(t, threeTargets).groups
 
-	// Rule 0 needs both headers plus the model prefix.
+	// Group 0 needs both headers plus the model prefix.
 	hdrs := map[string]string{
 		"x-gpustack-tier": "vip",
 		"x-api-key":       "sk-vip-001",
 	}
 	getter := func(n string) string { return hdrs[n] }
-	if tg, ok := evaluateRouteRules(rules, "deepseek-r1-distill", getter, 0, false); !ok || tg[0] != "t1" {
-		t.Errorf("vip rule: targets=%v matched=%v, want [t1] true", tg, ok)
+	if r, ok := evaluateRouteGroups(groups, "deepseek-r1-distill", getter, 0, false); !ok || r.targets[0] != "t1" {
+		t.Errorf("vip group: targets=%v matched=%v, want [t1] true", r.targets, ok)
 	}
-	// Model does not match -> falls through to rule 1 only if long enough.
-	if _, ok := evaluateRouteRules(rules, "gpt-4o", getter, 100, true); ok {
-		t.Errorf("short gpt-4o request matched a rule; want no match (full pool)")
+	// Model does not match -> falls through to group 1 only if long enough.
+	if _, ok := evaluateRouteGroups(groups, "gpt-4o", getter, 100, true); ok {
+		t.Errorf("short gpt-4o request matched a group; want no match (full pool)")
 	}
-	if tg, ok := evaluateRouteRules(rules, "gpt-4o", getter, 100000, true); !ok || tg[0] != "t3" {
-		t.Errorf("long gpt-4o: targets=%v matched=%v, want [t3] true", tg, ok)
+	if r, ok := evaluateRouteGroups(groups, "gpt-4o", getter, 100000, true); !ok || r.targets[0] != "t3" {
+		t.Errorf("long gpt-4o: targets=%v matched=%v, want [t3] true", r.targets, ok)
 	}
-	// Missing headers: rule 0 fails, and without a length rule 1 does too.
-	if _, ok := evaluateRouteRules(rules, "deepseek-r1", noHeaders, 0, false); ok {
+	// Missing headers: group 0 fails, and without a length group 1 does too.
+	if _, ok := evaluateRouteGroups(groups, "deepseek-r1", noHeaders, 0, false); ok {
 		t.Errorf("no headers, no length: want no match")
 	}
 }
 
-func TestEvaluateRouteRulesLengthSemantics(t *testing.T) {
-	rules := lbConfig(t, threeTargets).routeRules
+func TestEvaluateRouteGroupsLengthSemantics(t *testing.T) {
+	groups := lbConfig(t, threeTargets).groups
 
-	// A length rule without a measurement never matches.
-	if _, ok := evaluateRouteRules(rules, "whatever", noHeaders, 0, false); ok {
-		t.Errorf("no measurement matched the min-length rule")
+	// A length condition without a measurement never matches.
+	if _, ok := evaluateRouteGroups(groups, "whatever", noHeaders, 0, false); ok {
+		t.Errorf("no measurement matched the min-length group")
 	}
 	// Exactly at min counts (>= semantics).
-	if tg, ok := evaluateRouteRules(rules, "whatever", noHeaders, 65536, true); !ok || tg[0] != "t3" {
-		t.Errorf("length == min did not match: %v %v", tg, ok)
+	if r, ok := evaluateRouteGroups(groups, "whatever", noHeaders, 65536, true); !ok || r.targets[0] != "t3" {
+		t.Errorf("length == min did not match: %v %v", r.targets, ok)
 	}
 	// Below min does not.
-	if _, ok := evaluateRouteRules(rules, "whatever", noHeaders, 65535, true); ok {
+	if _, ok := evaluateRouteGroups(groups, "whatever", noHeaders, 65535, true); ok {
 		t.Errorf("length = min-1 matched")
 	}
 }
 
-func TestEvaluateRouteRulesCatchAll(t *testing.T) {
+func TestEvaluateRouteGroupsCatchAll(t *testing.T) {
 	raw := `{"candidates":[{"cluster":"a","targetId":"t1"},{"cluster":"b","targetId":"t2"}],
-		"routeRules":[{"name":"fallback","match":{},"targets":["t2"]}]}`
-	rules := lbConfig(t, raw).routeRules
-	if tg, ok := evaluateRouteRules(rules, "", noHeaders, 0, false); !ok || tg[0] != "t2" {
-		t.Errorf("empty match should always hit: %v %v", tg, ok)
+		"groups":[{"name":"fallback","match":{},"targets":["t2"]}]}`
+	groups := lbConfig(t, raw).groups
+	if r, ok := evaluateRouteGroups(groups, "", noHeaders, 0, false); !ok || r.targets[0] != "t2" {
+		t.Errorf("empty match should always hit: %v %v", r.targets, ok)
 	}
 }
 
-func TestParseRouteRulesAbsentIsOff(t *testing.T) {
+func TestParseRouteGroupsAbsentIsOff(t *testing.T) {
 	c := lbConfig(t, twoCandidates)
-	if len(c.routeRules) != 0 {
-		t.Fatalf("no routeRules in config, got %d", len(c.routeRules))
+	if len(c.groups) != 0 {
+		t.Fatalf("no groups in config, got %d", len(c.groups))
 	}
 }
 

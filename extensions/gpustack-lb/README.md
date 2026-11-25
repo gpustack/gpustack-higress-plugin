@@ -101,6 +101,40 @@ redirect trigger itself keeps its **legacy EnvoyFilter CR name**
 response-side marker, no fallback-path header), and the separate fallback
 ingress is reclaimed on LB routes.
 
+**Fallback candidates are never narrowed away by a group.** A group narrows
+the *main* pool; fallback stays eligible so a group-pinned request can still
+reach the route-level fallback pool once its pinned targets fail. Narrowing
+them out instead makes the failure path unreachable: a group pinning one
+target turns every fallback into dead capacity and the request 503s after
+exhausting the redirect budget.
+
+### The tried-clusters header records the service name
+
+On every attempt the finisher appends the chosen candidate to
+`x-gpustack-lb-tried`, and a re-selection pass excludes every candidate whose
+key is in that list. The key is the **service name alone**
+(`mock-a.lbtest.svc.cluster.local`), not the full Envoy cluster name
+(`outbound|80||mock-a.lbtest.svc.cluster.local`): the full name is long
+enough to threaten Envoy's header size limit, and it embeds a port that an
+instance rebuild can change, which would strand the accumulator.
+
+Two consequences worth knowing:
+
+- **Candidates of one cluster share a key.** A provider DNS cluster with many
+  endpoints contributes one entry, and excluding it drops all of them — which
+  is what a failure on that cluster means.
+- **A service name used by two different clusters is a config error.** The
+  header records the service name alone, so it could not tell the two apart:
+  excluding one would silently drop the other's endpoints. gpustack cannot
+  produce that (a registry name encodes the instance identity and the port
+  comes from that same instance), so this only catches a hand-written config.
+
+The writer (`recordTriedCluster`) and the comparator (`excludeClusters`) use
+the same `triedKey` derivation. Drift between them does not fail loudly: the
+header would hold service names while candidates hold full cluster names,
+nothing would ever match, and every re-selection pass would see the full pool
+again — spending the redirect budget retrying the instance that just failed.
+
 ## Configuration
 
 The two roles share one schema and each reads only its own part. **Every knob
@@ -127,33 +161,45 @@ matchRules:
           # weight: 10           # the presence of the field is the mode
                                  # switch, see below
           # maxRunningRequests: 8
+          # groups: ["vip", "long-context"]
+          #   Optional membership, multi-valued. Each entry is the `name` of
+          #   a `groups` entry; that group narrows to the candidates listing
+          #   it. Absent means "in no group", which every group excludes.
+          #   A group that still uses legacy `targets` cannot be named here.
       modelMappers:
         "2":
           "gpt-*": "qwen3-0.6b"
-      # routeRules (optional): deterministic request->pool narrowing — the
-      # third section next to candidates / modelMappers. The first matching
-      # rule narrows `candidates` to its `targets` before the candidate set
-      # is built, so health filtering, failOpen, the capability band and the
-      # finisher all operate within the narrowed subset (a matched request
-      # can never silently fall back to a candidate its rule excluded).
-      # Headers are read live at 340 — the post-authn view. contextLength
-      # prefers the gpustack_request_context.lengthBytes filter-state
-      # measurement (written by generic-proxy-router; a body rewrite drops
-      # Content-Length) and falls back to the Content-Length header; with no
-      # measurement available a length rule does not match. See
+      # groups (optional): deterministic request->pool narrowing — the third
+      # section next to candidates / modelMappers. A group is a named matcher;
+      # the first whose conditions hold narrows `candidates` before the
+      # candidate set is built, so health filtering, failOpen, the capability
+      # band and the finisher all operate within the narrowed subset. Headers
+      # are read live at 340 — the post-authn view. contextLength prefers the
+      # gpustack_request_context.lengthBytes filter-state measurement (written
+      # by generic-proxy-router; a body rewrite drops Content-Length) and falls
+      # back to the Content-Length header; with no measurement available a
+      # length condition does not match. See
       # designs/request-tagging-and-route-rules.md for the full contract.
-      # routeRules:
-      #   - name: vip-fixed
+      #
+      # A group's `name` IS its selector: it narrows to the candidates whose
+      # `groups` list that name. Required, and unique by last-wins — a
+      # redefinition replaces the earlier one in place, so the list order
+      # (first match wins) is preserved and a warning is logged. `targets` is
+      # the legacy selector, kept for one minor version and REMOVED IN 0.4.0;
+      # it names targetIds, so it breaks on a target rebuild, and a group that
+      # still carries it cannot be named from candidates[].groups.
+      # No group matching (or no groups at all) = the full pool, behaviour
+      # identical to before the feature existed.
+      #
+      # groups:
+      #   - name: vip
       #     match:
       #       headers:
-      #         - {name: x-gpustack-tier, exact: vip}
       #         - {name: x-api-key, prefix: "sk-vip-*"}
       #       model: "deepseek-r1*"
-      #     targets: ["2"]
       #   - name: long-context
       #     match:
       #       contextLength: {min: 65536}
-      #     targets: ["3"]
       # health.failOpen is inherited from defaultConfig; only write it to turn
       # it off for this route alone:
       # health:
