@@ -9,6 +9,17 @@ import (
 	"github.com/higress-group/wasm-go/pkg/wrapper"
 )
 
+// rejectionHeader marks the plugin's own verdict -- "this request is final,
+// do not re-enter" -- so the route's redirect policy can leave it alone while
+// still re-selecting on every other 4xx/5xx, including the Envoy-synthesised
+// 503/504 of a dead endpoint (UC/UF) or an upstream timeout (UT). gpustack
+// renders the predicate that excludes responses carrying it
+// (HttpResponseHeaderMatchInput, exact value per reason). A status-class-only exclusion
+// (only_redirect_upstream_code) does not work here: with it set, a route
+// pinned to a dead port with a healthy fallback returned Envoy's bare 503 and
+// never redirected (measured).
+const rejectionHeader = "x-gpustack-lb-reject"
+
 // reject answers with an explanatory response of our own when the candidate
 // set is empty.
 //
@@ -41,7 +52,7 @@ func reject(ctx wrapper.HttpContext, config Config) types.Action {
 	if err := proxywasm.SendHttpResponseWithDetail(
 		uint32(config.rejectStatus),
 		pluginName+".no_candidate",
-		[][2]string{{"content-type", "application/json"}},
+		[][2]string{{"content-type", "application/json"}, {rejectionHeader, "no_candidate"}},
 		body,
 		-1,
 	); err != nil {
@@ -77,7 +88,7 @@ func rejectCap(ctx wrapper.HttpContext, config Config) types.Action {
 	if err := proxywasm.SendHttpResponseWithDetail(
 		uint32(config.capRejectStatus),
 		pluginName+".max_inflight",
-		[][2]string{{"content-type", "application/json"}},
+		[][2]string{{"content-type", "application/json"}, {rejectionHeader, "max_inflight"}},
 		config.capRejectBody,
 		-1,
 	); err != nil {

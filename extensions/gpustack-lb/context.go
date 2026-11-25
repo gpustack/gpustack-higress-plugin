@@ -38,12 +38,6 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	ctx.DontReadRequestBody()
 
-	// The untouched configured pool, PRE-exclusion: the degenerate guard's
-	// last resort re-runs the rule narrowing over it (the post-exclusion
-	// pool is empty precisely when everything allowed was tried, so it
-	// cannot serve as its own rescue source).
-	originalPool := config.candidates
-
 	if v, err := proxywasm.GetHttpRequestHeader(fallbackFromHeader); err == nil && v != "" {
 		if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr != nil || prev == "" {
 			// No LB-written target header: either a legacy fallback deployment
@@ -101,35 +95,6 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	publishPool := config.candidates
 	if main := mainTier(config.candidates); len(main) > 0 {
 		config.candidates = main
-	}
-
-	// Degenerate guard: if every stage together emptied the set — all
-	// rule-allowed candidates sit on tried clusters — writing nothing
-	// under cluster_header is the 503 that does not flush. Re-run the
-	// rule narrowing over the ORIGINAL pool (not the post-exclusion
-	// rulePool, which is empty in exactly this situation) and restore
-	// its tier split into BOTH the published set and the state-loading
-	// pool (restoring only config.candidates would leave publishPool
-	// empty and the rescued candidates stateless). The redirect budget
-	// bounds the loop and health marking meanwhile drives the dead
-	// instances out.
-	if len(config.candidates) == 0 && len(originalPool) > 0 {
-		rescueCfg := config
-		rescueCfg.candidates = originalPool
-		rescuePool := originalPool
-		if len(rescueCfg.groups) > 0 {
-			rescuePool = applyRouteGroups(rescueCfg, clientModel)
-		}
-		if rescue := tieredFallback(rescuePool); len(rescue) > 0 {
-			proxywasm.LogDebugf("%s: all-tried dead end, rescuing %d rule-allowed candidate(s)", pluginName, len(rescue))
-			// config.candidates takes the tier-restricted pool (the
-			// published set), publishPool keeps the FULL rule pool —
-			// the same shape as the normal path, so the state load and
-			// the healthy-fallback drain can still reach a fallback
-			// candidate when the rescued main tier turns out ejected.
-			config.candidates = rescue
-			publishPool = rescuePool
-		}
 	}
 
 	// **Do not call ctx.DisableReroute()**: it stops the route from being
@@ -429,19 +394,6 @@ func fallbackTierOnly(cands []candidateSpec, states map[string]clusterState) []c
 		out = append(out, c)
 	}
 	return out
-}
-
-// tieredFallback restores a tier split over an emptied pool: the main tier
-// of the full (post-rule) pool when it has any candidate, otherwise the
-// fallback tier. Used by the degenerate all-tried guard, which must
-// republish SOMETHING (an empty cluster_header set is a non-flushing 503)
-// without letting the escape hatch bypass the matched route rule or the
-// tier discipline.
-func tieredFallback(fullPool []candidateSpec) []candidateSpec {
-	if main := mainTier(fullPool); len(main) > 0 {
-		return main
-	}
-	return fullPool
 }
 
 // buildFailClosed is the strict preference order over the narrowed pool

@@ -89,6 +89,22 @@ indistinguishable from one Envoy set itself, so there is nothing for the wasm
 filter to check. Deployments that do not use Higress's AI fallback at all can
 strip the header unconditionally instead.
 
+### The redirect policy must leave the rejection alone -- by header
+
+The per-route redirect policy (Higress `custom_response` / `RedirectPolicy`,
+the one gpustack renders next to `cluster_header`) must not re-enter the route
+on the plugin's own rejection. The plugin marks that response with
+`x-gpustack-lb-reject`; gpustack renders the predicate "any 4xx/5xx AND NOT
+that header carrying one of its verdict values (`no_candidate`,
+`max_inflight`)". Every other 4xx/5xx still re-selects, including the
+Envoy-synthesised 503/504 of a dead endpoint or an upstream timeout.
+
+Do **not** use `only_redirect_upstream_code: true` for this: it also stops
+failover on connection failures and timeouts, because those are local replies
+too. Measured on a route pinned to a dead port with a healthy fallback tier:
+the client got Envoy's bare 503 and the fallback was never tried. See "The
+rejection path" below for the numbers.
+
 ### Fallback tier
 
 Candidates may carry `fallback: true` (rendered by gpustack for targets
@@ -676,6 +692,26 @@ Three hard requirements (learned the hard way in `gpustack-rate-limit`):
    (the body gets dropped) and not `HeaderStopAllIterationAndWatermark` (it gets
    stuck under watermark waiting for a resume that never comes)
 3. The body must be non-empty and valid JSON
+
+A fourth requirement lives outside this plugin: the per-route redirect policy
+must leave the rejection alone. The rejection is a local reply; a policy that
+redirects by status class alone treats it as one more failure to retry, and the
+dead end burns the entire redirect budget. The plugin therefore sets
+`x-gpustack-lb-reject` on both rejections (`no_candidate`, `max_inflight`) and
+gpustack's predicate excludes responses carrying it. Measured on a group
+pinned to one failing target with no fallback tier:
+
+| redirect policy | passes | upstream attempts | client sees |
+|---|---|---|---|
+| status class only | 11 | 33 | last upstream 503 body, ~0.5s |
+| `only_redirect_upstream_code: true` | 2 | 3 | the rejection JSON, ~0.05s -- **but a dead endpoint or timeout no longer fails over either** |
+| header exclusion | 2 | 3 | the rejection JSON, ~0.05s, `details=via_wasm::…::gpustack-lb.no_candidate`; dead endpoint / timeout still re-select |
+
+The middle row is why the exclusion is by header: connection failures (UC/UF)
+and timeouts (UT) are Envoy-synthesised local replies as well, and those are
+exactly the cases re-selection exists for. Without any exclusion the rejection
+still ends the request once the budget is spent, so deployments that cannot
+render the predicate should keep `max_internal_redirects` low.
 
 ## Hard constraints
 
