@@ -37,12 +37,25 @@ const (
 	// by generic-proxy-router upstream in the chain; see wire.go.
 	FilterStateRequestContext = wire.FilterStateRequestContext
 
+	// FilterStateVideoPin: the deterministic instance pin written by
+	// generic-proxy-router for job follow-ups; see wire.go.
+	FilterStateVideoPin = wire.FilterStateVideoPin
+
 	KindInstance = wire.KindInstance
 	KindProvider = wire.KindProvider
 )
 
 // RequestContext is the value stored under FilterStateRequestContext.
 type RequestContext = wire.RequestContext
+
+// VideoPin is the value stored under FilterStateVideoPin.
+type VideoPin = wire.VideoPin
+
+// Pin modes, aliased for the same reason as the types above.
+const (
+	PinModeJob    = wire.PinModeJob
+	PinModeSelect = wire.PinModeSelect
+)
 
 // SharedInflightPrefix / SharedHealthPrefix + <full cluster name>.
 //

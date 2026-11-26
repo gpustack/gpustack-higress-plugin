@@ -482,6 +482,13 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, pluginConfig config.PluginCo
 	}
 	util.ReplaceResponseHeaders(headers)
 
+	// Completed video content is an opaque byte stream, never JSON or SSE:
+	// it is forwarded as is, and is not buffered.
+	if apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName); apiName == provider.ApiNameRetrieveVideoContent {
+		ctx.DontReadResponseBody()
+		return types.ActionContinue
+	}
+
 	_, needHandleBody := activeProvider.(provider.TransformResponseBodyHandler)
 	var needHandleStreamingBody bool
 	_, needHandleStreamingBody = activeProvider.(provider.StreamingResponseBodyHandler)

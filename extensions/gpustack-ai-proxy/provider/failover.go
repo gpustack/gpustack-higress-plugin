@@ -701,6 +701,13 @@ func (c *ProviderConfig) resetSharedData() {
 }
 
 func (c *ProviderConfig) OnRequestFailed(activeProvider Provider, ctx wrapper.HttpContext, apiTokenInUse string, apiTokens []string, status string) types.Action {
+	// An async video job may have been accepted even when its response was
+	// lost. Failing over to another apiToken or retrying the request could
+	// submit a second job, so neither is attempted for video operations;
+	// follow-ups address the job by ID on the instance that owns it.
+	if isVideoOperation(ctx) {
+		return types.ActionContinue
+	}
 	if c.isFailoverEnabled() && util.MatchStatus(status, c.failover.failoverOnStatus) {
 		log.Warnf("apiToken:%s need failover, error status:%s", apiTokenInUse, status)
 		c.handleUnavailableApiToken(ctx, apiTokenInUse)
@@ -715,6 +722,35 @@ func (c *ProviderConfig) OnRequestFailed(activeProvider Provider, ctx wrapper.Ht
 		return types.HeaderStopAllIterationAndWatermark
 	}
 	return types.ActionContinue
+}
+
+// isVideoOperation reports whether the request that just failed was an
+// async video operation, by its API name. A `protocol: original` provider
+// answers GetApiName with "" for paths it does not rename, which replaces
+// the shared classification -- so an unclassified API is classified again
+// from the preserved request path. Otherwise a video create on such a
+// provider would slip past the no-replay guard here, while the router's
+// own guard is the only thing left between a lost response and a second
+// job.
+func isVideoOperation(ctx wrapper.HttpContext) bool {
+	if apiName, _ := ctx.GetContext(CtxKeyApiName).(ApiName); apiName != "" {
+		return isVideoApi(apiName)
+	}
+	// The preserved request path keeps its query string; the classifier
+	// matches the path alone.
+	path := ctx.GetStringContext(CtxRequestPath, "")
+	if i := strings.IndexByte(path, '?'); i != -1 {
+		path = path[:i]
+	}
+	return isVideoApi(ClassifyPath(path))
+}
+
+func isVideoApi(apiName ApiName) bool {
+	switch apiName {
+	case ApiNameVideos, ApiNameVideoRemix, ApiNameRetrieveVideo, ApiNameRetrieveVideoContent:
+		return true
+	}
+	return false
 }
 
 func isNotStreamingResponse(ctx wrapper.HttpContext) bool {

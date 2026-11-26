@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gpustack/gpustack-higress-plugins/extensions/gpustack-lb/wire"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/tidwall/gjson"
 )
@@ -95,6 +96,12 @@ type Config struct {
 	capRejectMessage string
 	capRejectBody    []byte
 
+	// -- Pins (see pin.go). targetRules map a pin's target to the cluster
+	// service names that realise it, and a service name back to a target;
+	// they must be configured alike in gpustack-generic-proxy-router
+	// (wire.TargetPatternsKey). Empty config means wire.DefaultTargetPatterns.
+	targetRules wire.TargetRules
+
 	// -- Specific to mode: context.
 	lbMode     bool
 	candidates []candidateSpec
@@ -161,6 +168,20 @@ type Config struct {
 // to today's empty model-mapper config, whereas defaulting to finisher would
 // put a plugin on every route trying to write a cluster header and do
 // book-keeping.
+// parseTargetRules reads targetPatterns: an array of {target, cluster}
+// rules (see wire.TargetRule). Unset, the defaults apply.
+func parseTargetRules(j gjson.Result) (wire.TargetRules, error) {
+	rules := j.Get(wire.TargetPatternsKey)
+	if rules.Exists() && !rules.IsArray() {
+		return nil, fmt.Errorf("%s must be an array of {target, cluster} rules", wire.TargetPatternsKey)
+	}
+	var parsed []wire.TargetRule
+	for _, r := range rules.Array() {
+		parsed = append(parsed, wire.TargetRule{Target: r.Get("target").String(), Cluster: r.Get("cluster").String()})
+	}
+	return wire.CompileTargetRules(parsed)
+}
+
 func normalizeMode(raw string) (mode string, known bool) {
 	switch raw {
 	case modeFinisher:
@@ -232,6 +253,14 @@ func parseConfig(j gjson.Result, config *Config) error {
 	config.maxInflightAgeMs = j.Get("maxInflightAgeMs").Int()
 	if config.maxInflightAgeMs <= 0 {
 		config.maxInflightAgeMs = defaultMaxInflightAgeMs
+	}
+
+	// Parsed outside parseLB for the same reason as failOpen, and at every
+	// config location: a pin is joined on the route that carries the finisher,
+	// while the rules are deployment-wide.
+	config.targetRules, err = parseTargetRules(j)
+	if err != nil {
+		return err
 	}
 
 	store, err := buildStateStore(j)
@@ -447,6 +476,15 @@ func parseOverrideConfig(j gjson.Result, global Config, config *Config) error {
 		}
 	}
 	inheritInt64(j, "maxInflightAgeMs", &config.maxInflightAgeMs, global.maxInflightAgeMs)
+
+	// -- Target rules (see pin.go). Deployment-level as well: a finisher
+	// matchRule that says nothing inherits the global list, so custom
+	// targetPatterns put in defaultConfig reach every route -- otherwise
+	// the IDs the router wrapped with them are all pin misses on exactly
+	// the routes that carry a rule. A rule that sets the key overrides.
+	if !j.Get(wire.TargetPatternsKey).Exists() && len(global.targetRules) > 0 {
+		config.targetRules = global.targetRules
+	}
 
 	// -- The state backend. Deployment-level, so a rule that says nothing
 	// inherits the global one **including its already-initialised redis

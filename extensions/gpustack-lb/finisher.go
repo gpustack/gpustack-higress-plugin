@@ -67,6 +67,30 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		return types.ActionContinue
 	}
 
+	// A pin names its own target and is answered before any selection --
+	// and before the empty-set rejection: when health filtering or a group
+	// removed every candidate, a pinned request must still get the promised
+	// 404 with `pin_miss`, not the generic no-candidate 503.
+	//
+	// A job follow-up (PinModeJob) stops here: see pinCandidate for why it
+	// must not go through the reserve walk. A client-selected request
+	// (PinModeSelect) only fixes the candidate list to the one named
+	// instance and then takes the ordinary reserve path below, so the
+	// instance's maxRunningRequests still applies to it.
+	var ordered []Candidate
+	if pin, ok := readVideoPin(); ok {
+		if pin.Mode != PinModeSelect {
+			return pinCandidate(ctx, set, pin, config.targetRules)
+		}
+		c := pinnedCandidate(set, pin, config.targetRules)
+		if c == nil {
+			proxywasm.LogInfof("%s: pin miss: %s is not a candidate of this route", pluginName, pin.Target)
+			_ = proxywasm.RemoveHttpRequestHeader(targetClusterHeader)
+			return rejectPinMiss(ctx)
+		}
+		ordered = []Candidate{*c}
+	}
+
 	// The candidate set is empty. **We must answer ourselves**: on this route
 	// Envoy's own 503 for a missing cluster measurably fails to flush to the
 	// client, and the request hangs until the client times out. Removing the
@@ -77,11 +101,13 @@ func finisherOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		return reject(ctx, config)
 	}
 
-	// The reserve walk order: the winner of the usual selection first, then
-	// the rest -- so "the best candidate is momentarily full" degrades to the
-	// second-best rather than to a rejection.
-	pick, totals := selectCandidate(set)
-	ordered := reserveOrder(set, pick, totals)
+	if ordered == nil {
+		// The reserve walk order: the winner of the usual selection first,
+		// then the rest -- so "the best candidate is momentarily full"
+		// degrades to the second-best rather than to a rejection.
+		pick, totals := selectCandidate(set)
+		ordered = reserveOrder(set, pick, totals)
+	}
 	targets := make([]reserveTarget, 0, len(ordered))
 	for i := range ordered {
 		targets = append(targets, reserveTarget{

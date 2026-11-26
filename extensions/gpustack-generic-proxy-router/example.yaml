@@ -35,14 +35,38 @@ spec:
     #   - Write the target into `targetHeader` and into the body's `modelKey`.
     # If the URL doesn't match `prefix` (or {id} isn't mapped), the plugin
     # falls through to body-driven mode below.
+    #
+    #    /model/proxy/qwen-alias/v1/chat/completions        → qwen2.5-7b-instruct
+    #
+    # Naming the instance (needs an LB route): with aliasRegex, {id} may be
+    # "{route-id}-{target}". The regex is matched whole against the {id}
+    # segment; its `route` group is looked up in aliasNameMapping like any
+    # alias, its optional `target` group is the instance or provider the
+    # client names within that route. The path outranks the body's `model`.
+    # The instance is honoured but the request still goes through
+    # gpustack-lb's in-flight reserve; a target that is not a candidate of
+    # the route is 404 with `x-gpustack-lb-reject: pin_miss`.
+    #
+    # The route group is lazy on purpose: a suffix that is not a target
+    # shape is absorbed, so `qwen-alias` stays one alias.
+    #
+    #    /model/proxy/2-7/v1/chat/completions              → route 2, instance 7
+    #    /model/proxy/2-provider-5/v1/chat/completions     → route 2, provider 5
+    #    /model/proxy/2-7/v1/videos                        → create on instance 7
+    #    /model/proxy/qwen-alias-7/v1/chat/completions     → alias qwen-alias, instance 7
+    #
+    # Without aliasRegex {id} is a plain alias, as it always was.
     # --------------------------------------------------------------
     prefix: "/model/proxy/"
+    # aliasRegex: '^(?P<route>[^/]+?)(?:-(?P<target>[0-9]+|provider-[0-9]+))?$'
     targetHeader: "x-higress-llm-model"
     modelKey: "model"
     aliasNameMapping:
       qwen-alias: "qwen2.5-7b-instruct"
       llama-alias: "llama-3.1-8b-instruct"
       gpt4-alias: "gpt-4o"
+      # route ids, for the {route-id}-{target} spelling above
+      "2": "qwen2.5-7b-instruct"
       # Values can also be "<provider>/<model>" — split happens iff
       # `addProviderHeader` is configured.
       # openai-gpt4: "openai/gpt-4"
@@ -87,6 +111,65 @@ spec:
     #       model: "qwen2.5-coder-7b"
     #     - pattern: "(?i)\\b(image|photo)\\b"
     #       model: "qwen-vl"
+
+    # --------------------------------------------------------------
+    # Self-routing video job IDs. Deployment-level like aliasNameMapping:
+    # nothing here is per-route, so it belongs in defaultConfig and not in
+    # matchRules. Which routes take part is decided by aliasNameMapping
+    # (keyed by route id) and by the route name check below.
+    #
+    #   gpustack_<route-id>-<instance-id>_<native-id>      gpustack_2-7_video_abc
+    #   gpustack_<route-id>-provider-<id>_<native-id>      gpustack_2-provider-5_video_abc
+    #
+    # targetPatterns pair a target with the cluster service names that
+    # realise it. Each rule is two regexes whose capture groups correspond
+    # by position: what is outside a group is a regex (any model), what is
+    # inside a group is the mapped value.
+    #
+    #   target "2"          ->  the candidate  model-<model>-2
+    #   service model-42-2  ->  the target "2", written into the wrapped ID
+    #
+    # Unset, they are the two GPUStack rules below. They MUST be the same
+    # list on gpustack-lb, which reads every candidate through the same
+    # rule to compare it with a pin; a custom list replaces the defaults.
+    # `target` must be literals and capture groups only (nothing else can
+    # be rebuilt from a service name), the group counts must be equal, a
+    # target must not contain `_` (the ID's divider), and the `target`
+    # regexes must not overlap: a target is claimed by the first rule that
+    # matches it.
+    #
+    # targetPatterns:
+    #   - target: '^(\d+)$'
+    #     cluster: 'model-\d+-(\d+)'
+    #   - target: '^provider-(\d+)$'
+    #     cluster: 'provider-(\d+)'
+    #
+    # The same two-part spelling is accepted as a path-driven alias, with
+    # which a client names the instance for an ordinary request:
+    #   /model/proxy/2-7/v1/chat/completions   -> route 2, instance 7
+    # It is honoured but still goes through gpustack-lb's in-flight reserve.
+    #
+    # The route id names the model through aliasNameMapping above -- the same
+    # key as /model/proxy/{id} -- and the literal `provider-` tells a provider
+    # target from an instance one. With both fields absent the video branch
+    # never runs; a partial set is a config error.
+    #
+    # videoRegexes      GET/DELETE paths; named groups `target` and `origin`
+    #                   (`[^/]+`, never `.+`). `path` is the upstream path.
+    # videoIdRewriteOnRouteNamePrefix  the create/status/delete response `id` is
+    #                   wrapped only when Envoy's route_name starts with one of
+    #                   these; the digits after it are the route id.
+    #
+    # POST /v1/videos needs no regex: it is body-driven, so `/videos` and
+    # `/videos/sync` must be in enableOnPathSuffix; it is never replayed.
+    # --------------------------------------------------------------
+    # videoRegexes:
+    #   - regex: '^/v1/videos/gpustack_(?P<target>[^_]+)_(?P<origin>[^/]+)$'
+    #     path: "/v1/videos/{origin}"
+    #   - regex: '^/v1/videos/gpustack_(?P<target>[^_]+)_(?P<origin>[^/]+)/content$'
+    #     path: "/v1/videos/{origin}/content"
+    # videoIdRewriteOnRouteNamePrefix:
+    #   - "ai-route-route-"
 
   # You can also override per ingress / route, e.g. enable only on a specific AI route:
   # matchRules:
