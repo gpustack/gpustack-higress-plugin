@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -34,8 +35,8 @@ const (
 	// body rewrite for the path-driven case is intentionally delegated to
 	// gpustack-model-mapper (single-responsibility, mirrors higress's
 	// router/mapper split).
-	ctxKeyBodyDriven  = "gpustack_grp_body_driven"
-	ctxKeyContentType = "gpustack_grp_content_type"
+	ctxKeyBodyDriven   = "gpustack_grp_body_driven"
+	ctxKeyContentType  = "gpustack_grp_content_type"
 	ctxKeyFallbackPass = "gpustack_grp_fallback_pass"
 )
 
@@ -66,6 +67,21 @@ type PluginConfig struct {
 	// keeps one copy in its buffer, the wasm linear memory keeps another
 	// when we read it out — so peak ≈ 2× maxBodyBytes per request).
 	maxBodyBytes uint32
+
+	// Self-routing video job IDs (see video.go). Rendered by gpustack only
+	// on video model routes, together with aliasNameMapping (route id ->
+	// model name), which the video branch shares with path-driven mode.
+	// Both empty = the video branch never runs.
+	videoRegexes           []VideoRegex
+	videoRouteNamePrefixes []string
+
+	// -- Naming the instance (see resolveAlias). aliasPattern is the compiled
+	// aliasRegex, matched whole against the {id} segment of a path-driven
+	// request; nil means {id} is a plain alias, exactly as before the option
+	// existed. targetPatterns maps a candidate's service name to the target a
+	// pin names, shared with gpustack-lb (wire.TargetPatternsKey).
+	aliasPattern *regexp.Regexp
+	targetRules  wire.TargetRules
 }
 
 func main() {}
@@ -87,12 +103,27 @@ func init() {
 		// return value only at end-of-stream, which is the contract
 		// model-router (the plugin we replace) was designed for.
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		// Response side is video-only: the body callback buffers nothing
+		// unless the header callback armed a video ID rewrite (see
+		// onHttpResponseHeaders in video.go).
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
+		wrapper.ProcessResponseBody(onHttpResponseBody),
 		wrapper.WithRebuildAfterRequests[PluginConfig](1000),
 		wrapper.WithRebuildMaxMemBytes[PluginConfig](200*1024*1024),
 	)
 }
 
 func parseConfig(json gjson.Result, config *PluginConfig) error {
+	// **Reset the destination first.** rule_matcher re-runs the parse on the
+	// *same* &rule.config when the first attempt fails, with a backup JSON.
+	// Whatever the failed attempt wrote would survive into the retry -- the
+	// slice fields would be appended to twice, and aliasRegex /
+	// targetPatterns / videoRegexes of the rejected config would stay in
+	// force for a backup that omits them. Zeroing the whole struct rather
+	// than resetting fields one by one is deliberate: a per-field list is
+	// only correct until the next field is added.
+	*config = PluginConfig{}
+
 	config.prefix = json.Get("prefix").String()
 	if config.prefix == "" {
 		config.prefix = defaultPrefix
@@ -196,7 +227,77 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	// requires a live wasm host (panics from `go test`). The same config
 	// shape is emitted at the head of every onHttpRequestHeaders so the
 	// first request gives the same visibility without breaking tests.
-	return nil
+	if err := parseVideoConfig(json, config); err != nil {
+		return err
+	}
+	return parseTargetConfig(json, config)
+}
+
+// parseTargetConfig reads aliasRegex and targetPatterns.
+//
+// aliasRegex is matched whole against the {id} segment of a path-driven
+// URL. It must name a `route` group, which is looked up in aliasNameMapping
+// exactly as a plain alias is; an optional `target` group is the instance or
+// provider the client names within that route. Absent, {id} is the alias --
+// the behaviour before the option existed. The recommended shape keeps
+// named aliases working: a lazy route group, so that `qwen-alias` is one
+// alias while `2-7` is route 2, instance 7.
+//
+// targetPatterns must be the same list gpustack-lb carries. Each rule is a
+// pair of regexes whose capture groups correspond by position: `target`
+// says what a target looks like, `cluster` the service names it stands
+// for, and the n-th group of one is the n-th group of the other. Both the
+// router (the cluster that served a create -> the target written into the
+// wrapped ID) and the LB (each candidate -> the target compared with the
+// pin) read a rule through the same wire.TargetOf. Absent, both use
+// wire.DefaultTargetPatterns.
+func parseTargetConfig(j gjson.Result, config *PluginConfig) error {
+	if s := j.Get("aliasRegex").String(); s != "" {
+		// Anchored here, whatever the operator wrote: the {id} segment is
+		// matched as a whole, so "12-extra" never resolves as route 12.
+		compiled, err := regexp.Compile("^(?:" + s + ")$")
+		if err != nil {
+			return fmt.Errorf("aliasRegex: invalid regex %q: %w", s, err)
+		}
+		if compiled.SubexpIndex("route") < 0 {
+			return fmt.Errorf("aliasRegex: %q must name a capture group (?P<route>...)", s)
+		}
+		config.aliasPattern = compiled
+	}
+
+	rules := j.Get(wire.TargetPatternsKey)
+	if rules.Exists() && !rules.IsArray() {
+		return fmt.Errorf("%s must be an array of {target, cluster} rules", wire.TargetPatternsKey)
+	}
+	var parsed []wire.TargetRule
+	for _, r := range rules.Array() {
+		parsed = append(parsed, wire.TargetRule{Target: r.Get("target").String(), Cluster: r.Get("cluster").String()})
+	}
+	var err error
+	config.targetRules, err = wire.CompileTargetRules(parsed)
+	return err
+}
+
+// resolveAlias splits the {id} segment of a path-driven URL into the route
+// and, when the client names one, the target. False when aliasRegex is
+// configured and the segment does not match it: such a segment is no alias
+// at all.
+func (c *PluginConfig) resolveAlias(id string) (route, target string, ok bool) {
+	if c.aliasPattern == nil {
+		return id, "", true
+	}
+	m := c.aliasPattern.FindStringSubmatch(id)
+	if m == nil {
+		return "", "", false
+	}
+	route = m[c.aliasPattern.SubexpIndex("route")]
+	if route == "" {
+		return "", "", false
+	}
+	if i := c.aliasPattern.SubexpIndex("target"); i > 0 {
+		target = m[i]
+	}
+	return route, target, true
 }
 
 // extractID returns the {id} segment of path after the configured prefix.
@@ -262,6 +363,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// Whether the body needs re-buffering is decided by the conditions
 	// below (LB re-entry AND a rewrite-dropped Content-Length).
 	if v, err := proxywasm.GetHttpRequestHeader("x-higress-fallback-from"); err == nil && v != "" {
+		// A re-entry is recognised by the original path its first pass
+		// left, never by the live :path. Video replay guard and follow-ups
+		// need the video branch; a client-selected request gets its pin
+		// back either way.
+		method, _ := proxywasm.GetHttpRequestHeader(":method")
+		if action, handled := videoReentry(ctx, config, method); handled {
+			return action
+		}
 		// The length-only body pass applies ONLY to an LB re-selection
 		// re-entry, identified by a surviving x-higress-target-cluster.
 		// A legacy fallback deployment (marker without a target header)
@@ -308,10 +417,54 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	hasBody := ctx.HasRequestBody()
 	bodyCapable := (mediaType == mtJSON || mediaType == mtMultipart) && hasBody
 
-	proxywasm.LogInfof("%s: onRequestHeaders path=%q contentType=%q mediaType=%q hasBody=%v prefix=%q aliasCount=%d",
-		pluginName, cleanPath, contentType, mediaType, hasBody, config.prefix, len(config.aliasNameMapping))
+	method, _ := proxywasm.GetHttpRequestHeader(":method")
 
-	// Path-driven branch (priority: a configured `/model/proxy/{id}/` URL is
+	proxywasm.LogInfof("%s: onRequestHeaders method=%s path=%q contentType=%q mediaType=%q hasBody=%v prefix=%q aliasCount=%d",
+		pluginName, method, cleanPath, contentType, mediaType, hasBody, config.prefix, len(config.aliasNameMapping))
+
+	// Self-routing video follow-up (GET/DELETE /v1/videos/gpustack_...): the
+	// URL is the only thing the OpenAI SDK sends, so it is the strongest
+	// intent signal there is -- ahead of the path-driven alias, since a
+	// `/model/proxy/{id}/v1/videos/...` form is matched by the regexes too.
+	//
+	// The original-path header is cleared first: it is this plugin's own
+	// marker for a redirect re-entry (see videoReentry), never something a
+	// client may seed on a first pass -- with or without the video branch,
+	// since a client-selected request leaves it too.
+	_ = proxywasm.RemoveHttpRequestHeader(videoOriginalPathHeader)
+	if config.videoEnabled() {
+		if action, handled := routeVideo(ctx, config, method, cleanPath, path); handled {
+			return action
+		}
+	}
+
+	// A create is recognised and armed before any of the early returns
+	// below (alias-hit, body-not-capable, suffix miss): whichever way it is
+	// routed, it must never keep Envoy retries or return a native ID. The
+	// alias prefix and a trailing slash are normalised away so the request
+	// also reaches the body-driven branch and the model route's path match.
+	// suffixPath is what the body-driven suffix match below runs against:
+	// cleanPath, unless a create was normalised. The alias has to stay in
+	// cleanPath for the path-driven lookup -- it outranks the body's model,
+	// /model/proxy/2/v1/videos/ routes as alias 2 exactly like any other
+	// path-driven request -- but the alias-bearing spelling itself matches
+	// no suffix, so the body-driven fallback (alias miss) needs the
+	// normalised one.
+	suffixPath := cleanPath
+	if config.videoEnabled() && method == "POST" {
+		if create, ok := normalizeVideoCreatePath(cleanPath, config.prefix); ok {
+			armVideoCreate(ctx, path)
+			if create != cleanPath {
+				query := ""
+				if idx := strings.Index(path, "?"); idx != -1 {
+					query = path[idx:]
+				}
+				_ = proxywasm.ReplaceHttpRequestHeader(":path", create+query)
+				suffixPath = create
+			}
+		}
+	}
+
 	// the operator's strongest intent signal, outranks body's `model`).
 	// On a hit we ONLY write the routing headers and return — body is not
 	// read or modified. Rationale: body-level model rewrite is the
@@ -326,14 +479,22 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	// while mapping config is being rolled out — the WARN log surfaces the
 	// miss for operators to fix.
 	if id := extractID(cleanPath, config.prefix); id != "" {
-		if target := config.aliasNameMapping[id]; target != "" {
-			proxywasm.LogInfof("%s: path-driven HIT id=%q → %q (headers only)", pluginName, id, target)
-			writeRoutingHeaders(config, target)
+		// route, and the target when the client names one
+		// (/model/proxy/{route}-{instance}/...).
+		route, target, matched := config.resolveAlias(id)
+		if matched && target != "" {
+			if action, handled := routePinnedProxy(ctx, config, route, target, cleanPath, suffixPath, path); handled {
+				return action
+			}
+		}
+		if t := config.aliasNameMapping[route]; matched && t != "" {
+			proxywasm.LogInfof("%s: path-driven HIT id=%q → %q (headers only)", pluginName, id, t)
+			writeRoutingHeaders(config, t)
 			ctx.DontReadRequestBody()
 			return types.ActionContinue
 		}
-		proxywasm.LogWarnf("%s: path-driven miss id=%q not in aliasNameMapping (size=%d); falling through to body-driven",
-			pluginName, id, len(config.aliasNameMapping))
+		proxywasm.LogWarnf("%s: path-driven miss id=%q (aliasRegex=%v, aliasNameMapping size=%d); falling through to body-driven",
+			pluginName, id, matched, len(config.aliasNameMapping))
 	}
 
 	if !bodyCapable {
@@ -342,9 +503,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
-	if !matchPathSuffix(cleanPath, config.enableOnPathSuffix) {
+	if !matchPathSuffix(suffixPath, config.enableOnPathSuffix) {
 		proxywasm.LogInfof("%s: body-driven skip — path %q does not match enableOnPathSuffix (%d entries); passing through",
-			pluginName, cleanPath, len(config.enableOnPathSuffix))
+			pluginName, suffixPath, len(config.enableOnPathSuffix))
 		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}

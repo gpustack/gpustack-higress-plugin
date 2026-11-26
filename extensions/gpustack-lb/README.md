@@ -96,7 +96,7 @@ the one gpustack renders next to `cluster_header`) must not re-enter the route
 on the plugin's own rejection. The plugin marks that response with
 `x-gpustack-lb-reject`; gpustack renders the predicate "any 4xx/5xx AND NOT
 that header carrying one of its verdict values (`no_candidate`,
-`max_inflight`)". Every other 4xx/5xx still re-selects, including the
+`max_inflight`, `pin_miss`)". Every other 4xx/5xx still re-selects, including the
 Envoy-synthesised 503/504 of a dead endpoint or an upstream timeout.
 
 Do **not** use `only_redirect_upstream_code: true` for this: it also stops
@@ -697,7 +697,8 @@ A fourth requirement lives outside this plugin: the per-route redirect policy
 must leave the rejection alone. The rejection is a local reply; a policy that
 redirects by status class alone treats it as one more failure to retry, and the
 dead end burns the entire redirect budget. The plugin therefore sets
-`x-gpustack-lb-reject` on both rejections (`no_candidate`, `max_inflight`) and
+`x-gpustack-lb-reject` on every rejection (`no_candidate`, `max_inflight`,
+`pin_miss`) and
 gpustack's predicate excludes responses carrying it. Measured on a group
 pinned to one failing target with no fallback tier:
 
@@ -712,6 +713,115 @@ and timeouts (UT) are Envoy-synthesised local replies as well, and those are
 exactly the cases re-selection exists for. Without any exclusion the rejection
 still ends the request once the budget is spent, so deployments that cannot
 render the predicate should keep `max_internal_redirects` low.
+
+## Pins
+
+There are two kinds, told apart by the pin's `mode`:
+
+| Mode | Written for | Finisher |
+| --- | --- | --- |
+| `job` | a follow-up of an async job (video status / content / cancel) | routes to the named candidate; no selection, **no reserve** |
+| `select` | `/model/proxy/{route}-{instance}/...`, the client naming the instance | candidate list fixed to the named one, then the **ordinary reserve path**: `maxRunningRequests` still applies (full = 429) |
+
+In both modes a target that is not in the published set is a `404` with
+`x-gpustack-lb-reject: pin_miss`, and the context role skips the
+tried-cluster exclusion and the main/fallback tier split (see below).
+
+### Job follow-ups (`mode: job`)
+
+The finisher accepts one input besides selection: a **pin**, left in filter
+state under `gpustack_video_pin` ([wire](wire/wire.go), `VideoPin{Target}`)
+by `gpustack-generic-proxy-router` for the follow-up requests of an
+asynchronous job — video status, content and cancel. The job's native ID
+exists on exactly one instance; a follow-up routed by model and re-selected
+lands on an instance that has never seen it.
+
+The target names the backend **within the route**. Which service names a
+target stands for is `targetPatterns` — unset, it is GPUStack's cluster
+naming:
+
+```text
+pin 7           candidate service name  model-<model>-7     (any model: the route's)
+pin provider-5  candidate service name  provider-5          (exact)
+```
+
+```yaml
+targetPatterns:            # unset: exactly these two
+  - target: '^(\d+)$'
+    cluster: 'model-\d+-(\d+)'
+  - target: '^provider-(\d+)$'
+    cluster: 'provider-(\d+)'
+```
+
+A rule is a pair of regexes whose capture groups correspond by position:
+what is outside the groups is a regex and takes no part in the mapping,
+what is inside a group is the mapped value. The finisher reads it in one
+direction only: every candidate's service name is matched against
+`cluster`, the groups are interleaved into `target`'s literals, and the
+result must equal the pin's target — so instance 7 never matches 71, and
+the target compared here is produced by the very `TargetOf` the router
+used to write it into the ID. The list **must be the one
+`gpustack-generic-proxy-router` carries**, which reads the same rules to
+put a target into a wrapped ID; the shared definition is
+`wire.TargetPatternsKey`.
+
+The model is deliberately not part of the pin. The caller has a route id,
+not a model id — they are different numbers — and it does not need one:
+every instance candidate of a route belongs to the route's one model, so
+within the published set the instance id is unambiguous. The literal
+`provider-` is what tells the two target kinds apart.
+
+The pin is **matched against the published candidate set, nothing else**.
+The cluster header written is the candidate's own — port, subset and
+resolution suffix included — never a name assembled from the pin. That is
+also what bounds the mechanism: a pin can only name a target that is already
+a legitimate candidate of this route. One the context role filtered out
+(removed, ejected, narrowed away by a group) is a miss, and a miss is a `404`
+carrying `x-gpustack-lb-reject: pin_miss` — the job lived in that engine's
+memory, and there is no other honest answer.
+
+A pinned request skips `selectCandidate` and `Reserve` entirely:
+
+- there is nothing to select, and the reserve walk's "best is full, try the
+  next" is not a degradation here but a guaranteed 404;
+- a status poll takes no capacity worth reserving, and answering it `429`
+  because the owner sits at `maxRunningRequests` would hide a finished job
+  behind a cap that has nothing to do with it;
+- a weighted set is overridden: the business split is for new work, and a
+  follow-up is not new work.
+
+The chosen candidate is still recorded, so `onHttpStreamDone` reports the
+health outcome (a poll that cannot connect to its instance is evidence about
+that instance). No in-flight entry is written, so there is nothing to
+release. The body is never read.
+
+Three details follow from the pin not being new work:
+
+- **The context role treats a pinned request differently.** It neither
+  excludes the clusters already tried (the owner is the only instance that
+  can answer, so a retry after a transient failure must reach it again) nor
+  applies the main/fallback tier split (a job may have been created on a
+  fallback instance while the main tier was down; once main recovers, the
+  split would publish main only and turn the healthy owner into a miss).
+  Groups and health filtering still apply.
+- **The pin is read before the empty-set rejection.** When health or a group
+  removed every candidate, a pinned request gets the promised `404` with
+  `pin_miss`, not the generic no-candidate 503.
+- **The chosen candidate carries its `Probation` flag**, so a pinned poll
+  that cannot connect to a just-recovered instance counts with the
+  tightened threshold, exactly as a selected request would.
+
+The original self-routing path survives a redirect re-entry in the
+`x-gpustack-video-path` request header (Envoy replays request headers on an
+internal redirect, the property the tried-clusters header relies on too):
+the router restores the pin from it, so the retry reaches the owner instead
+of a re-selected instance.
+
+A route without `candidates` has no candidate set, so the pin is not even
+looked at: the request passes through to wherever `weighted_clusters` sends
+it. Video models therefore need an LB route for follow-ups to be correct;
+`gpustack-generic-proxy-router`'s README lists this under the controller
+prerequisites.
 
 ## Hard constraints
 

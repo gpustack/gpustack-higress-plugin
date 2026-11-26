@@ -65,6 +65,53 @@ type RequestContext struct {
 	LengthBytes *int64 `json:"lengthBytes,omitempty"`
 }
 
+// FilterStateVideoPin carries a **deterministic instance pin** from the entry
+// plugin (generic-proxy-router, AUTHN/900) to the finisher (AUTHN/325).
+//
+// It exists for follow-up requests of an asynchronous job -- video status,
+// content and cancel -- whose native ID only has meaning on the instance that
+// created the job. Routing those by model and letting the finisher re-select
+// lands them on an instance that has never seen the ID (a 404), and no
+// capability-plugin opinion can fix it: a weighted set ignores opinions
+// outright, and the finisher's reserve walk moves to the next candidate when
+// the owner is full. A pin is not an opinion, it is the answer.
+//
+// It is filter state rather than a request header for the same reason as the
+// request tagging design: a header can be forged by the client, and a forged
+// pin would let a caller choose its own instance on every LB route.
+//
+// It is set with SetProperty in the router's header phase, before the router
+// returns, so it is visible to every filter below in the same pass.
+const FilterStateVideoPin = "gpustack_video_pin"
+
+// VideoPin is the value stored under FilterStateVideoPin: the target within
+// the route, in the spelling of the GPUStack cluster naming contract --
+// `7` for instance 7 (service name model-<model>-<instance>, where the model
+// is the route's own), `provider-5` for provider 5 (service name
+// provider-<id>). The port and the full Envoy cluster name are taken from the
+// matched candidate, never guessed. targetPatterns (target.go) say which
+// service names a target stands for, in both directions.
+type VideoPin struct {
+	Target string `json:"target"`
+	// Mode says what the pin is for, which decides how much of the finisher
+	// still applies. Empty means PinModeJob (the pin predates the field).
+	Mode string `json:"mode,omitempty"`
+}
+
+// PinModeJob: the request is a follow-up of a job that lives on exactly
+// this target (video status / content / cancel). Nothing is selected and
+// nothing is reserved -- moving to another instance is a guaranteed 404,
+// and a poll takes no capacity worth capping.
+const PinModeJob = "job"
+
+// PinModeSelect: the CLIENT named the target for an ordinary request
+// (/model/proxy/{route}-{instance}/...). The instance is honoured, but the
+// request is still new work: it goes through the in-flight check-and-reserve
+// like any other, so naming an instance is not a way around
+// maxRunningRequests. Full means 429 (rejectCap), not a move to another
+// instance.
+const PinModeSelect = "select"
+
 // Candidate is one candidate instance published to downstream plugins.
 type Candidate struct {
 	Cluster string `json:"cluster"`

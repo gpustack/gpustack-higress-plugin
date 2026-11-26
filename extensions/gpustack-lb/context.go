@@ -38,30 +38,47 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	ctx.DontReadRequestBody()
 
-	if v, err := proxywasm.GetHttpRequestHeader(fallbackFromHeader); err == nil && v != "" {
-		if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr != nil || prev == "" {
-			// No LB-written target header: either a legacy fallback deployment
-			// (its fallback ingress steers by this very marker) or a forged
-			// marker on a request LB never touched. Publish nothing either way.
-			proxywasm.LogDebugf("%s: fallback pass (%s) without a target header, skip publishing candidates", pluginName, v)
-			return types.ActionContinue
-		}
-		tried := triedClusters()
-		if len(tried) == 0 {
-			// The accumulator header did not survive (very first pass of a
-			// deployment that predates it, or stripped mid-chain): fall back
-			// to excluding the last target header only.
-			if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr == nil && prev != "" {
-				tried = []string{prev}
+	// A pinned job follow-up is not new work, so the two stages that exist
+	// to move NEW work around do not apply to it:
+	//
+	//   - the tried-cluster exclusion: the owner is the only instance that
+	//     can answer, so a retry after a transient failure must be able to
+	//     reach it again instead of being steered elsewhere;
+	//   - the main/fallback tier split: a job may well have been created on
+	//     a fallback instance while the main tier was down, and once the
+	//     main tier recovers the split would publish main only -- turning
+	//     the healthy owner into a pin_miss.
+	//
+	// Groups and health filtering still apply: the pin may only ever name a
+	// candidate that is eligible for this route and healthy right now.
+	_, pinned := readVideoPin()
+
+	if !pinned {
+		if v, err := proxywasm.GetHttpRequestHeader(fallbackFromHeader); err == nil && v != "" {
+			if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr != nil || prev == "" {
+				// No LB-written target header: either a legacy fallback deployment
+				// (its fallback ingress steers by this very marker) or a forged
+				// marker on a request LB never touched. Publish nothing either way.
+				proxywasm.LogDebugf("%s: fallback pass (%s) without a target header, skip publishing candidates", pluginName, v)
+				return types.ActionContinue
 			}
+			tried := triedClusters()
+			if len(tried) == 0 {
+				// The accumulator header did not survive (very first pass of a
+				// deployment that predates it, or stripped mid-chain): fall back
+				// to excluding the last target header only.
+				if prev, terr := proxywasm.GetHttpRequestHeader(targetClusterHeader); terr == nil && prev != "" {
+					tried = []string{prev}
+				}
+			}
+			narrowed := excludeClusters(config.candidates, tried)
+			if len(narrowed) == len(config.candidates) {
+				proxywasm.LogDebugf("%s: fallback pass (%s): no candidate excluded, keeping the full set", pluginName, v)
+			} else {
+				proxywasm.LogDebugf("%s: fallback pass (%s): excluding %d tried cluster(s), %d/%d candidates remain", pluginName, v, len(tried), len(narrowed), len(config.candidates))
+			}
+			config.candidates = narrowed
 		}
-		narrowed := excludeClusters(config.candidates, tried)
-		if len(narrowed) == len(config.candidates) {
-			proxywasm.LogDebugf("%s: fallback pass (%s): no candidate excluded, keeping the full set", pluginName, v)
-		} else {
-			proxywasm.LogDebugf("%s: fallback pass (%s): excluding %d tried cluster(s), %d/%d candidates remain", pluginName, v, len(tried), len(narrowed), len(config.candidates))
-		}
-		config.candidates = narrowed
 	}
 
 	// The client's model name comes from the x-higress-llm-model header, which
@@ -93,8 +110,10 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 	// the health-aware drain inside LoadStates can still reach the
 	// fallback tier when every main survivor turns out to be ejected.
 	publishPool := config.candidates
-	if main := mainTier(config.candidates); len(main) > 0 {
-		config.candidates = main
+	if !pinned {
+		if main := mainTier(config.candidates); len(main) > 0 {
+			config.candidates = main
+		}
 	}
 
 	// **Do not call ctx.DisableReroute()**: it stops the route from being

@@ -25,10 +25,15 @@ func newMapCtx() *mapCtx {
 	return &mapCtx{kv: make(map[string]interface{})}
 }
 
-func (m *mapCtx) SetContext(key string, value interface{})          { m.kv[key] = value }
-func (m *mapCtx) GetContext(key string) interface{}                 { return m.kv[key] }
-func (m *mapCtx) GetBoolContext(key string, def bool) bool          { return def }
-func (m *mapCtx) GetStringContext(key, def string) string           { return def }
+func (m *mapCtx) SetContext(key string, value interface{}) { m.kv[key] = value }
+func (m *mapCtx) GetContext(key string) interface{}        { return m.kv[key] }
+func (m *mapCtx) GetBoolContext(key string, def bool) bool { return def }
+func (m *mapCtx) GetStringContext(key, def string) string {
+	if s, ok := m.kv[key].(string); ok {
+		return s
+	}
+	return def
+}
 func (m *mapCtx) GetByteSliceContext(key string, def []byte) []byte { return def }
 func (m *mapCtx) Scheme() string                                    { return "" }
 func (m *mapCtx) Host() string                                      { return "" }
@@ -116,6 +121,50 @@ func TestRetryOnFailure_FromJson_explicitRetryTimeout(t *testing.T) {
 	}`))
 	require.True(t, c.IsRetryOnFailureEnabled())
 	assert.Equal(t, int64(90000), c.retryOnFailure.retryTimeout)
+}
+
+// A `protocol: original` provider leaves the API unclassified on paths it
+// does not rename; the video guard then has to fall back to the request
+// path, or a create would be retried on failure.
+func TestOnRequestFailed_videoGuardFallsBackToPath(t *testing.T) {
+	var c ProviderConfig
+	c.FromJson(gjson.Parse(`{
+		"type":"openai",
+		"apiTokens":["a","b"],
+		"failover":{"enabled":true,"failoverOnStatus":["429","503"]},
+		"retryOnFailure":{"enabled":true,"retryOnStatus":["429","503"]}
+	}`))
+
+	video := newMapCtx()
+	video.SetContext(CtxRequestPath, "/v1/videos")
+	act := c.OnRequestFailed(stubProviderType{}, video, "a", []string{"a", "b"}, "503")
+	assert.Equal(t, types.ActionContinue, act, "an unclassified create must not be retried")
+
+	for path, want := range map[string]bool{
+		"/v1/videos":                 true,
+		"/v1/videos/vid_abc":         true,
+		"/v1/videos/vid_abc/content": true,
+		"/v1/videos/vid_abc/remix":   true,
+		"/v1/chat/completions":       false,
+		"/v1/videos/sync":            false, // synchronous: no job to duplicate
+		"":                           false,
+		// the preserved path keeps its query string
+		"/v1/videos?a=1":                     true,
+		"/v1/videos/vid_abc/content?x=1&y=2": true,
+		"/v1/chat/completions?model=v":       false,
+	} {
+		ctx := newMapCtx()
+		ctx.SetContext(CtxRequestPath, path)
+		if got := isVideoOperation(ctx); got != want {
+			t.Errorf("isVideoOperation(path %q) = %v, want %v", path, got, want)
+		}
+	}
+
+	// the API name still wins when the provider set one
+	named := newMapCtx()
+	named.SetContext(CtxKeyApiName, ApiNameRetrieveVideo)
+	named.SetContext(CtxRequestPath, "/v1/chat/completions")
+	assert.True(t, isVideoOperation(named))
 }
 
 func TestOnRequestFailed_offlineBranches(t *testing.T) {

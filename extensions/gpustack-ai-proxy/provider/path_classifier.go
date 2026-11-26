@@ -39,6 +39,10 @@ var (
 		{PathOpenAIModels, ApiNameModels},
 		{PathOpenAIFineTuningJobs, ApiNameFineTuningJobs},
 		{PathOpenAIResponses, ApiNameResponses},
+		// Synchronous generation returns raw video bytes rather than a task
+		// object: classified as "" so the plugin neither parses nor rewrites
+		// the body, in either direction. It is an ordinary model request.
+		{PathOpenAIVideos + "/sync", ""},
 		{PathOpenAIVideos, ApiNameVideos},
 		// Anthropic style
 		{PathAnthropicMessagesCountTokens, ApiNameAnthropicCountTokens},

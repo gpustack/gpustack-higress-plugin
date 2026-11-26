@@ -43,6 +43,7 @@ func Test_getApiName(t *testing.T) {
 		{"openai files", "/v1/files", provider.ApiNameFiles},
 		{"openai retrieve file", "/v1/files/fileid", provider.ApiNameRetrieveFile},
 		{"openai retrieve file content", "/v1/files/fileid/content", provider.ApiNameRetrieveFileContent},
+		{"openai synchronous video passthrough", "/v1/videos/sync", ""},
 		{"openai videos", "/v1/videos", provider.ApiNameVideos},
 		{"openai retrieve video", "/v1/videos/videoid", provider.ApiNameRetrieveVideo},
 		{"openai retrieve video content", "/v1/videos/videoid/content", provider.ApiNameRetrieveVideoContent},
