@@ -112,10 +112,56 @@ that declare fallback status codes). The tier is **ordinal, not
 proportional**: fallback candidates take no share of normal traffic — a
 normal pass publishes the main tier only — and join the published set
 only on a re-selection pass whose surviving main tier is empty. The
-redirect trigger itself keeps its **legacy EnvoyFilter CR name**
-(gpustack updates the same CR in place, `lb_reselect=True`: no
-response-side marker, no fallback-path header), and the separate fallback
-ingress is reclaimed on LB routes.
+redirect trigger rides the **same per-route EnvoyFilter** as
+`cluster_header` (`gpustack-lb-<route>`: no response-side marker, no
+fallback-path header), and the separate fallback ingress is reclaimed on LB
+routes.
+
+### Re-selection budgets
+
+A re-selection is the internal-redirect pass that follows an upstream
+failure: the request re-enters the route and the plugin moves it to a
+**different** target. Two knobs bound it, one per tier. Both are **per
+route** -- they sit in the context CR's `matchRules[].config` next to
+`candidates`, which is where gpustack renders them from `plugins.lb` -- and
+a value in that CR's
+`defaultConfig` acts as the deployment-wide default for routes that omit
+them. The finisher never reads either: only the context role decides which
+tier a re-selection pass may still enter.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `maxReselections` | 0 | How many times a request may be moved to another **main-tier** target |
+| `fallbackMaxReselections` | 0 | How many times it may be moved to another **fallback-tier** target after the first one |
+
+They are **not retry counts**. A target is never dispatched twice -- the
+tried-clusters exclusion below removes every attempted candidate -- so a
+budget of 10 on a three-target route still stops at three attempts.
+
+Both default to **0**, i.e. no re-selection at all, so a route opts in per
+tier:
+
+- `maxReselections: 0`: the first failure goes straight to the fallback
+  tier (or to the no-candidate rejection when the route has none).
+- `fallbackMaxReselections: 0`: the fallback tier's **first** target is the
+  whole attempt; raise it to let later fallback targets take over.
+
+A route that relies on re-selection must therefore set `maxReselections`
+explicit -- in its matchRule, or once in the **context** CR's
+`defaultConfig` for every route (a key in the finisher CR's `defaultConfig`
+is never read: that role does not select tiers).
+
+The two tiers are counted independently. Entering the fallback tier is not a
+re-selection of the main tier, and spending the main budget never decides
+whether a fallback target is reached. When both are spent the plugin
+publishes an empty candidate set and answers with the no-candidate
+rejection -- on the spot, without spending further redirects. A pool left
+empty by the exclusion alone (every target tried) ends the same way, which
+is why the budget only ever shortens a chain, never lengthens it.
+
+The route's Envoy `max_internal_redirects` remains as a safety valve and
+should stay at or above `1 + maxReselections + fallbackMaxReselections`, so
+that the plugin, not Envoy, is the one that ends an exhausted request.
 
 **Fallback candidates are never narrowed away by a group.** A group narrows
 the *main* pool; fallback stays eligible so a group-pinned request can still
@@ -231,6 +277,8 @@ matchRules:
 | `candidates[].maxRunningRequests` | 0 (unlimited) | The candidate's concurrency cap. Enforced as a **hard** cap by the finisher's atomic check-and-reserve (see below); published on the candidate so the finisher knows the budget. Rejected requests get `reject.capStatus` / `reject.capMessage` (default 429) |
 | `modelMappers` | none | Model name mappings grouped by `targetId`; keys within a group use model-mapper syntax (exact / `prefix*` / `*`) |
 | `health.failOpen` | `true` | When every candidate has been ejected, pass through rather than reject. With a misconfigured path or a fleet-wide engine restart, it is better to send the request and have it fail than to take the whole route out of service. **Can be set globally in `defaultConfig` and overridden by matchRules** |
+| `maxReselections` | 0 | Max times a request may be moved to another **main-tier** target on re-selection; `0` disables main-tier re-selection. Per route here; a `defaultConfig` value is the default for routes that omit it. Read by the **context role only** (the finisher never sees it). See "Re-selection budgets" above |
+| `fallbackMaxReselections` | 0 | Max times a request may be moved to another **fallback-tier** target after the first; `0` makes the fallback tier's first target the whole attempt. Same role and locations as `maxReselections` |
 | `modelMapping` etc. | — | The existing model-mapper config for non-LB routes; upstream semantics are followed verbatim |
 
 Under `health`, `mode: context` **recognises only `failOpen`**. The threshold,

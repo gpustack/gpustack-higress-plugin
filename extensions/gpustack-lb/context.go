@@ -27,11 +27,18 @@ func contextOnHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 // Ordering on a fallback (redirect re-entry) pass, each stage narrowing the
 // next: exclude every ATTEMPTED cluster (the accumulated x-gpustack-lb-tried
 // header — excluding only the last one would let two failing main clusters
-// alternate until the redirect budget expires); then groups (a group
-// narrowing to [A,F] must keep F eligible even when the main-tier survivor B
+// alternate until the redirect budget expires); then close the tiers whose
+// re-selection budget is spent (maxReselections / fallbackMaxReselections:
+// an untried candidate behind an exhausted budget is not eligible either);
+// then groups (a group narrowing to [A,F] must keep F eligible even when
+// the main-tier survivor B
 // exists — the group's verdict outranks the tier); then the tier split (main
 // tier while it has survivors in the narrowed set, the fallback tier only
-// when it does not). A normal pass runs the same chain minus the exclusion.
+// when it does not). A normal pass runs the same chain minus the exclusion
+// and the budgets.
+// A pool left empty by any of these stages publishes an empty candidate set,
+// which the finisher answers with the no-candidate rejection: the request
+// ends at the plugin instead of spending further redirects.
 // Only when the marker is present but no target header survived does the
 // legacy behaviour (publish nothing, let the fallback ingress own the pass)
 // apply.
@@ -71,11 +78,19 @@ func handleLBMode(ctx wrapper.HttpContext, config Config) types.Action {
 					tried = []string{prev}
 				}
 			}
+			// Which tier each attempted cluster belongs to is read off the
+			// full pool: the exclusion below removes exactly those candidates.
+			budget := reselectionBudgetFor(config.candidates, tried, config)
 			narrowed := excludeClusters(config.candidates, tried)
 			if len(narrowed) == len(config.candidates) {
 				proxywasm.LogDebugf("%s: fallback pass (%s): no candidate excluded, keeping the full set", pluginName, v)
 			} else {
 				proxywasm.LogDebugf("%s: fallback pass (%s): excluding %d tried cluster(s), %d/%d candidates remain", pluginName, v, len(tried), len(narrowed), len(config.candidates))
+			}
+			narrowed = applyReselectionBudget(narrowed, budget)
+			if !budget.main || !budget.fallback {
+				proxywasm.LogInfof("%s: fallback pass (%s): re-selection budget exhausted (main open=%t, fallback open=%t), %d candidates remain",
+					pluginName, v, budget.main, budget.fallback, len(narrowed))
 			}
 			config.candidates = narrowed
 		}
@@ -381,6 +396,76 @@ func excludeClusters(cands []candidateSpec, clusters []string) []candidateSpec {
 // name is unambiguous across the route).
 func triedKey(c Candidate) string {
 	return serviceKey(c.Cluster)
+}
+
+// reselectionBudget says, per tier, whether it may still be entered on this
+// re-selection pass. false means the tier is closed: its candidates are
+// removed from the pool even when untried ones remain.
+type reselectionBudget struct {
+	main     bool
+	fallback bool
+}
+
+// reselectionBudgetFor derives the verdict from the attempted set. The
+// re-selections a tier has spent are its attempts minus one -- the first
+// attempt is the ordinary choice, every later one a re-selection -- so the
+// tier closes exactly when that count reaches its budget. A tier never
+// entered is always open.
+//
+// Pure function over the pool, the tried list and the config, so it is
+// unit-testable; the host calls stay in handleLBMode.
+func reselectionBudgetFor(pool []candidateSpec, tried []string, config Config) reselectionBudget {
+	attempted := make(map[string]struct{}, len(tried))
+	for _, c := range tried {
+		attempted[c] = struct{}{}
+	}
+	var mainAttempts, fallbackAttempts int64
+	for _, c := range pool {
+		// Both spellings of one identity, as in excludeClusters: the
+		// accumulator records the service name, the legacy path the full
+		// cluster name.
+		_, byKey := attempted[triedKey(c.Candidate)]
+		_, byCluster := attempted[c.Cluster]
+		if !byKey && !byCluster {
+			continue
+		}
+		if c.Fallback {
+			fallbackAttempts++
+		} else {
+			mainAttempts++
+		}
+	}
+	return reselectionBudget{
+		main:     tierOpen(mainAttempts, config.maxReselections),
+		fallback: tierOpen(fallbackAttempts, config.fallbackMaxReselections),
+	}
+}
+
+// tierOpen reports whether a tier with the given number of attempts may be
+// re-selected into again under the budget.
+func tierOpen(attempts, maxReselections int64) bool {
+	return attempts == 0 || attempts-1 < maxReselections
+}
+
+// applyReselectionBudget removes the candidates of every closed tier. The
+// empty result is what tells the finisher to answer with the no-candidate
+// rejection: nothing is left that this request may be sent to. Pure, and it
+// returns the input slice itself when both tiers are open (the common pass).
+func applyReselectionBudget(pool []candidateSpec, budget reselectionBudget) []candidateSpec {
+	if budget.main && budget.fallback {
+		return pool
+	}
+	if !budget.main && !budget.fallback {
+		return nil
+	}
+	out := make([]candidateSpec, 0, len(pool))
+	for _, c := range pool {
+		// Exactly one tier is open; keep the candidates that belong to it.
+		if c.Fallback == budget.fallback {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // mainTier keeps only the non-fallback candidates. The inverse filter is

@@ -123,6 +123,18 @@ spec:
         # health:
         #   failOpen: false
         #
+        # Re-selection budgets: per route, per tier. A failed request
+        # re-enters the route and is moved to a DIFFERENT target of the tier
+        # at most this many times (a target is never dispatched twice).
+        # maxReselections bounds the main tier, fallbackMaxReselections the
+        # fallback tier, counted independently. Both default to 0 -- no
+        # re-selection: the first failure goes straight to the fallback tier,
+        # whose first target is the whole attempt. gpustack renders them here
+        # from plugins.lb. Read by this role only; a value in defaultConfig
+        # acts as the deployment-wide default for routes that omit them.
+        maxReselections: 10
+        fallbackMaxReselections: 2
+        #
         # groups (optional): deterministic request->pool narrowing. A group is
         # a named matcher; the first whose conditions hold narrows
         # `candidates` before the candidate set is built, so health filtering,
