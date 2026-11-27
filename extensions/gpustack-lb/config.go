@@ -21,8 +21,15 @@ const (
 	defaultUnhealthyThreshold = 3
 	defaultCooldownMs         = 10000
 	defaultMaxInflightAgeMs   = 10 * 60 * 1000 // 10 min
-	defaultRejectStatus       = 503
-	defaultRejectMessage      = "no healthy model instance available"
+
+	// Re-selection budgets, per tier. Both default to off: a failed request
+	// is answered (or sent to the fallback tier's first target) rather than
+	// moved to another target, and a route opts in per tier.
+	defaultMaxReselections         = 0
+	defaultFallbackMaxReselections = 0
+
+	defaultRejectStatus  = 503
+	defaultRejectMessage = "no healthy model instance available"
 
 	// The max-inflight rejection is a **rate-limit verdict**, not a health
 	// one: 429 says "back off and retry" where 503 says "this deployment is
@@ -75,6 +82,21 @@ type Config struct {
 	// maxInflightAgeMs: the finisher is the only writer of in-flight counts, so
 	// it is also responsible for pruning leaked entries.
 	maxInflightAgeMs int64
+
+	// -- Re-selection budgets (per tier, context role only). A re-selection
+	// is the internal-redirect pass that follows an upstream failure; the
+	// budget counts how many times a request may be moved to a DIFFERENT
+	// target of the tier. It is not a retry count: a target is never
+	// dispatched twice (the tried-clusters exclusion), so the effective
+	// number is also bounded by the tier's size.
+	//
+	// maxReselections bounds the main tier; fallbackMaxReselections bounds
+	// the fallback tier and is counted independently -- entering the
+	// fallback tier is not a re-selection of the main tier, and spending
+	// the main budget must not decide whether a fallback target is reached.
+	// 0 closes the tier after its first attempt.
+	maxReselections         int64
+	fallbackMaxReselections int64
 
 	// -- The reject path (§7.3).
 	//
@@ -255,6 +277,12 @@ func parseConfig(j gjson.Result, config *Config) error {
 		config.maxInflightAgeMs = defaultMaxInflightAgeMs
 	}
 
+	// Parsed outside parseLB like failOpen: the config location is
+	// deployment-level, and defaultConfig never carries candidates.
+	if err := parseReselectionBudgets(j, config); err != nil {
+		return err
+	}
+
 	// Parsed outside parseLB for the same reason as failOpen, and at every
 	// config location: a pin is joined on the route that carries the finisher,
 	// while the rules are deployment-wide.
@@ -394,6 +422,35 @@ func intField(r gjson.Result, what string) (int64, error) {
 	return r.Int(), nil
 }
 
+// parseReselectionBudgets reads the two per-tier re-selection budgets. Both
+// are non-negative whole numbers: 0 is a legal, meaningful value (the tier
+// is not re-selected), so neither the default-on-non-positive shortcut of
+// maxInflightAgeMs nor gjson's truncating Int() can be used here.
+func parseReselectionBudgets(j gjson.Result, config *Config) error {
+	config.maxReselections = defaultMaxReselections
+	config.fallbackMaxReselections = defaultFallbackMaxReselections
+	for _, k := range []struct {
+		key string
+		dst *int64
+	}{
+		{"maxReselections", &config.maxReselections},
+		{"fallbackMaxReselections", &config.fallbackMaxReselections},
+	} {
+		if !j.Get(k.key).Exists() || j.Get(k.key).Type == gjson.Null {
+			continue
+		}
+		v, err := intField(j.Get(k.key), k.key)
+		if err != nil {
+			return err
+		}
+		if v < 0 {
+			return fmt.Errorf("%s must not be negative, got %d", k.key, v)
+		}
+		*k.dst = v
+	}
+	return nil
+}
+
 // stateBackend is the only read path for store.
 //
 // A zero-valued Config -- what rule_matcher leaves behind when the global
@@ -476,6 +533,24 @@ func parseOverrideConfig(j gjson.Result, global Config, config *Config) error {
 		}
 	}
 	inheritInt64(j, "maxInflightAgeMs", &config.maxInflightAgeMs, global.maxInflightAgeMs)
+
+	// The re-selection budgets inherit on presence, not on a positive global
+	// value the way inheritInt64 does: 0 is a configured "do not re-select",
+	// not "unset". A rule that sets the key wins; a rule that omits it takes
+	// the global's. The one ambiguity is harmless -- a global that is zero
+	// because its parse failed hands down the same number the default is.
+	for _, k := range []struct {
+		key    string
+		dst    *int64
+		global int64
+	}{
+		{"maxReselections", &config.maxReselections, global.maxReselections},
+		{"fallbackMaxReselections", &config.fallbackMaxReselections, global.fallbackMaxReselections},
+	} {
+		if !j.Get(k.key).Exists() && global.mode != "" {
+			*k.dst = k.global
+		}
+	}
 
 	// -- Target rules (see pin.go). Deployment-level as well: a finisher
 	// matchRule that says nothing inherits the global list, so custom
